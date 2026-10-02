@@ -1,0 +1,80 @@
+#!/bin/sh
+# rpcd exec 插件：为 LuCI(JS) 界面提供 meshctl 调用
+#   ubus 对象: mesh
+#   方法:      status           -> 返回 meshctl status 的 JSON
+#              exec {cmd:"..."} -> 执行白名单内的 meshctl 子命令
+# 部署后需重启 rpcd: /etc/init.d/rpcd restart
+. /usr/share/libubox/jshn.sh
+
+MESHCTL=/usr/sbin/meshctl
+
+case "$1" in
+	list)
+		echo '{ "status": { }, "exec": { "cmd": "str" } }'
+		;;
+
+	call)
+		case "$2" in
+			status)
+				out=$("$MESHCTL" status 2>/dev/null)
+				[ -n "$out" ] || out='{"error":"status_failed"}'
+				printf '%s\n' "$out"
+				;;
+
+			exec)
+				json_load "$(cat)" 2>/dev/null
+				json_get_var cmd cmd 2>/dev/null
+				code=1
+				case "$cmd" in
+				apply)
+					# 会重启网络/无线，后台执行并立即返回 —— 这个 code=0 是**刻意**的：
+					# 子节点 apply 会把本机 LAN 改成 DHCP（地址由主节点重新分配）并紧接着
+					# network restart，承载本次 RPC 应答的连接会被当场掐断，等结果再返回
+					# 只会让前端看到"网络错误"。所以先返回，真实结果存内存(tmpfs)供事后
+					# 查询 —— 刻意不写 flash：重启后记录自然消失，界面也就不再显示
+					# 一条已经过时的"上次应用结果"。
+					rm -f /tmp/mesh-apply.out
+					(
+						"$MESHCTL" apply >/tmp/mesh-apply.out 2>&1
+						rc=$?
+						mkdir -p /tmp/mesh
+						msg=$(grep -E '^(错误|完成)' /tmp/mesh-apply.out 2>/dev/null | tail -n 1)
+						[ -n "$msg" ] || msg='（无明确结果，详见 /tmp/mesh-apply.out）'
+						{
+							echo "code=$rc"
+							echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+							echo "msg=$msg"
+						} > /tmp/mesh/last_apply
+					) >/dev/null 2>&1 &
+					out='应用已触发：无线重启约 10~20 秒，期间连接可能中断。'
+					code=0
+					;;
+				last_apply)
+					# 回读上一次 apply 的真实结果（code=2 表示尚无记录）。
+					# 子节点换完 IP 后重新打开页面，也能看到上一次到底成功没有。
+					if [ -f /tmp/mesh/last_apply ]; then
+						out=$(cat /tmp/mesh/last_apply 2>/dev/null)
+						code=$(sed -n 's/^code=//p' /tmp/mesh/last_apply 2>/dev/null)
+						[ -n "$code" ] || code=2
+					else
+						out=$(printf 'code=2\nmsg=%s' '尚无应用记录')
+						code=2
+					fi
+					;;
+				diag|sync|revert|port_bridging|confirm_rollback)
+						out=$("$MESHCTL" "$cmd" 2>&1)
+						code=$?
+						;;
+					*)
+						out='错误：不支持的命令'
+						code=1
+						;;
+				esac
+				json_init
+				json_add_int code "${code:-1}"
+				json_add_string stdout "$out"
+				json_dump
+				;;
+		esac
+		;;
+esac

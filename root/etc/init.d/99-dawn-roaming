@@ -1,0 +1,223 @@
+#!/bin/sh /etc/rc.common
+#
+# 自检：按本机 LAN 网段自动校正 dawn / umdns 的漫游配置
+#
+# 触发方式（三种，可叠加）：
+#   1. 开机自启      —— /etc/init.d/99-dawn-roaming enable
+#   2. 定时巡检      —— /etc/init.d/99-dawn-roaming cron_enable
+#   3. 手动          —— /etc/init.d/99-dawn-roaming start
+#
+# 为什么需要定时巡检：本固件不发 procd 的 config.change 事件（实测命令行 uci commit
+# 与 LuCI 的 uci apply 都不产生），事件触发不可用，只能轮询。这里定时自愈的价值在于：
+#   - 改了 LAN IP / 网段（static <-> dhcp）后 broadcast_ip 会失效，dawn 立刻看不见邻居；
+#   - 手动改过 dawn 配置或升级包后配置被重置。
+#
+# 设计原则：
+#   1. 未安装 dawn / umdns 时安静跳过（不凭空创建配置文件）
+#   2. 广播地址取自运行时接口(brd)，兼容 LAN 为 DHCP 客户端、以及非 /24 子网
+#   3. 幂等 —— 配置已正确时不重启服务（dawn 重启会丢邻居视图，需 20~45s 重建）
+#   4. 静默 —— ROAM_QUIET=1 时"无需改动"不写 syslog
+#   5. 干跑 —— ROAM_DRYRUN=1 只打印不落盘
+#   6. 仅服务已组网设备 —— /etc/config/mesh 的 enabled 必须为 1，否则静默退出。
+#      本脚本随 luci-app-mesh 包安装并默认开机自启 + 每分钟巡检，但**只在用户真正
+#      启用了 Mesh 组网后才动作**；普通路由模式下装了包也不会碰 dawn / umdns 配置。
+#
+# 启动顺序：START=99，必须晚于 97-wifi-roaming（无线先就绪，dawn 再重启）
+#
+START=99
+STOP=01
+# 不要设置 USE_PROCD —— 哪怕设成 0。rc.common 里是 `[ -n "$USE_PROCD" ] && { ... }`，
+# 只要该变量【非空】就会进入 procd 分支，并用 procd 版的 start() 覆盖本脚本的 start()，
+# 导致 start 实际不执行（实测表现：无输出、rc=0，静默失效）。留空即走普通分支。
+
+TAG=dawn-roaming
+
+# cron 调用时 PATH 里可能没有 /sbin，必须显式补齐，否则找不到 uci / service / logger
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# 脚本自身真实路径（解析 rc.d 软链接），用于 fast_skip 指纹：
+# 脚本逻辑变更后，已部署设备必须能识别到"脚本本体变了"并重跑，否则旧规则永久滞留。
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+
+ROAM_DRYRUN=${ROAM_DRYRUN:-0}
+ROAM_QUIET=${ROAM_QUIET:-0}
+CRON_LINE='* * * * * ROAM_QUIET=1 /etc/init.d/99-dawn-roaming start'
+CRON_FILE=/etc/crontabs/root
+STATE=/tmp/.roam-dawn.md5
+
+EXTRA_COMMANDS="cron_enable cron_disable"
+EXTRA_HELP="	cron_enable	Install cron entry for periodic self-healing
+	cron_disable	Remove the cron entry"
+
+log()  { logger -t "$TAG" "$*"; [ "$ROAM_DRYRUN" = "1" ] && echo "[dryrun] $*"; }
+qlog() { [ "$ROAM_QUIET" = "1" ] && return 0; log "$*"; }
+
+lock_acquire() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 9>/tmp/.roam-dawn.lock
+	flock -n 9 || return 1
+	return 0
+}
+
+# 是否已启用 Mesh 组网：本脚本只为"正在组网的设备"服务。
+# 未启用时一律静默退出 —— 装了这个包不等于要给无线改配置，只有用户真的开了组网
+# （/etc/config/mesh 的 config main 'main' → option enabled '1'）才动手。
+# 读不到该选项、或值不是 1，都视为未启用：宁可什么都不做，也不要在普通路由模式下
+# 擅自改 dawn / umdns 配置并重启服务。
+mesh_enabled() {
+	[ "$(uci -q get mesh.main.enabled 2>/dev/null)" = "1" ]
+}
+
+# 快速通道：network / dawn / umdns 三个配置都没变 -> 跳过
+fast_skip() {
+	local cur prev
+	[ "$ROAM_DRYRUN" = "1" ] && return 1
+	command -v md5sum >/dev/null 2>&1 || return 1
+	cur=$( ( cat /etc/config/network /etc/config/dawn /etc/config/umdns 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 )
+	[ -n "$cur" ] || return 1
+	prev=$(cat "$STATE" 2>/dev/null)
+	[ "$cur" = "$prev" ] && return 0
+	echo "$cur" > "$STATE" 2>/dev/null
+	return 1
+}
+
+state_save() {
+	command -v md5sum >/dev/null 2>&1 || return 0
+	( cat /etc/config/network /etc/config/dawn /etc/config/umdns 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 > "$STATE" 2>/dev/null
+}
+
+# 取 LAN 广播地址：优先运行时 brd 字段，回退 UCI 静态地址按掩码计算
+lan_broadcast() {
+	local dev raw ip prefix nm b
+	dev=$(uci get network.lan.device 2>/dev/null)
+	[ -n "$dev" ] || dev=br-lan
+
+	# 1) 运行时接口（最准：覆盖 DHCP 客户端、非标子网）
+	b=$(ip -4 addr show dev "$dev" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "brd") { print $(i + 1); exit } }')
+	[ -n "$b" ] && { echo "$b"; return 0; }
+
+	# 2) 回退：UCI 静态地址 + 掩码（ipaddr 可能写成 10.0.0.1 或 10.0.0.1/24）
+	raw=$(uci get network.lan.ipaddr 2>/dev/null)
+	[ -n "$raw" ] || return 1
+	ip=${raw%%/*}
+	prefix=${raw#*/}
+	[ "$prefix" = "$raw" ] && prefix=
+	nm=$(uci get network.lan.netmask 2>/dev/null)
+	if [ -z "$nm" ]; then
+		[ -n "$prefix" ] || prefix=24
+		# 前缀转掩码：m = 高 prefix 位为 1
+		local m=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+		nm="$(( (m >> 24) & 255 )).$(( (m >> 16) & 255 )).$(( (m >> 8) & 255 )).$(( m & 255 ))"
+	fi
+
+	# bcast = (ip & mask) | (255 - mask)，逐字节
+	set -- $(echo "$ip.$nm" | tr '.' ' ')
+	[ $# -eq 8 ] || return 1
+	echo "$(( ($1 & $5) | (255 - $5) )).$(( ($2 & $6) | (255 - $6) )).$(( ($3 & $7) | (255 - $7) )).$(( ($4 & $8) | (255 - $8) ))"
+}
+
+# set_if_diff <config> <section> <option> <value>
+# 当前值已是目标值 -> 返回 1（无改动）；否则写入并返回 0
+set_if_diff() {
+	local cfg=$1 sec=$2 opt=$3 val=$4 cur
+	cur=$(uci get "$cfg.$sec.$opt" 2>/dev/null)
+	[ "$cur" = "$val" ] && return 1
+	if [ "$ROAM_DRYRUN" = "1" ]; then
+		log "$cfg.$sec.$opt: '$cur' -> '$val'"
+		return 0
+	fi
+	uci set "$cfg.$sec.$opt=$val" 2>/dev/null || return 1
+	log "$cfg.$sec.$opt: '$cur' -> '$val'"
+	return 0
+}
+
+start() {
+	local bcast changed=0 changed_umdns=0 has_umdns=0
+
+	# ---- 前置：mesh 未启用则静默退出（不为非组网设备改无线配置）----
+	if ! mesh_enabled; then
+		qlog "mesh 未启用（mesh.main.enabled != 1），跳过"
+		return 0
+	fi
+
+	# ---- 前置：dawn 未安装则安静跳过（避免 uci 凭空建文件）----
+	if [ ! -x /etc/init.d/dawn ] || [ ! -f /etc/config/dawn ]; then
+		qlog "dawn not installed, skip"
+		return 0
+	fi
+
+	fast_skip && return 0
+	lock_acquire || { qlog "已有实例在运行，跳过本次"; return 0; }
+
+	bcast=$(lan_broadcast)
+	if [ -z "$bcast" ]; then
+		log "无法确定 LAN 广播地址（接口未就绪且无静态配置），本次跳过"
+		return 1
+	fi
+
+	# ---- dawn 侧 ----
+	set_if_diff dawn "@network[0]" broadcast_ip "$bcast"   && changed=1
+	set_if_diff dawn global set_hostapd_nr      1          && changed=1
+	set_if_diff dawn global eval_probe_req      1          && changed=1
+	set_if_diff dawn global eval_auth_req       1          && changed=1
+	set_if_diff dawn global eval_assoc_req      1          && changed=1
+	set_if_diff dawn global use_station_count   1          && changed=1
+	set_if_diff dawn global max_station_diff    1          && changed=1
+
+	# ---- umdns 侧（dawn 靠它发现邻居 AP）----
+	if [ -x /etc/init.d/umdns ] && [ -f /etc/config/umdns ]; then
+		has_umdns=1
+		set_if_diff umdns "@umdns[0]" network lan && changed_umdns=1
+	fi
+
+	# ---- 无条件确保开机自启（幂等）----
+	if [ "$ROAM_DRYRUN" != "1" ]; then
+		[ "$has_umdns" = "1" ] && service umdns enable >/dev/null 2>&1
+		service dawn enable >/dev/null 2>&1
+	fi
+
+	if [ "$ROAM_DRYRUN" = "1" ]; then
+		log "干跑结束：LAN 广播地址=$bcast，dawn 待改=$changed，umdns 待改=$changed_umdns（未提交、未重启）"
+		return 0
+	fi
+
+	# ---- 分别提交：dawn 与 umdns 是两个 config，必须各 commit 一次 ----
+	[ "$changed" = "1" ] && uci commit dawn
+	[ "$changed_umdns" = "1" ] && uci commit umdns
+	state_save
+
+	if [ "$changed" = "1" ] || [ "$changed_umdns" = "1" ]; then
+		# 输出静音：service 的输出若混进调用方（rpcd file.exec / LuCI）的返回流会污染结果，
+		# 且重启耗时会让调用方多等；失败原因仍可从 syslog 里查到。
+		[ "$has_umdns" = "1" ] && service umdns restart >/dev/null 2>&1
+		service dawn restart >/dev/null 2>&1
+		log "漫游配置已应用（broadcast=$bcast），服务已重启"
+	else
+		qlog "漫游配置已就位（broadcast=$bcast），无需改动"
+	fi
+	return 0
+}
+
+cron_enable() {
+	mkdir -p /etc/crontabs
+	[ -f "$CRON_FILE" ] || : > "$CRON_FILE"
+	grep -v "99-dawn-roaming" "$CRON_FILE" 2>/dev/null > /tmp/.cr.tmp
+	echo "$CRON_LINE" >> /tmp/.cr.tmp
+	mv /tmp/.cr.tmp "$CRON_FILE"
+	chmod 600 "$CRON_FILE"
+	service cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+	logger -t "$TAG" "定时巡检已启用：$CRON_LINE"
+	echo "已启用：$CRON_LINE"
+}
+
+cron_disable() {
+	[ -f "$CRON_FILE" ] || return 0
+	grep -v "99-dawn-roaming" "$CRON_FILE" 2>/dev/null > /tmp/.cr.tmp
+	mv /tmp/.cr.tmp "$CRON_FILE"
+	/etc/init.d/cron restart >/dev/null 2>&1
+	logger -t "$TAG" "定时巡检已移除"
+	echo "已移除定时巡检"
+}
+
+stop() { return 0; }

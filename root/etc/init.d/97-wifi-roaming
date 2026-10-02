@@ -1,0 +1,203 @@
+#!/bin/sh /etc/rc.common
+#
+# 自检：为 AP 型无线接口补齐 802.11k / 802.11v / 802.11r 漫游能力
+#
+# 触发方式（三种，可叠加）：
+#   1. 开机自启      —— /etc/init.d/97-wifi-roaming enable
+#   2. 定时巡检      —— /etc/init.d/97-wifi-roaming cron_enable   （默认每分钟，见下）
+#   3. 手动          —— /etc/init.d/97-wifi-roaming start
+#
+# 为什么需要定时巡检：
+#   本固件（实测）**不发 procd 的 config.change 事件** —— 无论命令行 `uci commit`
+#   还是 LuCI/rpcd 的 `uci apply` 都不产生该事件，所以 procd_add_config_trigger
+#   （配置变更即时触发）在这里无效。而 LuCI 无线页保存会重写整段 wireless 配置，
+#   导致 rrm_neighbor_report / rrm_beacon_report / 11r 等项被清掉（主节点实测发生过）。
+#   因此只能靠定时巡检做"配置漂移自愈"。脚本幂等，无变化时几乎零开销。
+#
+# 设计原则：
+#   1. 幂等 —— 配置已正确时不 commit、不 reload（避免每次巡检断一次网）
+#   2. 只改 AP —— mesh(802.11s) / sta / adhoc / monitor 一律跳过，防止打断 mesh 回程
+#   3. 11r 仅在 AP 已加密时开启（FT 依赖 WPA2/WPA3 密钥体系，开放网络下无效）
+#   4. 静默 —— ROAM_QUIET=1 时"无需改动"不写 syslog（定时巡检专用，避免刷屏）
+#   5. 干跑 —— ROAM_DRYRUN=1 只打印不落盘
+#   6. 仅服务已组网设备 —— /etc/config/mesh 的 enabled 必须为 1，否则静默退出。
+#      本脚本随 luci-app-mesh 包安装并默认开机自启 + 每分钟巡检，但**只在用户真正
+#      启用了 Mesh 组网后才动作**；普通路由模式下装了包也不会碰无线配置。
+#
+# 启动顺序：本脚本 START=97，必须早于 99-dawn-roaming（dawn 要在无线就绪后重启）
+#
+START=97
+STOP=01
+# 不要设置 USE_PROCD —— 哪怕设成 0。rc.common 里是 `[ -n "$USE_PROCD" ] && { ... }`，
+# 只要该变量【非空】就会进入 procd 分支，并用 procd 版的 start() 覆盖本脚本的 start()，
+# 导致 start 实际不执行（实测表现：无输出、rc=0，静默失效）。留空即走普通分支。
+
+TAG=wifi-roaming
+
+# cron 调用时 PATH 里可能没有 /sbin，必须显式补齐，否则找不到 uci / wifi / logger
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# 脚本自身真实路径（解析 rc.d 软链接），用于 fast_skip 指纹：
+# 脚本逻辑变更后，已部署设备必须能识别到"脚本本体变了"并重跑，否则旧规则永久滞留。
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+
+# ---- 可调参数 ----
+FT_ENABLE=1                # 是否开启 802.11r（1=开；AP 为开放网络时会自动跳过）
+MOBILITY_DOMAIN=4f57       # FT 漫游域：全网所有 AP 必须完全一致
+ROAM_DRYRUN=${ROAM_DRYRUN:-0}
+ROAM_QUIET=${ROAM_QUIET:-0}
+CRON_LINE='* * * * * ROAM_QUIET=1 /etc/init.d/97-wifi-roaming start'
+CRON_FILE=/etc/crontabs/root
+STATE=/tmp/.roam-wifi.md5
+
+EXTRA_COMMANDS="cron_enable cron_disable"
+EXTRA_HELP="	cron_enable	Install cron entry for periodic self-healing
+	cron_disable	Remove the cron entry"
+
+log()  { logger -t "$TAG" "$*"; [ "$ROAM_DRYRUN" = "1" ] && echo "[dryrun] $*"; }
+qlog() { [ "$ROAM_QUIET" = "1" ] && return 0; log "$*"; }
+
+# 单实例：防止 cron 巡检与开机启动并发、或上一轮 reload 未完又来一轮
+lock_acquire() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 9>/tmp/.roam-wifi.lock
+	flock -n 9 || return 1
+	return 0
+}
+
+# 快速通道：配置文件 md5 未变 -> 直接跳过（定时巡检下开销约等于一次 md5sum）
+fast_skip() {
+	local cur prev
+	[ "$ROAM_DRYRUN" = "1" ] && return 1
+	command -v md5sum >/dev/null 2>&1 || return 1
+	cur=$( ( md5sum /etc/config/wireless 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 )
+	[ -n "$cur" ] || return 1
+	prev=$(cat "$STATE" 2>/dev/null)
+	[ "$cur" = "$prev" ] && return 0
+	echo "$cur" > "$STATE" 2>/dev/null
+	return 1
+}
+
+state_save() {
+	command -v md5sum >/dev/null 2>&1 || return 0
+	( md5sum /etc/config/wireless 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 > "$STATE" 2>/dev/null
+}
+
+# 枚举所有 wifi-iface 节名：同时兼容具名节(default_radio0)与匿名节(@wifi-iface[0])
+wifi_iface_sections() {
+	uci show wireless 2>/dev/null | sed -n 's/^wireless\.\(.*\)=wifi-iface$/\1/p'
+}
+
+# 是否已启用 Mesh 组网：本脚本只为"正在组网的设备"服务。
+# 未启用时一律静默退出 —— 装了这个包不等于要给无线改配置，只有用户真的开了组网
+# （/etc/config/mesh 的 config main 'main' → option enabled '1'）才动手。
+# 读不到该选项、或值不是 1，都视为未启用：宁可什么都不做，也不要在普通路由模式下
+# 擅自往 AP 接口写 11k/v/r。
+mesh_enabled() {
+	[ "$(uci -q get mesh.main.enabled 2>/dev/null)" = "1" ]
+}
+
+start() {
+	local sec mode enc key changed=0 total=0 aps=0
+
+	command -v uci >/dev/null 2>&1 || { log "uci not found, abort"; return 1; }
+	mesh_enabled || { qlog "mesh 未启用（mesh.main.enabled != 1），跳过"; return 0; }
+	fast_skip && return 0
+	lock_acquire || { qlog "已有实例在运行，跳过本次"; return 0; }
+
+	for sec in $(wifi_iface_sections); do
+		total=$((total + 1))
+		mode=$(uci get "wireless.$sec.mode" 2>/dev/null)
+		# 只处理 AP 接口；mesh 回程改了会断组网，sta/adhoc/monitor 无漫游意义
+		[ "$mode" = "ap" ] || continue
+		aps=$((aps + 1))
+
+		# ---- 802.11k：邻居报告 + Beacon 报告（客户端才能知道有哪些邻居 AP）----
+		if [ "$(uci get "wireless.$sec.ieee80211k" 2>/dev/null)" != "1" ] \
+		   || [ "$(uci get "wireless.$sec.rrm_neighbor_report" 2>/dev/null)" != "1" ] \
+		   || [ "$(uci get "wireless.$sec.rrm_beacon_report" 2>/dev/null)" != "1" ]; then
+			log "$sec: 需要开启 802.11k"
+			if [ "$ROAM_DRYRUN" != "1" ]; then
+				uci set "wireless.$sec.ieee80211k=1"
+				uci set "wireless.$sec.rrm_neighbor_report=1"
+				uci set "wireless.$sec.rrm_beacon_report=1"
+			fi
+			changed=1
+		fi
+
+		# ---- 802.11v：BTM 引导（dawn/usteer 用文明引导替代硬踢的前提）----
+		if [ "$(uci get "wireless.$sec.ieee80211v" 2>/dev/null)" != "1" ] \
+		   || [ "$(uci get "wireless.$sec.bss_transition" 2>/dev/null)" != "1" ]; then
+			log "$sec: 需要开启 802.11v"
+			if [ "$ROAM_DRYRUN" != "1" ]; then
+				uci set "wireless.$sec.ieee80211v=1"
+				uci set "wireless.$sec.bss_transition=1"
+			fi
+			changed=1
+		fi
+
+		# ---- 802.11r：仅当 AP 已加密（开放网络下 FT 不生效）----
+		enc=$(uci get "wireless.$sec.encryption" 2>/dev/null)
+		key=$(uci get "wireless.$sec.key" 2>/dev/null)
+		if [ "$FT_ENABLE" = "1" ] && [ -n "$enc" ] && [ "$enc" != "none" ] && [ -n "$key" ]; then
+			if [ "$(uci get "wireless.$sec.ieee80211r" 2>/dev/null)" != "1" ] \
+			   || [ "$(uci get "wireless.$sec.mobility_domain" 2>/dev/null)" != "$MOBILITY_DOMAIN" ]; then
+				log "$sec: 需要开启 802.11r (mobility_domain=$MOBILITY_DOMAIN)"
+				if [ "$ROAM_DRYRUN" != "1" ]; then
+					uci set "wireless.$sec.ieee80211r=1"
+					uci set "wireless.$sec.mobility_domain=$MOBILITY_DOMAIN"
+					uci set "wireless.$sec.ft_over_ds=1"
+					uci set "wireless.$sec.ft_psk_generate_local=1"
+				fi
+				changed=1
+			fi
+		else
+			qlog "$sec: 跳过 802.11r（加密方式=${enc:-none}，开放网络不支持 FT）"
+		fi
+	done
+
+	if [ "$changed" = "1" ]; then
+		if [ "$ROAM_DRYRUN" = "1" ]; then
+			log "扫描完成：共 $total 个 wifi-iface / $aps 个 AP —— 有改动待应用（干跑，未 commit、未 reload）"
+		else
+			uci commit wireless
+			state_save
+			log "扫描完成：共 $total 个 wifi-iface / $aps 个 AP —— 配置已变更，后台 reload wifi"
+			# 后台执行：wifi reload 会重建 radio（5G 与 mesh 回程共用 radio1，会短暂断链），
+			# 同步等待会阻塞开机/巡检。
+			# exec 9>&- ：释放锁，避免后续巡检被误判为"仍在运行"。
+			# exec >/dev/null 2>&1 ：**必须**把子 shell 的 fd1/fd2 一并脱离父进程管道。
+			#   否则调用方（rpcd file.exec / LuCI 按钮）要等到所有持有该管道的进程退出才
+			#   拿到返回 —— 实测表现是调用挂起十几秒，且期间 WiFi 重建断连，前端会误报失败。
+			( exec 9>&-; exec >/dev/null 2>&1; wifi reload >/dev/null 2>&1; log "wifi reload 完成" ) &
+		fi
+	else
+		state_save
+		qlog "扫描完成：共 $total 个 wifi-iface / $aps 个 AP —— 漫游配置已就位，无需改动"
+	fi
+	return 0
+}
+
+cron_enable() {
+	mkdir -p /etc/crontabs
+	[ -f "$CRON_FILE" ] || : > "$CRON_FILE"
+	grep -v "97-wifi-roaming" "$CRON_FILE" 2>/dev/null > /tmp/.cr.tmp
+	echo "$CRON_LINE" >> /tmp/.cr.tmp
+	mv /tmp/.cr.tmp "$CRON_FILE"
+	chmod 600 "$CRON_FILE"
+	service cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+	logger -t "$TAG" "定时巡检已启用：$CRON_LINE"
+	echo "已启用：$CRON_LINE"
+}
+
+cron_disable() {
+	[ -f "$CRON_FILE" ] || return 0
+	grep -v "97-wifi-roaming" "$CRON_FILE" 2>/dev/null > /tmp/.cr.tmp
+	mv /tmp/.cr.tmp "$CRON_FILE"
+	/etc/init.d/cron restart >/dev/null 2>&1
+	logger -t "$TAG" "定时巡检已移除"
+	echo "已移除定时巡检"
+}
+
+stop() { return 0; }

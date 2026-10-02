@@ -1,0 +1,17 @@
+{
+	"luci-app-mesh": {
+		"description": "Grant access to Mesh 组网 (meshctl / uci mesh)",
+		"read": {
+			"uci": [ "mesh" ],
+			"ubus": {
+				"mesh": [ "status" ]
+			}
+		},
+		"write": {
+			"uci": [ "mesh" ],
+			"ubus": {
+				"mesh": [ "exec" ]
+			}
+		}
+	}
+}

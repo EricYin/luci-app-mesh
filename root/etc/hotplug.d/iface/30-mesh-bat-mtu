@@ -1,0 +1,24 @@
+#!/bin/sh
+# batman-adv hardif 兜底（事件驱动）：补 MTU
+#
+# 背景：bat0 的 hard interface（mesh0 无线回程）必须比标准 MTU 多容纳 41 字节的
+# batman 头部，否则内核会全程分片。而 netifd 对"外部创建"的设备设置 MTU 的时机
+# 并不保证，所以要在接口 up 之后补一次。
+#
+# 这里用 hotplug 事件代替了 meshctl apply 里原本那个
+# `( sleep 15; mesh_bat_fix_mtu ) &` 游离后台进程：
+#   · 事件触发更准 —— 接口什么时候 up，就什么时候设，不需要猜一个 15 秒
+#   · 不留孤儿进程 —— 原来的子 shell 不会被父进程回收，apply 期间连续操作还会
+#     同时冒出多个；且它们靠 sleep 计时，接口晚于 15 秒才 up 就永远补不上
+#   · 代价极低 —— 先读一次当前值，不一致才写内核
+#
+# 注：早期版本这里还会调用 mesh_bat_hardif_prefs 补 hardif 级 hop_penalty。
+# 那种"有线 5 / 无线 30"的择优只在 bat0 上同时挂有线和无线两种 hardif 时才成立，
+# 而本包只实现 B 方案（bat0 只有 mesh0 一个 hardif），该函数已随 A/C 方案一并删除。
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+[ -f /usr/libexec/mesh/functions.sh ] || exit 0
+. /usr/libexec/mesh/functions.sh 2>/dev/null
+# 未启用 batman-adv 时函数内部会直接返回
+mesh_bat_fix_mtu 2>/dev/null
+exit 0

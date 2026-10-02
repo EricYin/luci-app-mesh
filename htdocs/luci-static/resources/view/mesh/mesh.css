@@ -1,0 +1,100 @@
+/* luci-app-mesh — JS 视图共享样式（对应预览版 mesh-ui-preview.html 的绿色主题）
+ *
+ * 注意：这里几乎所有卡片/表格都用了浅色背景，所以凡是设了 background 的地方
+ * 都要把 color 一起显式设掉。否则在暗色 LuCI 主题（正文字色为浅色）下会出现
+ * 「浅底浅字」，内容直接读不出来。
+ */
+
+.mesh-cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+	gap: 12px;
+}
+
+.mesh-card {
+	border: 1px solid #e3e3e3;
+	border-radius: 4px;
+	background: #fbfbfb;
+	color: #333;
+	padding: 12px 14px;
+}
+
+.mesh-card .lab { font-size: 12px; color: #777; margin-bottom: 4px; }
+.mesh-card .val { font-size: 16px; font-weight: 600; color: #333; }
+
+.mesh-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mesh-table th, .mesh-table td { border: 1px solid #e3e3e3; padding: 8px 10px; text-align: left; }
+.mesh-table td { background: #fff; color: #333; }
+.mesh-table th { background: #f4f4f4; font-weight: 600; color: #555; }
+.mesh-table-empty { color: #999; font-size: 13px; }
+
+.mesh-pill { padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #fff; display: inline-block; }
+.mesh-pill.ok { background: #37c837; }
+.mesh-pill.blue { background: #4a6fa5; }
+.mesh-pill.green { background: #0f8243; }
+.mesh-pill.grey { background: #aaa; }
+
+.mesh-tag { font-family: monospace; font-size: 12px; color: #666; }
+.mesh-muted { color: #777; font-size: 12px; line-height: 1.7; }
+
+.mesh-note {
+	border: 1px solid #e0e0e0;
+	background: #f6f6f6;
+	color: #666;
+	border-radius: 4px;
+	padding: 10px 12px;
+	font-size: 12px;
+	line-height: 1.9;
+}
+.mesh-note.green { background: #eef7ee; border-color: #cfe6cf; color: #3c763d; }
+.mesh-note.red { background: #fdecea; border-color: #f5c6cb; color: #a94442; }
+/* 组网可用、但漫游组件（dawn / umdns）缺失：不阻断组网，只作提醒 */
+.mesh-note.orange { background: #fff7e6; border-color: #f0d9a8; color: #8a6d3b; }
+
+.mesh-code {
+	background: #fbfbfb;
+	color: #333;
+	border: 1px solid #e5e5e5;
+	border-radius: 4px;
+	padding: 12px;
+	font-size: 12px;
+	max-height: 420px;
+	overflow: auto;
+	white-space: pre-wrap;
+	line-height: 1.6;
+	margin: 0;
+}
+
+.mesh-btnrow { display: flex; gap: 10px; flex-wrap: wrap; margin: 6px 0; }
+
+.mesh-rollback {
+	background: #fff8e1;
+	color: #333;
+	border: 1px solid #f0d98a;
+	border-left: 4px solid #f0ad4e;
+	border-radius: 4px;
+	padding: 12px 14px;
+	margin-bottom: 16px;
+}
+.mesh-rollback b { color: #a8741a; }
+
+.mesh-sigbars span {
+	display: inline-block;
+	width: 4px;
+	margin-right: 2px;
+	vertical-align: bottom;
+	background: #ddd;
+}
+
+.mesh-topo-wrap { text-align: center; }
+/* 拓扑图内部文字用固定灰度画在 SVG 上，给它一个稳定的浅色底，避免跟随暗色主题 */
+.mesh-topo-svg {
+	display: inline-block;
+	background: #fff;
+	border: 1px solid #e3e3e3;
+	border-radius: 4px;
+	padding: 10px 6px;
+}
+.mesh-topo-legend { text-align: center; margin-top: 6px; }
+.mesh-topo-legend span { display: inline-flex; align-items: center; margin-right: 16px; font-size: 12px; color: #666; }
+.mesh-topo-legend i { display: inline-block; width: 22px; height: 0; margin-right: 6px; }

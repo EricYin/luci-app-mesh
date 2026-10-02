@@ -1,0 +1,1458 @@
+#!/bin/sh
+# meshctl - luci-app-mesh 主控制器
+# 用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging>
+. /usr/libexec/mesh/functions.sh
+
+JF=$(command -v jsonfilter || echo /usr/bin/jsonfilter)
+
+# ================= 小工具 =================
+q() { uci -q get "$1" 2>/dev/null; }
+# 仅在值变化时写入，避免守护进程每 10 秒刷写闪存。
+# 调用点统一写成单参数形式 `mset <uci键>=<值>`（见本文件与 functions.sh），
+# 因此这里必须按"键=值"拆参。曾经的写法是直接取 $1/$2 两个位置参数，
+# 结果单个参数被整体当成键名 → `uci get` 取不到值恒为空 → 与同样为空的 $2 相等
+# → uci set 永远不执行，所有写入静默失效（子节点拿不到管理地址、AP 镜像不生效等）。
+# 两种形式都接受，避免再踩：`mset k=v` 与 `mset k v`。
+mset() {
+	local key val cur
+	if [ "$#" -ge 2 ]; then
+		key="$1"; val="$2"
+	else
+		key=${1%%=*}
+		val=${1#*=}
+	fi
+	[ -n "$key" ] || return 0
+	cur=$(uci -q get "$key" 2>/dev/null)
+	[ "$cur" = "$val" ] || uci set "$key=$val"
+}
+mdel() { uci -q delete "$1" 2>/dev/null; }
+# 同步结果落盘：lastok/lastfail 每轮都必须刷新（状态页据此判断"最近同步时间"），
+# 但日志只在该结果"与上一次不同"时记录一次 —— 子节点每 10 秒同步一次，配置稳定时
+# 结果恒为"配置一致"，若每轮都写一条日志，既刷屏又让日志文件不断翻转(写盘)。
+sync_ok() {
+	local prev
+	prev=$(cat "$MESH_TMP_DIR/lastreason" 2>/dev/null)
+	date '+%Y-%m-%d %H:%M:%S' > "$MESH_TMP_DIR/lastok"
+	printf '%s' "$1" > "$MESH_TMP_DIR/lastreason"
+	[ "$prev" = "$1" ] || mesh_log info "$1"
+}
+sync_fail() {
+	local prev
+	prev=$(cat "$MESH_TMP_DIR/failreason" 2>/dev/null)
+	date '+%Y-%m-%d %H:%M:%S' > "$MESH_TMP_DIR/lastfail"
+	printf '%s' "$1" > "$MESH_TMP_DIR/failreason"
+	[ "$prev" = "$1" ] || mesh_log warn "$1"
+}
+
+mesh_running_channel() { mesh_radio_running_channel "$1"; }
+
+# ================= AP/射频 快照缓冲 =================
+# APS_buf    每行: band|ssid|enc|key|r|ft_over_ds|mdid|nasid|reassoc|disabled
+# RADIOS_buf 每行: band|channel|real|htmode   (real=主节点实际运行信道，auto 时为 0)
+
+band_channel()      { printf '%s\n' "$RADIOS_buf" | awk -F'|' -v b="$1" '$1==b{print $2; exit}'; }
+band_channel_real() { printf '%s\n' "$RADIOS_buf" | awk -F'|' -v b="$1" '$1==b{print $3; exit}'; }
+band_htmode()       { printf '%s\n' "$RADIOS_buf" | awk -F'|' -v b="$1" '$1==b{print $4; exit}'; }
+
+mesh_first_ap_on_radio() {
+	local sec
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(q wireless.$sec.device)" = "$1" ] || continue
+		[ "$(q wireless.$sec.mode)" = "ap" ] || continue
+		echo "$sec"; return 0
+	done
+}
+
+# ================= 端口并入 br-lan =================
+# 子节点"删上行接口"这一步已经挪进 functions.sh 的 mesh_uci_remove_upstream()：
+# 它按"是否占用物理端口"判定，覆盖节名不叫 wan、匿名节、@wan 悬空引用、
+# 固件单独的 br-wan 桥等情形（只按名字删会漏，见那边的注释）。
+
+# ================= Mesh 回程接口 =================
+# $1 radio $2 channel $3 enc $4 key $5 mesh_id $6 rssi $7 maxp $8 fwd $9 hwmp_root
+mesh_uci_apply_mesh_ifaces() {
+	local sec
+	if [ -f "$MESH_STATE_DIR/mesh-iface" ]; then
+		sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
+		uci -q get "wireless.$sec" >/dev/null 2>&1 || sec=""
+	fi
+	[ -n "$sec" ] || {
+		sec=$(uci add wireless wifi-iface)
+		echo "$sec" > "$MESH_STATE_DIR/mesh-iface"
+	}
+	uci set wireless.$sec.device="$1"
+	uci set wireless.$sec.mode=mesh
+	uci set wireless.$sec.mesh_id="$5"
+	uci set wireless.$sec.network=lan
+	uci set wireless.$sec.ifname=mesh0
+	uci set wireless.$sec.mesh_fwding="$8"
+	uci set wireless.$sec.mesh_rssi_threshold="$6"
+	uci set wireless.$sec.mesh_hwmp_rootmode="$9"
+	uci set wireless.$sec.disabled=0
+	case "$3" in
+		none)
+			uci set wireless.$sec.encryption=none
+			mdel wireless.$sec.key
+			;;
+		*)
+			uci set wireless.$sec.encryption="$3"
+			[ -n "$4" ] && uci set wireless.$sec.key="$4"
+			;;
+	esac
+	# 信道写在 radio 上；auto 时不写死（跟随驱动选择）
+	if [ "$2" != "auto" ] && [ -n "$2" ]; then
+		mset wireless.$1.channel="$2"
+	else
+		mset wireless.$1.channel=auto
+	fi
+}
+
+mesh_uci_remove_mesh_ifaces() {
+	local sec
+	if [ -f "$MESH_STATE_DIR/mesh-iface" ]; then
+		sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
+		[ -n "$sec" ] && uci -q delete "wireless.$sec"
+		rm -f "$MESH_STATE_DIR/mesh-iface"
+	fi
+	# 清理游离的 mesh iface（历史遗留）
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(q wireless.$sec.mode)" = "mesh" ] && uci -q delete "wireless.$sec"
+	done
+}
+
+# ================= AP 镜像 =================
+# $1 = 节点序号（>=1，由主节点按注册顺序分配）
+# $2 = 回程频段（该频段 radio 必须与主节点同信道，不参与错开）
+# 本函数由守护进程每 10 秒调用一次，必须做到"配置没变就不产生任何 UCI 变更"。
+# 否则 `uci changes wireless` 恒为非空 → 每轮同步都 wifi reload → 无线一直反复重启。
+#   1) 本工具创建的 AP 段要复用（段名保持稳定），不能每轮都删掉再重建；
+#   2) 所有赋值一律走 mset（值相同就不写）—— uci set 即便写入相同的值也会留下变更记录。
+mesh_uci_mirror_aps() {
+	local idx="$1" bh_band="$2" radio band sec tgt n db dssid denc dkey r w mdid nasid rad rch rht real cht
+	local pool="" used=""
+	mkdir -p "$MESH_STATE_DIR"
+	for radio in $(mesh_radios); do
+		band=$(mesh_radio_band "$radio")
+		# 收集上一轮由本工具在该 radio 上创建、且仍然存在的 AP 段，供本轮复用
+		pool=""
+		if [ -f "$MESH_STATE_DIR/ap-created-$radio" ]; then
+			for sec in $(cat "$MESH_STATE_DIR/ap-created-$radio" 2>/dev/null); do
+				uci -q get "wireless.$sec" >/dev/null 2>&1 || continue
+				pool="$pool $sec"
+			done
+		fi
+		used=""
+		n=0
+		while IFS='|' read -r db dssid denc dkey r w mdid nasid rad ddis; do
+			[ -n "$dssid" ] || continue
+			[ "$db" = "$band" ] || continue
+			ddis=${ddis:-0}
+			# 第一个 AP 复用原生接口；其余先复用自建段，不够再新建
+			if [ "$n" = "0" ]; then
+				tgt=$(mesh_first_ap_on_radio "$radio")
+			else
+				tgt=""
+			fi
+			if [ -z "$tgt" ]; then
+				for sec in $pool; do
+					case " $used " in *" $sec "*) continue;; esac
+					tgt=$sec; break
+				done
+				if [ -z "$tgt" ]; then
+					tgt=$(uci add wireless wifi-iface)
+				fi
+				used="$used $tgt"
+			else
+				# 该 radio 没有原生 AP 时，第一个 AP 复用的就是我们上一轮创建的段。
+				# 这种情况也必须登记为"已用"，否则末尾会被当成多余段删掉再重建
+				case " $pool " in *" $tgt "*) used="$used $tgt";; esac
+			fi
+			mset wireless.$tgt.device="$radio"
+			mset wireless.$tgt.mode=ap
+			mset wireless.$tgt.network=lan
+			mset wireless.$tgt.ssid="$dssid"
+			case "$denc" in
+				none|"")
+					mset wireless.$tgt.encryption=none
+					mdel wireless.$tgt.key
+					;;
+				*)
+					mset wireless.$tgt.encryption="$denc"
+					[ -n "$dkey" ] && mset wireless.$tgt.key="$dkey"
+					;;
+			esac
+			if [ "$r" = "1" ]; then
+				mset wireless.$tgt.ieee80211r=1
+				[ -n "$w" ] && mset wireless.$tgt.ft_over_ds="$w"
+				[ -n "$rad" ] && mset wireless.$tgt.reassociation_deadline="$rad"
+				[ -n "$mdid" ] && mset wireless.$tgt.mobility_domain="$mdid"
+				[ -n "$nasid" ] && mset wireless.$tgt.nasid="$nasid"
+				case "$denc" in
+					psk*|sae*|mixed) mset wireless.$tgt.ft_psk_generate_local=1;;
+				esac
+			else
+				mdel wireless.$tgt.ieee80211r
+				mdel wireless.$tgt.ft_over_ds
+				mdel wireless.$tgt.reassociation_deadline
+				mdel wireless.$tgt.mobility_domain
+				mdel wireless.$tgt.nasid
+				mdel wireless.$tgt.ft_psk_generate_local
+			fi
+			mset wireless.$tgt.disabled="$ddis"
+			n=$((n+1))
+		done <<EOF
+$APS_buf
+EOF
+		# 只有本轮真的用不上的段（主节点删掉了多余的 AP）才删除
+		for sec in $pool; do
+			case " $used " in *" $sec "*) continue;; esac
+			uci -q delete "wireless.$sec" 2>/dev/null
+		done
+		if [ -n "$used" ]; then
+			# 每轮同步都会执行：AP 段集合通常不变，内容一致时 mesh_state_write 不落盘
+			printf '%s\n' $used | mesh_state_write "$MESH_STATE_DIR/ap-created-$radio"
+		else
+			rm -f "$MESH_STATE_DIR/ap-created-$radio" 2>/dev/null
+		fi
+		# 子节点：跟随主节点射频参数
+		#   回程频段 -> 必须与主节点同信道（主节点 auto 时用其实际运行信道）
+		#   其它频段 -> 主节点为固定信道时按节点序号错开；auto 则保持 auto
+		if [ "$idx" != "0" ] && [ -n "$band" ]; then
+			rch=$(band_channel "$band")
+			rht=$(band_htmode "$band")
+			if [ -n "$rch" ]; then
+				if [ "$band" = "$bh_band" ]; then
+					if [ "$rch" = "auto" ]; then
+						real=$(band_channel_real "$band")
+						case "$real" in ''|0|*[!0-9]*) real="";; esac
+						[ -n "$real" ] && rch="$real"
+					fi
+				elif [ "$rch" != "auto" ]; then
+					rch=$(mesh_stagger_channel "$band" "$rch" "$idx")
+				fi
+				mset wireless.$radio.channel="$rch"
+				# 回程频段：把学到的"主节点实际信道"写回本机配置。
+				# 回程信道必须两端相同，而这个值只有连上主节点后才拿得到；写回去以后，
+				# 子节点重新 apply（或重启后重新组网）就直接用同一信道，不必再依赖
+				# "无线链路已通"这个先有鸡后有蛋的前提。
+				if [ "$band" = "$bh_band" ] && [ "$rch" != "auto" ]; then
+					mset mesh.main.channel="$rch"
+				fi
+			fi
+			# htmode 必须按"本机射频自身能力"降级后再写：混编组网（主节点 WiFi6 /
+			# 本机 WiFi5）时把主节点的 HE80 原样写下来，热重载会 Not supported(-122)
+			# 并把 AP 留在 disabled（实测 MT7615 上 5G AP 直接不广播，只有整 radio
+			# 重启才恢复）。这里只跟随"频宽"，代际(HE/VHT/HT)取本机支持的最强者；
+			# 本机能力探测不到时保持现有值，绝不强写。
+			if [ -n "$rht" ]; then
+				cht=$(mesh_localize_htmode "$radio" "$rht")
+				[ -n "$cht" ] && mset wireless.$radio.htmode="$cht"
+			fi
+		fi
+	done
+}
+
+mesh_uci_cleanup_ap_sections() {
+	local f sec
+	for f in "$MESH_STATE_DIR"/ap-created-*; do
+		[ -f "$f" ] || continue
+		for sec in $(cat "$f" 2>/dev/null); do
+			uci -q delete "wireless.$sec" 2>/dev/null
+		done
+		rm -f "$f"
+	done
+}
+
+# ================= 应用配置 =================
+cmd_apply() {
+	local enabled role id key enc country band ch rssi maxp fwd gw hwmp bh_radio hwmp_root r sec has need_cfg
+	local rb_ip rb_sec batman batman_gw def_ch
+	# ===== 先把"暂存未提交"的 mesh 改动落盘，再读配置 =====
+	# 场景：脚本/CI 里 `uci set mesh...` 之后直接调 apply。uci 的改动在 shell 里
+	# 是**暂存在 /tmp/.uci/<config>** 的，没 commit 就读不到新值，于是走进
+	# "停用"分支把接口拆掉（真机踩到过，2026-09-23）。这里先提交再读，零副作用。
+	#
+	# 注意：**这一招管不到网页路径**。LuCI 网页的 rpcd uci.set 暂存只存在于
+	# 会话内存里（实测：web 侧 set 之后，设备上 `uci changes mesh` 为空、
+	# /tmp/.uci/mesh 是 0 字节），shell 与 meshctl 都看不见。网页那边的落盘
+	# 必须由前端自己调 uci.apply() 完成 —— 见 settings.js 的 handleSaveApply。
+	# 这里保留是因为它对 CLI 调用方仍然有效，且对其它调用方无害。
+	#
+	# 只提交 mesh 这一个配置，其它配置归别的界面管，这里不越权。
+	if [ -n "$(uci changes mesh 2>/dev/null)" ]; then
+		uci commit mesh
+		echo "提示：检测到 mesh 有暂存未提交的改动，已先行提交后再应用"
+	fi
+	enabled=$(mesh_uci_getd main.enabled 0)
+	role=$(mesh_uci_get main.role)
+	id=$(mesh_uci_get main.mesh_id)
+	key=$(mesh_uci_get main.mesh_key)
+	# 界面上暴露的项：用户设了就用用户的，没设（留空/未配置）才回落到后端自动判定。
+	# 默认值一律取自 functions.sh 里的 mesh_default_* 解析器，而不是在这里写字面量 ——
+	# cmd_apply / cmd_status / mesh-sync 三处都读同一套值，散着写迟早出现
+	# "状态页显示 A、实际下发 B" 这类极难排查的偏差。
+	enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
+	country=$(mesh_uci_getd main.country "$(mesh_default_country)")
+	band=$(mesh_uci_getd main.band auto)
+	ch=$(mesh_uci_getd main.channel auto)
+	rssi=$(mesh_uci_getd main.rssi "$(mesh_default_rssi)")
+	maxp=$(mesh_uci_getd main.max_peers "$(mesh_default_max_peers)")
+	# ===== 以下三项界面上已不暴露，按角色自动判定 =====
+	fwd=$(mesh_uci_getd main.layer2 1)
+	gw=$(mesh_uci_getd main.gw_advertise 1)
+	hwmp=$(mesh_uci_getd main.hwmp_mode auto)
+	# ===== 路径选择 (batman-adv) 为强制项：界面上不提供开关，这里也不读配置 =====
+	# 本包编译依赖已硬绑定 kmod-batman-adv + batctl + wpad-mesh-openssl + kmod-mac80211，
+	# 装完即具备条件，所以恒为启用；缺失内核模块时下面 [1/7] 会直接报错（而不是静默降级）。
+	# 网关模式按角色自动判断（master=server / client=client，主节点无默认路由时降 client）。
+	# 有线回程固定为 B 方案（br-lan 二层桥接），本包只实现这一种：
+	#   物理端口全部进 br-lan，bat0 也只作为 br-lan 的一个成员加入，
+	#   bat0 的 hardif 只有无线回程 mesh0 一个。
+	#   两台节点之间拉一根网线时，两个 br-lan 合成**同一个二层域**，网桥按 MAC 学习
+	#   直接从网口转发 —— 零 batman 封装开销、跑满线速，对端客户端的 MAC 只会在网口上
+	#   被学到（实测：测试机的 MAC 只在 lan1/lan3，不在 bat0）。这就是"有线优先"。
+	#   **注意 bat0 并不会被 STP 阻塞**（本包注释与文档曾长期这么写，2026-09-23 真机实测
+	#   推翻）：batman-adv 在 tx 路径直接丢弃目的地址 01:80:C2:00:00:00 的帧
+	#   （soft-interface.c: "don't accept stp packets. STP does not help in meshes"），
+	#   BPDU 出不了 bat0 → 对端收不到 → 两端各自把 bat0 当本段唯一的桥，恒为 forwarding。
+	#   跨 mesh 的环由 BLA 负责，STP 只管物理口之间的环。
+	#   拔线时 bat0 本来就是 forwarding，没有 STP 状态迁移要等（网桥刷新转发表即接管）；
+	#   唯一要等 STP 的是**插**方向：新端口必须过完 listening+learning（fd 压到 4 → 约 8 秒）。
+	#   换来的是完全不碰 VLAN 配置（另一种做法要在 br-lan 上开 VLAN filtering，netifd
+	#   落地与预期不符时端口会被隔离、设备失联，真机踩到过）。
+	batman=1
+	batman_gw=auto
+	# 把强制值写回 UCI：一是让状态页展示与实际一致，二是 mesh-sync 端点读的是
+	# main.batman，必须与"实际生效值"一致才能正确下发给子节点。
+	[ "$(q mesh.main.batman)" = "1" ] || uci set mesh.main.batman=1
+	[ "$(q mesh.main.batman_gw)" = "auto" ] || uci set mesh.main.batman_gw=auto
+	# 历史版本遗留的 main.batman_wired（0/1/2 三种有线回程模式）已无意义，
+	# 留着只会让"配置里写着 2、实际跑 B"这类偏差继续误导排查，顺手删掉
+	[ -n "$(q mesh.main.batman_wired)" ] && uci -q delete mesh.main.batman_wired
+
+	if [ "$enabled" != "1" ]; then
+		echo "[1/2] 组网已停用：移除本工具创建的 mesh 接口（保留原有 AP）"
+		# 拿不到锁就退出，绝不"抢不到也照样改"：uci 的提交是"读-改-写"，
+		# 两个 apply 并发交错的提交会把对方的改动整段覆盖掉（真机复现过：被删的
+		# 配置项又回来了）。_lock_take 只重试 5 秒，而一次 apply 全程 >5 秒，
+		# 所以"抢不到"在并发下几乎是必然事件，必须显式失败。
+		mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+		# 停用时必须撤掉回滚窗口：守护进程的 rollback_check 每轮都在跑，
+		# 残留的窗口到期后会去检查"管理地址是否可达"，不可达就把配置还原掉 ——
+		# 用户是主动停用的，不该再被自动还原一次
+		rm -f "$MESH_STATE_DIR/rollback" "$MESH_STATE_DIR/rollback.confirmed"
+		mesh_uci_remove_mesh_ifaces
+		mesh_batman_remove
+		uci set mesh.main.status_text='组网已停用'
+		uci commit mesh
+		if [ -n "$(uci changes wireless)" ]; then
+			uci commit wireless
+			wifi reload >/dev/null 2>&1 &
+		fi
+		if [ -n "$(uci changes network)" ]; then
+			uci commit network
+			/etc/init.d/network restart >/dev/null 2>&1 &
+		fi
+		mesh_unlock
+		echo "完成。"
+		return 0
+	fi
+
+	echo "[1/7] 校验参数"
+	if [ "$role" != master ] && [ "$role" != client ]; then
+		echo "错误：请选择本节点角色（主节点/子节点）"; return 1
+	fi
+	if [ -z "$id" ]; then
+		echo "错误：Mesh ID 不能为空"; return 1
+	fi
+	if [ "${#id}" -gt 32 ]; then
+		echo "错误：Mesh ID 最长 32 字符"; return 1
+	fi
+	if [ "$enc" != none ] && [ "${#key}" -lt 8 ]; then
+		echo "错误：回程密码至少 8 位（或选择不加密）"; return 1
+	fi
+	if ! mesh_kernel_mesh_cap; then
+		echo "错误：本机无线驱动未上报 mesh point 能力（802.11s 不被支持）"; return 1
+	fi
+	if ! mesh_wpad_mesh_cap; then
+		echo "错误：未安装支持 802.11s 的 wpad（请安装 wpad-openssl 或 wpad-wolfssl）"; return 1
+	fi
+	if ! mesh_batman_module_ready; then
+		# 强制要求 batman-adv 内核模块（kmod-batman-adv）：不走 300s 缓存（mesh_batman_cap），
+		# 用 mesh_batman_module_ready 即时检查并先 modprobe 一次，刚装完没重启也能立刻认出来。
+		# 硬条件是内核模块，不是 batctl 二进制；两者都由 kmod-batman-adv 包带来，
+		# 安装命令按实际包管理器给出（apk / opkg 自适应），不要写死其中一种
+		echo "错误：缺少 batman-adv 内核模块（请执行 $(mesh_pm_install) kmod-batman-adv batctl）"; return 1
+	fi
+	if ! mesh_batctl >/dev/null 2>&1; then
+		echo "错误：缺少 batctl 工具（请执行 $(mesh_pm_install) kmod-batman-adv batctl）"; return 1
+	fi
+	band=$(mesh_resolve_backhaul_band "$band")
+	[ -n "$band" ] || { echo "错误：未找到可用射频"; return 1; }
+	bh_radio=$(mesh_band_radio "$band")
+	[ -n "$bh_radio" ] || { echo "错误：本机没有 ${band}GHz 射频"; return 1; }
+	# 回程信道：同一组网内所有节点必须"完全相同"。
+	# 802.11s mesh point 与 STA 不同：STA 会扫描并跟随 AP 的信道，而 mesh 两端必须各自
+	# 把射频落到同一信道上才会互相收到信标、建立 plink。两端各自 auto = 各挑各的，
+	# 几乎必然错开 —— 表现为"两个 mesh 接口都 up、却始终 0 个对端"（实测踩过：主节点
+	# 固定 40、子节点 auto 落到 36，就是这现象，子节点还因拿不到地址被回滚）。
+	# 所以：空值/非法值一律落到本频段的固定默认值；子节点的 auto 也一并改成默认值
+	# （子节点无法自动跟随，用 auto 一定组不上）；主节点保留 auto 的能力，但要提示
+	# 子节点必须先用其它路径连上它。
+	def_ch=$(mesh_default_channel "$band")
+	if [ "$ch" = "auto" ]; then
+		if [ "$role" = client ]; then
+			echo "提示：子节点不能用「自动」回程信道（无法自动跟随主节点），已改用默认信道 $def_ch，请确认与主节点相同"
+			ch="$def_ch"
+		else
+			echo "提示：回程信道为「自动」—— 子节点必须先经其它路径（如网线）连上本机才能跟随其实际信道，建议固定为一个信道"
+		fi
+	elif [ -z "$ch" ] || ! mesh_channel_valid "$band" "$ch"; then
+		echo "提示：回程信道「${ch:-未设置}」无效，已改用默认信道 $def_ch（所有节点必须相同）"
+		ch="$def_ch"
+	fi
+	[ "$(q mesh.main.channel)" = "$ch" ] || uci set mesh.main.channel="$ch"
+	# 同理把其余"实际生效值"回填 UCI。界面留空时若不回填，状态页会显示空、
+	# 而 mesh-sync 端点读到的却是解析器给的默认值 —— 两端不一致最难排查。
+	[ "$(q mesh.main.encryption)" = "$enc" ] || uci set mesh.main.encryption="$enc"
+	[ "$(q mesh.main.country)" = "$country" ] || uci set mesh.main.country="$country"
+	[ "$(q mesh.main.band)" = "$band" ] || uci set mesh.main.band="$band"
+	[ "$(q mesh.main.rssi)" = "$rssi" ] || uci set mesh.main.rssi="$rssi"
+	[ "$(q mesh.main.max_peers)" = "$maxp" ] || uci set mesh.main.max_peers="$maxp"
+
+	# 拿不到锁就退出（理由同上面 [1/2] 分支）：并发 apply 会互相覆盖 uci 提交。
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	echo "[2/7] 备份组网前配置"
+	mesh_backup_once
+
+	echo "[3/7] 写入状态"
+	mkdir -p "$MESH_STATE_DIR"
+	echo "$band" > "$MESH_STATE_DIR/bh-band"
+	{
+		echo "role=$role"
+		echo "mesh_id=$id"
+		echo "enc=$enc"
+		echo "band=$band"
+		echo "channel=$ch"
+		echo "country=$country"
+		echo "rssi=$rssi"
+		echo "max_peers=$maxp"
+		echo "hwmp=$hwmp"
+	} > "$MESH_STATE_DIR/config"
+
+	echo "[4/7] 配置网络（子节点：全部物理端口并入内网 br-lan、地址由主节点 DHCP 分发）"
+	# 子节点恒为 DHCP：内网地址一律向主节点申请，不再有"手填内网地址"这条路。
+	# 历史选项 client_addr（DHCP / 保留原有静态地址）已删除，这里顺手清掉旧配置里的残留。
+	# 不只是简化：`proto=static` 而 `ipaddr` 为空会让 br-lan 一个地址都没有，节点当场
+	# 彻底失联（实测踩到过，只能靠 IPv6 链路本地去救）—— 恒 DHCP 从根上消除该状态。
+	if [ -n "$(q mesh.main.client_addr)" ]; then
+		uci -q delete mesh.main.client_addr
+		mesh_log info "已移除历史选项 client_addr：子节点内网地址固定由主节点 DHCP 分发"
+	fi
+	if [ "$role" = client ]; then
+		# 必须先拆掉所有"占着物理端口的上行/旁路接口"，端口才会被识别为内网端口；
+		# 反过来的话 WAN 口会被 mesh_lan_ports 当成上行口排除掉，永远进不了 br-lan
+		mesh_uci_remove_upstream
+		mesh_ports_into_brlan
+		mset network.lan.proto=dhcp
+		# 残留的手动 IPv4 配置（历史版本"保留原有静态地址"留下的）一并清掉：proto=dhcp
+		# 下 netifd 根本不消费它们（ipaddr/gateway 不是接口属性，由 static 协议自己取），
+		# 留着只会让配置文件里摆着一个没用上的手填地址，误导排障。
+		for o in ipaddr netmask gateway dns broadcast; do
+			mdel "network.lan.$o"
+		done
+		# 关闭本机 DHCP 服务：地址与下挂终端全部由主节点分发
+		mset dhcp.lan.ignore=1
+		mset dhcp.lan.ra=disabled
+		mset dhcp.lan.dhcpv6=disabled
+	else
+		# 主节点保留 WAN 上行口，只把 LAN 侧端口收进 br-lan（不能把 WAN 桥进内网）
+		mesh_ports_into_brlan
+		# 主节点是网关，内网必须是静态地址。但绝不能在 ipaddr 为空时写 static ——
+		# 那等于亲手把内网地址抹掉，节点当场失联（子节点正是被这个状态变砖的）。
+		if [ -n "$(q network.lan.ipaddr)" ]; then
+			mset network.lan.proto=static
+		else
+			mesh_log warn "内网 lan.ipaddr 为空，保持 proto=$(q network.lan.proto) 不改写；请先在 LuCI 里给 br-lan 配置地址"
+			echo "提示：内网 lan.ipaddr 为空，未改写 proto（主节点必须有静态地址）"
+		fi
+		mdel dhcp.lan.ignore
+		mdel dhcp.lan.ra
+		mdel dhcp.lan.dhcpv6
+	fi
+	# br-lan 的 MAC 必须确定，否则子节点的 DHCP 地址会随网桥重建而漂移（见函数注释）
+	mesh_pin_brlan_mac
+
+	# 回滚保护窗口：窗口结束时若新管理地址不可达，自动还原组网前配置。
+	# 由守护进程自动触发的应用(MESH_NOROLLBACK=1)不建窗口——没人会去点"确认"，
+	# 否则窗口一到就会把刚刚同步成功的配置给还原掉
+	rm -f "$MESH_STATE_DIR/rollback.confirmed"
+	rb_sec=$MESH_ROLLBACK_SECONDS
+	if [ "${MESH_NOROLLBACK:-0}" = "1" ]; then
+		rm -f "$MESH_STATE_DIR/rollback"
+	elif [ "$role" = client ]; then
+		# 子节点恒为 DHCP："-" = 只要 br-lan 拿到任意地址即视为可管理，
+		# 不校验具体地址（地址由主节点分发，我们事先无从得知）
+		rb_ip="-"
+		# batman-adv 恒为启用（见 [1/7]），需要等 OGM 收敛才能拿到地址，窗口放宽
+		rb_sec=240
+	else
+		rb_ip=$(mesh_lan_ip)
+	fi
+	if [ "${MESH_NOROLLBACK:-0}" != "1" ]; then
+		{
+			echo "ip=$rb_ip"
+			echo "deadline=$(( $(date +%s) + rb_sec ))"
+		} > "$MESH_STATE_DIR/rollback"
+	fi
+
+	echo "[5/7] 配置 mesh 回程接口（$bh_radio · ${band}GHz · 信道 $ch）"
+	hwmp_root=$hwmp
+	[ "$hwmp" = auto ] && { [ "$role" = master ] && hwmp_root=3 || hwmp_root=0; }
+	# batman-adv 接管路径选择后，802.11s 自身的转发与 HWMP 根模式必须让位
+	[ "$batman" = "1" ] && { fwd=0; hwmp_root=0; }
+	# 让位结果回填 UCI，保证状态页显示的就是实际生效值。
+	# 注意只回填 layer2：hwmp_mode 保留 auto/用户值，它是"模式设定"而非生效值，
+	# 写死成 0 会丢掉下次 apply 时按角色重新判定的能力。
+	[ "$(q mesh.main.layer2)" = "$fwd" ] || uci set mesh.main.layer2="$fwd"
+	if [ "$role" = master ]; then
+		if [ "$gw" = 1 ] && ! ip route show default 2>/dev/null | grep -q .; then
+			echo "提示：未检测到默认路由，网关通告已自动关闭"
+			gw=0
+			uci set mesh.main.gw_advertise=0
+		fi
+	else
+		gw=0
+	fi
+	mesh_uci_apply_mesh_ifaces "$bh_radio" "$ch" "$enc" "$key" "$id" "$rssi" "$maxp" "$fwd" "$hwmp_root"
+	for r in $(mesh_radios); do mset wireless.$r.country="$country"; done
+
+	# batman-adv：mesh 接口改挂到 bat0 的 hardif 上，而不是直接进 br-lan
+	sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
+	if [ "$batman" = "1" ]; then
+		local bat_gw=$batman_gw
+		[ "$batman_gw" = auto ] && { [ "$role" = master ] && bat_gw=server || bat_gw=client; }
+		if [ "$bat_gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
+			echo "提示：未检测到默认路由，batman-adv 网关模式降为 client"
+			bat_gw=client
+		fi
+		mesh_batman_apply "$bat_gw"
+		[ -n "$sec" ] && uci set wireless.$sec.network=batmesh
+		echo "      batman-adv 已接管路径选择（网关模式 $bat_gw，802.11s 转发已关闭）"
+	else
+		mesh_batman_remove
+		[ -n "$sec" ] && uci set wireless.$sec.network=lan
+	fi
+
+	if [ "$role" = master ]; then
+		# 主节点：原样保留本机在「网络 → 无线」里的 AP 设置，绝不改写 SSID/密码。
+		# 仅清理本工具在"子节点时期"自动创建出来的 AP，避免残留重复接口。
+		mesh_uci_cleanup_ap_sections
+		# 缺省 AP 补全（仅当某射频完全没有接口时）
+		need_cfg=0
+		for r in $(mesh_radios); do
+			has=0
+			for sec in $(mesh_wifi_ifaces); do
+				[ "$(q wireless.$sec.device)" = "$r" ] && has=1
+			done
+			[ "$has" = "0" ] && need_cfg=1
+		done
+		[ "$need_cfg" = 1 ] && { echo "      为空射频生成默认 AP"; wifi config; }
+		echo "[6/7] 主节点：原样保留本机无线设置（子节点将同步这里配置的 SSID/密码/802.11r）"
+		rm -f "$MESH_STATE_DIR/my-index"
+	else
+		echo "[6/7] 子节点：AP 与信道由主节点下发（守护进程自动同步）"
+		uci set mesh.main.status_text='等待主节点下发配置'
+	fi
+
+	echo "[7/7] 提交并重载"
+	net_chg=0; wl_chg=0; dhcp_chg=0
+	[ -n "$(uci changes network)" ] && net_chg=1
+	[ -n "$(uci changes wireless)" ] && wl_chg=1
+	[ -n "$(uci changes dhcp)" ] && dhcp_chg=1
+	uci set mesh.main.status_text="已应用（$role）"
+	uci commit mesh
+	[ "$net_chg" = 1 ] && uci commit network
+	[ "$wl_chg" = 1 ] && uci commit wireless
+	[ "$dhcp_chg" = 1 ] && uci commit dhcp
+	[ "$net_chg" = 1 ] && { /etc/init.d/network restart >>"$MESH_LOG" 2>&1; sleep 3; }
+	[ "$wl_chg" = 1 ] && wifi reload >>"$MESH_LOG" 2>&1
+	# 热重载在 "AP 与 mesh0 共用同一 radio" 的设备上可能把 AP 留在 disabled（见
+	# mesh_wifi_ensure_aps_up 注释）——apply 后同样要校验并兜底，否则"改一次密码
+	# 子节点 AP 就消失"。
+	[ "$wl_chg" = 1 ] && mesh_wifi_ensure_aps_up >>"$MESH_LOG" 2>&1
+	[ "$dhcp_chg" = 1 ] && /etc/init.d/dnsmasq restart >>"$MESH_LOG" 2>&1
+	mesh_ensure_service
+	# batman-adv 的 hardif 兜底（netifd 设 MTU 的时机不保证，这里补一次）
+	# 原先这里还会 `( sleep 15; mesh_bat_fix_mtu ) &` 起一个游离后台进程 —— 已去掉：
+	#   · 事件驱动：新增 /etc/hotplug.d/iface/30-mesh-bat-mtu，接口 up 时立即补
+	#   · 周期收敛：守护进程每轮循环顺带比对一次（只读 sysfs，代价极低）
+	# 两种方式都比"留一个睡 15 秒的子 shell"更干净 —— 后者不会被父进程回收，
+	# 且 apply 期间若用户紧接着再操作，会同时冒出多个这样的游离进程。
+	if [ "$batman" = "1" ]; then
+		mesh_bat_fix_mtu >>"$MESH_LOG" 2>&1
+	fi
+	[ "$role" = client ] && date '+%Y-%m-%d %H:%M:%S' > "$MESH_TMP_DIR/lastok"
+	mesh_unlock
+	echo "完成。无线重启约需 10~20 秒。"
+}
+
+# ================= 邻居表（状态页 + 拓扑） =================
+# 输出 TSV: mac|link|signal|txrate|connected|status|role|bat_tq|bat_via|bat_pref|bat_gw|path|host|ip
+#   link: wifi / wired / both(无线与有线同时在线) / unknown / 原注册值(离线时)
+#   role: master(主节点) / client(已注册子节点) / unknown(未登记邻居)
+#   bat_*: 来自 batman-adv。bat_tq 是它算出的路径质量(0~255)，
+#          bat_via 是它实际选中的出口。注意 bat0 在 B 方案下只有无线 mesh0 一个
+#          hardif，所以 bat_via/bat_pref **恒为无线** —— 它表达的是"batman 从哪个
+#          hardif 到达对端"，不是"数据实际走哪条路"，界面不得拿它当"优先链路"。
+#   path: 实际承载链路 wired / wifi / 空(未知)，按 br-lan 内核转发表实测。
+#         网线是 br-lan 的桥端口、不是 batman 的路径，只有转发表才看得见它。
+#         见 functions.sh 的 mesh_brlan_fdb_tsv。
+#   host/ip: 注册表里没有该设备时的兜底（子节点的注册表是空的 —— 注册是
+#          "子节点 → 主节点"单向的，所以子节点只能靠 master-id 认出主节点）
+#
+# 关键点：无线邻居表里的 MAC 是「对端 mesh 接口」的 MAC，与子节点上报的 eth* MAC
+# 不是同一个值。靠注册表第 9 列 wmac 建立映射，才能把同一台设备的有线/无线证据
+# 合并成一行，避免"一台设备被列两次 / 一条已连接一条离线"。
+build_peers_tsv() {
+	local wf="$MESH_TMP_DIR/wifi.tsv" arp="$MESH_TMP_DIR/arp.tsv"
+	local st="$MESH_TMP_DIR/stations.tsv" reg="$MESH_REGISTRY"
+	local fdb="$MESH_TMP_DIR/fdb.tsv"
+	local now ifn self selfw mmac="" mwmac="" mhost="" mid="$MESH_STATE_DIR/master-id"
+	now=$(date +%s)
+	self=$(mesh_primary_mac | tr 'a-f' 'A-F')
+	selfw=$(mesh_mesh_iface_macs)
+	[ -f "$mid" ] && {
+		mmac=$(sed -n 's/^\([^|]*\)|.*/\1/p' "$mid" | head -n1)
+		mwmac=$(sed -n 's/^[^|]*|\([^|]*\)|.*/\1/p' "$mid" | head -n1)
+		# 第 3 列是主节点主机名：子节点注册表为空，界面上主节点的名字只能从这里来
+		mhost=$(sed -n 's/^[^|]*|[^|]*|\([^|]*\).*/\1/p' "$mid" | head -n1)
+	}
+
+	# 实际承载链路：读内核桥转发表（见 mesh_brlan_fdb_tsv 的说明）
+	mesh_brlan_fdb_tsv > "$fdb" 2>/dev/null
+
+	: > "$wf"
+	for ifn in $(mesh_mesh_ifaces); do
+		iw dev "$ifn" station dump 2>/dev/null | awk '
+			function flush() { if (mac != "") printf "%s|%s|%s|%s\n", mac, sig, tx, ct }
+			BEGIN { mac = ""; sig = ""; tx = ""; ct = "" }
+			/^Station / { flush(); mac = $2; sig = ""; tx = ""; ct = ""; next }
+			/^[ \t]*signal:/ { sub(/^[ \t]*signal:[ \t]*/, ""); sub(/[ \t]*dBm.*$/, ""); sig = $0; next }
+			/^[ \t]*tx bitrate:/ { sub(/^[ \t]*tx bitrate:[ \t]*/, ""); sub(/[ \t].*$/, ""); tx = $0; next }
+			/^[ \t]*connected time:/ { sub(/^[ \t]*connected time:[ \t]*/, ""); sub(/[ \t].*$/, ""); ct = $0; next }
+			END { flush() }
+		' >> "$wf"
+	done
+
+	# ARP/邻居表: ip|mac|dev —— 既用于「未上报 wmac」的无线兜底，也用于判定有线是否真的在线
+	: > "$arp"
+	ip neigh show 2>/dev/null | awk 'NF>=5 && $5 ~ /^[0-9a-fA-F:]+$/ { printf "%s|%s|%s\n", $1, toupper($5), $3 }' >> "$arp"
+	[ -s "$arp" ] || awk 'NR>1 && NF>=6 { printf "%s|%s|%s\n", $1, toupper($4), $6 }' /proc/net/arp 2>/dev/null >> "$arp"
+
+	# batman-adv 路径表（若启用）：originator → TQ / 出口 / 是否选中网关
+	# 未启用时不落这张中间表：下面的 awk 读到不存在的文件会直接跳过（零开销）
+	local bt="$MESH_TMP_DIR/bat.tsv"
+	if [ "$(mesh_uci_getd main.batman 1)" = "1" ] && mesh_batman_cap; then
+		mesh_bat_originators_tsv > "$bt" 2>/dev/null
+	else
+		rm -f "$bt" 2>/dev/null
+	fi
+
+	: > "$st"
+	mkdir -p "$MESH_TMP_DIR"
+	[ -f "$reg" ] || : > "$reg"     # 子节点无注册表时给空输入，保证下面 awk 能正常跑
+	awk -F'|' -v now="$now" -v wf="$wf" -v arpf="$arp" -v btf="$bt" -v fdbf="$fdb" \
+		-v self="$self" -v selfw="$selfw" \
+		-v mmac="$mmac" -v mwmac="$mwmac" -v mhost="$mhost" '
+		function emit(m, lk, sg, txr, ctm, stt, rl, btq, bvia, bpref, bgw, pth, hst, pip) {
+			if (m == "" || done[m]) return
+			done[m] = 1
+			printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", m, lk, sg, txr, ctm, stt, rl, btq, bvia, bpref, bgw, pth, hst, pip
+		}
+		# 出口接口 → 链路类型
+		function iflink(s) {
+			if (s == "") return ""
+			# bat0 在 B 方案下是 br-lan 的永久成员口，其 hardif 是无线 mesh0；
+			# 数据经 bat0 到达即意味着走无线回程，必须判为 wifi，否则拔掉网线后
+			# 对端 MAC 改从 bat0 学到、被误判成"有线"（2026-09-23 复现：断线仍显示有线）。
+			if (s ~ /^mesh/ || s ~ /^wlan/ || s ~ /^bat/) return "wifi"
+			return "wired"
+		}
+		# 在 batman-adv 路径表里查该节点：命中多个候选取 TQ 最高的
+		function batfind(nc) {
+			btq = ""; bvia = ""; bpref = ""; bgw = 0
+			for (j = 1; j <= nc; j++) {
+				k = cand[j]
+				if (k == "" || !(k in batorig)) continue
+				if (btq == "" || (batorig[k] + 0) > (btq + 0)) {
+					btq = batorig[k]; bvia = batvia[k]; bgw = batgw[k]; bpref = iflink(bvia)
+				}
+			}
+		}
+		# 实际承载：按 br-lan 转发表判断发往该节点的单播帧从哪个口出。
+		# 候选 MAC 顺序 = 节点本机 MAC（节点间单播用的就是各自 br-lan 的 MAC，
+		# 最可靠）→ master-id 映射出的节点 MAC → 上报的 mesh 接口 MAC →
+		# 无线邻居 MAC → ARP 学到的 MAC。命中第一个有转发表的即为答案。
+		function pathof(nmac, wmacs, best, ip,   i, n, k, c, wwa, bestp) {
+			n = 0
+			if (nmac != "") {
+				c[++n] = toupper(nmac)
+				k = toupper(nmac)
+				if (k in m2n) c[++n] = m2n[k]
+			}
+			k = split(toupper(wmacs), wwa, ",")
+			for (i = 1; i <= k; i++) if (wwa[i] != "") c[++n] = wwa[i]
+			if (best != "") c[++n] = toupper(best)
+			if (ip != "" && (ip in arpmac)) c[++n] = arpmac[ip]
+			# 有线优先：同一节点若同时被二层直转(网线)和 bat0(无线回程)学到，
+			# 数据实际压在网线上，优先报 wired，避免 bat0 条目覆盖导致误报无线。
+			bestp = ""
+			for (i = 1; i <= n; i++) {
+				if (c[i] in fpath) {
+					if (fpath[c[i]] == "wired") return "wired"
+					if (bestp == "") bestp = fpath[c[i]]
+				}
+			}
+			return bestp
+		}
+		BEGIN {
+			# 无线邻居：同一 MAC 出现在多个 mesh 接口时保留信号最好的一条
+			while ((getline l < wf) > 0) {
+				n = split(l, a, "|")
+				wm = toupper(a[1]); if (wm == "" || n < 4) continue
+				if (!(wm in wsig) || (a[2] + 0) > (wsig[wm] + 0)) {
+					wsig[wm] = a[2]; wtx[wm] = a[3]; wct[wm] = a[4]
+				}
+				wseen[wm] = 1
+			}
+			close(wf)
+		while ((getline l < arpf) > 0) {
+			split(l, b, "|")
+			if (b[1] == "" || b[2] == "") continue
+			mac2ip[toupper(b[2])] = b[1]                                # 反查：MAC -> IP
+			# ARP 只用于 IP->MAC 反查(arpmac)，绝不参与"有线/无线"链路判定：
+			# 断线后 ARP 条目在有线口仍 up 时会长期残留，用它判链路会误报 both
+			# （2026-09-23 二次复现）。B 方案里链路类型只由转发表(FDB)决定。
+			if (b[3] ~ /^mesh/ || b[3] ~ /^wlan/ || b[3] ~ /^bat/) arpmac[b[1]] = b[2]
+		}
+			close(arpf)
+			while ((getline l < btf) > 0) {
+				split(l, c, "|")
+				if (c[1] == "") continue
+				kk = c[1]
+				if (!(kk in batorig) || (c[2] + 0) > (batorig[kk] + 0)) {
+					batorig[kk] = c[2]; batvia[kk] = c[4]; batgw[kk] = (c[6] == "1" ? 1 : 0)
+				}
+				if (c[3] != "" && !(c[3] in batnex)) batnex[c[3]] = kk
+			}
+			close(btf)
+			# br-lan 转发表：MAC -> 出口接口 -> 链路类型。这是判断"数据实际走
+			# 有线还是无线"的唯一依据（batman 只看得到 bat0 的 hardif）。
+			while ((getline l < fdbf) > 0) {
+				split(l, d, "|")
+				if (d[1] == "" || d[2] == "") continue
+				fpath[toupper(d[1])] = iflink(d[2])
+			}
+			close(fdbf)
+			# 主节点身份集合（子节点视角下用来把主节点标出来）
+			n = split(mmac, t, ",")
+			nmac0 = ""; for (i = 1; i <= n; i++) if (t[i] != "" && nmac0 == "") nmac0 = toupper(t[i])
+			n = split(mwmac, t, ","); for (i = 1; i <= n; i++) if (t[i] != "") ismaster[toupper(t[i])] = 1
+			# mesh 接口 MAC -> 节点本机 MAC：子节点注册表为空，主节点在它眼里只是个
+			# "未登记的无线邻居"（身份是 mesh0 的 MAC）。映射过去才能既显示主机名，
+			# 又能用转发表判出"其实走的是网线"。
+			n = split(mwmac, t, ",")
+			for (i = 1; i <= n; i++)
+				if (t[i] != "" && nmac0 != "") m2n[toupper(t[i])] = nmac0
+			if (nmac0 != "" && mhost != "") mname[nmac0] = mhost
+			n = split(selfw, t, ","); for (i = 1; i <= n; i++) if (t[i] != "") isself[t[i]] = 1
+			if (self != "") isself[self] = 1
+		}
+		{
+			nmac = toupper($1)
+			if (nmac == "" || (nmac in isself)) next
+			ip = $2; host = $3; link = $6; last = $8 + 0
+			# 该节点上报的所有 mesh 接口 MAC → 命中无线邻居则视为无线在线
+			n = split(toupper($9), wa, ",")
+			best = ""; bestsig = -9999
+			for (i = 1; i <= n; i++) {
+				k = wa[i]; if (k == "") continue
+				if (k in wseen) { used[k] = 1; s = wsig[k] + 0; if (best == "" || s > bestsig) { best = k; bestsig = s } }
+			}
+			if (best == "" && (nmac in wseen)) { best = nmac; used[nmac] = 1; bestsig = wsig[nmac] + 0 }
+			# 旧版子节点没上报 wmac 时，用 ARP 表里的 IP→MAC 兜底关联
+			if (best == "" && (ip in arpmac) && (arpmac[ip] in wseen)) {
+				best = arpmac[ip]; used[best] = 1; bestsig = wsig[best] + 0
+			}
+			wifi_ok = (best != "")
+			# 实际承载链路（网桥转发表实测）：先算出来，它同时是最硬的有线证据
+			dpath = pathof(nmac, $9, best, ip)
+			# 有线在线必须实打实：发往该节点的单播确实从物理口出（转发表），
+			# 或者该 IP 是从有线口学到的。
+			# 只有「无线也没连上且记录为有线」时才回退信任注册表记录（ARP 不可用的情况）。
+		recent = (last + 180 >= now)
+		wired_ok = 0
+		if (recent) {
+			# 唯一可靠的有线证据 = 转发表(dpath)：发往该节点的单播确实从物理口出。
+			# 断线后该口 link-down，内核会立即冲刷此 MAC 的 FDB 条目 -> dpath 变空，
+			# "已拔线却显示有线"便不再发生。绝不回退到 ARP：ARP 条目在口仍 up 时会
+			# 长时间残留(实测 lan1 carrier=1、但子节点 MAC 根本不在 FDB)，一旦回退就误判
+			# 成 both（2026-09-23 二次复现）。B 方案下 bat0 的 hardif 仅 mesh0(无线)，
+			# batman 永远只走无线，故"有线"必须由 FDB 这一 L2 真实学习结果说了算。
+			if (dpath == "wired") wired_ok = 1
+		}
+		# 展示用 path：有线优先于无线；二者皆无时退回 dpath(可能为空)
+		ppath = (wired_ok ? "wired" : (wifi_ok ? "wifi" : dpath))
+			if (wifi_ok && wired_ok)          { lk = "both";  stt = "connected" }
+			else if (wifi_ok)                 { lk = "wifi";  stt = "connected" }
+			else if (wired_ok)                { lk = "wired"; stt = "connected" }
+			else if (recent)                  { lk = "unknown"; stt = "connected" }
+			else                              { lk = (link == "" ? "unknown" : link); stt = "offline" }
+			sg = wifi_ok ? wsig[best] : ""
+			txr = wifi_ok ? wtx[best] : (wired_ok ? "1000 Mb/s" : "-")
+			ctm = wifi_ok ? wct[best] : ""
+			rl = (nmac in ismaster) ? "master" : "client"
+			# batman-adv：候选身份 = 节点 MAC / 上报的 wmac / 命中的无线 MAC / ARP 学到的 MAC / 作为下一跳
+			nc = 0
+			cand[++nc] = nmac
+			n = split(toupper($9), wa, ",")
+			for (i = 1; i <= n; i++) if (wa[i] != "") cand[++nc] = wa[i]
+			if (best != "") cand[++nc] = best
+			if ((ip in arpmac)) cand[++nc] = arpmac[ip]
+			if (nmac in batnex) cand[++nc] = batnex[nmac]
+			batfind(nc)
+			emit(nmac, lk, sg, txr, ctm, stt, rl, btq, bvia, bpref, bgw, ppath, "", "")
+		}
+		END {
+			# 未在注册表登记的无线邻居：子节点视角下的主节点、以及未注册邻居。
+			# 主节点不会出现在子节点的注册表里（注册是"子节点 → 主节点"单向的），
+			# 子节点只能靠 master-id 认出它。认出后把身份还原成节点本机 MAC、
+			# 补上主机名与 IP，再用转发表判它是不是还接着网线 —— 这样两个方向
+			# 的状态页看到的才是同一台设备的同一个身份、同一组链路。
+			for (wm in wseen) {
+				if (wm in used) continue
+				if (wm in isself) continue
+				dm = wm
+				if ((wm in m2n) && !(m2n[wm] in isself)) dm = m2n[wm]
+				if (dm in done) continue
+				whost = (dm in mname) ? mname[dm] : ""
+				wip = (dm in mac2ip) ? mac2ip[dm] : ""
+				nc = 0
+				cand[++nc] = wm
+				if (wm in batnex) cand[++nc] = batnex[wm]
+				if (dm != wm) cand[++nc] = dm
+				batfind(nc)
+				# 能走到这一支就说明无线链路在线；转发表若显示它还有网线，两条都在线
+			wdpath = (dm in fpath) ? fpath[dm] : ((wm in fpath) ? fpath[wm] : "")
+			wppath = (wdpath == "wired") ? "wired" : "wifi"
+			emit(dm, (wdpath == "wired") ? "both" : "wifi", wsig[wm], wtx[wm], wct[wm], "connected",
+				(wm in ismaster || dm in ismaster) ? "master" : "unknown",
+				btq, bvia, bpref, bgw, wppath, whost, wip)
+			}
+		}
+	' "$reg" 2>/dev/null >> "$st"
+	echo "$st"
+}
+
+peers_tsv_to_json() {
+	local st="$1" reg="$MESH_REGISTRY"
+	awk -F'|' -v reg="$reg" '
+		function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+		BEGIN {
+			nreg = 0
+			while ((getline line < reg) > 0 && nreg < 64) {
+				split(line, a, "|")
+				mac = toupper(a[1])
+				rip[mac] = a[2]; rhost[mac] = a[3]; ridx[mac] = nreg + 1; rlast[mac] = a[8] + 0
+				nreg++
+			}
+			close(reg)
+			first = 1
+		}
+		{
+			mac = toupper($1)
+			if (mac == "" || seen[mac]++) next
+			link = $2; sig = $3; tx = $4; ct = $5; status = $6; role = $7
+			btq = $8; bvia = $9; bpref = $10; bgw = ($11 == "1" ? 1 : 0)
+			bpath = $12; bhost = $13; bip = $14
+			# 注册表优先；注册表里没有该设备时（子节点眼里的主节点）用 TSV 带来的兜底值
+			host = (mac in rhost && rhost[mac] != "") ? rhost[mac] : (bhost != "" ? bhost : mac)
+			ip   = (mac in rip && rip[mac] != "") ? rip[mac] : bip
+			idx  = (mac in ridx) ? ridx[mac] : 0
+			if (!first) printf ",\n"
+			first = 0
+			printf "{\"mac\":\"%s\",\"hostname\":\"%s\",\"link\":\"%s\",\"ip\":\"%s\",\"path\":\"%s\",\"signal\":%s,\"txrate\":\"%s\",\"connected\":\"%s\",\"index\":%d,\"status\":\"%s\",\"role\":\"%s\",\"bat\":{\"tq\":%s,\"via\":\"%s\",\"preferred\":\"%s\",\"gw\":%d}}",
+				esc(mac), esc(host), esc(link), esc(ip), esc(bpath),
+				(sig == "" ? "null" : "\"" sig "\""), esc(tx), esc(ct), idx, esc(status), esc(role),
+				(btq == "" ? "null" : "\"" btq "\""), esc(bvia), esc(bpref), bgw
+		}
+		END { if (first) printf " " }
+	' "$st"
+}
+
+# ================= 状态 =================
+cmd_status() {
+	local role enabled id enc country band ch rssi maxp fwd gw hwmp bh_radio bh_band now
+	local peer_count peer_online wifi_peers eth_peers lastok lastfail reason myidx syncinfo synccode
+	role=$(mesh_uci_getd main.role master)
+	enabled=$(mesh_uci_getd main.enabled 0)
+	id=$(mesh_uci_getd main.mesh_id OpenWrtMesh)
+	# 与 cmd_apply 用同一套解析器取默认值，避免"状态页显示 A、下发却是 B"
+	enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
+	country=$(mesh_uci_getd main.country "$(mesh_default_country)")
+	band=$(mesh_uci_getd main.band auto)
+	# 回程信道：配置为空时按与 cmd_apply 相同的默认值显示，避免状态页出现空白
+	ch=$(mesh_uci_getd main.channel '')
+	rssi=$(mesh_uci_getd main.rssi "$(mesh_default_rssi)")
+	maxp=$(mesh_uci_getd main.max_peers "$(mesh_default_max_peers)")
+	fwd=$(mesh_uci_getd main.layer2 1)
+	gw=$(mesh_uci_getd main.gw_advertise 1)
+	hwmp=$(mesh_uci_getd main.hwmp_mode auto)
+	# batman-adv 恒为启用，802.11s 的二层转发随之让位（与 cmd_apply 一致）
+	[ "$(mesh_uci_getd main.batman 1)" = "1" ] && fwd=0
+	now=$(date +%s)
+
+	local st
+	st=$(build_peers_tsv)
+	peer_count=$(wc -l < "$st" 2>/dev/null); peer_count=${peer_count:-0}
+	peer_count=$(printf '%s' "$peer_count" | tr -d ' ')
+	# 一台设备同时有无线与有线时只算一个节点，但两种链路各计一次
+	peer_online=$(awk -F'|' '$6=="connected"' "$st" | wc -l | tr -d ' ')
+	wifi_peers=$(awk -F'|' '($2=="wifi"||$2=="both") && $6=="connected"' "$st" | wc -l | tr -d ' ')
+	eth_peers=$(awk -F'|' '($2=="wired"||$2=="both") && $6=="connected"' "$st" | wc -l | tr -d ' ')
+
+	# 回程频段必须与 cmd_apply 用同一套解析：配置里 band=auto 时 apply 会解析成
+	# 实际可用频段，而这里原来直接用原值 -> mesh_band_radio auto 查不到射频 ->
+	# bh_radio 变 "-"，回程接口/信道整块显示成"未运行"（明明正在跑）
+	bh_band=$(mesh_resolve_backhaul_band "$band")
+	[ -n "$bh_band" ] || bh_band="$band"
+	bh_radio=$(mesh_band_radio "$bh_band")
+	[ -n "$bh_radio" ] || bh_radio="-"
+	local bh_if bh_ch
+	bh_if=$(mesh_mesh_ifaces | head -n1); [ -n "$bh_if" ] || bh_if="-"
+	if [ "$ch" = "auto" ]; then
+		bh_ch=$(mesh_running_channel "$bh_radio")
+		[ -n "$bh_ch" ] || bh_ch="auto"
+	else
+		bh_ch="$ch"
+	fi
+
+	lastok=$(cat "$MESH_TMP_DIR/lastok" 2>/dev/null)
+	lastfail=$(cat "$MESH_TMP_DIR/lastfail" 2>/dev/null)
+	reason=$(cat "$MESH_TMP_DIR/failreason" 2>/dev/null)
+	myidx=0
+	[ -f "$MESH_STATE_DIR/my-index" ] && myidx=$(cat "$MESH_STATE_DIR/my-index" 2>/dev/null)
+	case "$myidx" in ''|*[!0-9]*) myidx=0;; esac
+
+	# 同步状态。除给人看的文案外，另给一个稳定的状态码：
+	# 界面若按翻译后的中文文案判色，切换界面语言后会失配，必须用状态码
+	if [ "$role" = client ]; then
+		if [ -n "$lastfail" ] && { [ -z "$lastok" ] || [ "$lastfail" \> "$lastok" ]; }; then
+			syncinfo="同步失败: $reason"
+			synccode="fail"
+		elif [ -n "$lastok" ]; then
+			syncinfo="已同步"
+			synccode="ok"
+		else
+			syncinfo="尚未同步"
+			synccode="none"
+		fi
+	else
+		syncinfo="配置源(下发中)"
+		synccode="master"
+	fi
+
+	local kern wpad lanip lanproto bat_cap=0 bat_on=0 bat_if="" bat_hifs="" bat_hifs_json="" h
+	local bat_gw=auto bat_algo=default batctl_ok=0 dawn_ok=0 umdns_ok=0
+	kern=0; mesh_kernel_mesh_cap && kern=1
+	wpad=0;  mesh_wpad_mesh_cap && wpad=1
+	bat_cap=0; mesh_batman_cap && bat_cap=1
+	# batctl 是**独立**的强制项（见 cmd_apply 的 "缺少 batctl 工具" 分支）：
+	# kmod-batman-adv 与 batctl 通常同进同退，但手工删包/半装时会出现
+	# "模块在、batctl 不在" —— 此时 cap.batman=1 会让界面全绿，而 apply 实际
+	# 被拒。所以单独探测二进制并暴露给界面。
+	batctl_ok=0; mesh_batctl >/dev/null 2>&1 && batctl_ok=1
+	# 漫游引导（dawn + umdns）：与组网本身无关（缺了照样能组 mesh），但缺了就没有
+	# 802.11k/v 引导，客户端会抱着弱信号的 AP 不放。这里只做"是否安装"的探测并
+	# 暴露给界面，不作为 apply 的硬性门槛 —— 免得没装 dawn 的设备连组网都用不了。
+	dawn_ok=0;  mesh_dawn_cap  && dawn_ok=1
+	umdns_ok=0; mesh_umdns_cap && umdns_ok=1
+	# batman-adv 为强制项（见 cmd_apply）：只要内核具备能力即视为启用，
+	# 不再读 main.batman —— 界面上也没有这个开关了。
+	bat_on=0
+	[ "$bat_cap" = 1 ] && bat_on=1
+	# 界面要显示"实际生效"的网关模式：auto 按角色解析后才是真值
+	bat_gw=$(mesh_uci_getd main.batman_gw auto)
+	[ "$bat_gw" = auto ] && { [ "$role" = master ] && bat_gw=server || bat_gw=client; }
+	if [ "$bat_on" = "1" ] && [ "$bat_gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
+		bat_gw=client
+	fi
+	bat_algo=$(mesh_bat_routing_algo 2>/dev/null)
+	[ -n "$bat_algo" ] || bat_algo=default
+	if [ "$bat_cap" = 1 ] && [ "$bat_on" = "1" ]; then
+		bat_if=$(mesh_bat_iface 2>/dev/null)
+		bat_hifs=$(mesh_bat_hardifs 2>/dev/null | tr '\n' ' ')
+	fi
+	for h in $bat_hifs; do
+		[ -n "$bat_hifs_json" ] && bat_hifs_json="$bat_hifs_json,"
+		bat_hifs_json="$bat_hifs_json\"$(mesh_esc "$h")\""
+	done
+	lanip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -n "$lanip" ] || lanip=$(ip -4 addr show dev br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n1)
+	lanproto=$(uci -q get network.lan.proto 2>/dev/null)
+
+	local caps_json radios_json
+	radios_json=$(
+		local first=1 radio band pch rch ht
+		for radio in $(mesh_radios); do
+			band=$(mesh_radio_band "$radio")
+			ht=$(q wireless.$radio.htmode); ht=${ht:-HT20}
+			pch=$(q wireless.$radio.channel); pch=${pch:-auto}
+			rch=$(mesh_running_channel "$radio")
+			case "$rch" in ''|*[!0-9]*) rch=0;; esac
+			[ "$first" = 1 ] || printf ',\n'
+			first=0
+		printf ' {"radio":"%s","phy":"%s","band":"%s","channel":"%s","real":%s,"htmode":"%s"}' \
+			"$radio" "$(mesh_radio_phy "$radio")" "$band" "$pch" "$rch" "$ht"
+	done
+)
+
+	# 回程信道：按硬件真实能力给出每个频段可用的信道列表（前端据此按频段过滤下拉）
+	local chans_2g="" chans_5g="" chans_6g="" cb=""
+	for radio in $(mesh_radios); do
+		cb=$(mesh_radio_band "$radio")
+		case "$cb" in
+			2g) chans_2g="$chans_2g $(mesh_radio_channels "$radio")";;
+			5g) chans_5g="$chans_5g $(mesh_radio_channels "$radio")";;
+			6g) chans_6g="$chans_6g $(mesh_radio_channels "$radio")";;
+		esac
+	done
+	chans_2g=$(mesh_channels_uniq_sorted "$chans_2g")
+	chans_5g=$(mesh_channels_uniq_sorted "$chans_5g")
+	chans_6g=$(mesh_channels_uniq_sorted "$chans_6g")
+	channels_json=$(printf '"2g":%s,"5g":%s,"6g":%s' \
+		"$(mesh_list_to_json "$chans_2g")" \
+		"$(mesh_list_to_json "$chans_5g")" \
+		"$(mesh_list_to_json "$chans_6g")")
+
+local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
+	if [ -f "$MESH_STATE_DIR/rollback" ]; then
+		rb_active=1
+		rb_ip=$(sed -n 's/^ip=//p' "$MESH_STATE_DIR/rollback")
+		rb_deadline=$(sed -n 's/^deadline=//p' "$MESH_STATE_DIR/rollback")
+		case "$rb_deadline" in ''|*[!0-9]*) rb_deadline=0;; esac
+		rb_left=$((rb_deadline - now))
+		[ "$rb_left" -lt 0 ] && rb_left=0
+	fi
+
+	cat <<EOF
+{
+ "enabled": $enabled,
+ "role": "$(mesh_esc "$role")",
+ "mesh_id": "$(mesh_esc "$id")",
+ "encryption": "$(mesh_esc "$enc")",
+ "country": "$(mesh_esc "$country")",
+ "band": "$(mesh_esc "$band")",
+ "channel": "$(mesh_esc "$ch")",
+ "rssi": "$(mesh_esc "$rssi")",
+ "max_peers": "$(mesh_esc "$maxp")",
+ "layer2": $fwd,
+ "gw_advertise": $gw,
+ "hwmp_mode": "$(mesh_esc "$hwmp")",
+ "master_addr": "$(mesh_esc "$(mesh_uci_getd main.master_addr "")")",
+ "hostname": "$(mesh_esc "$(mesh_hostname)")",
+ "model": "$(mesh_esc "$(mesh_board)")",
+ "fwver": "$(mesh_esc "$(mesh_fwver)")",
+ "lan_ip": "$(mesh_esc "$lanip")",
+ "lan_proto": "$(mesh_esc "$lanproto")",
+ "mac": "$(mesh_esc "$(mesh_primary_mac)")",
+ "now": $now,
+ "capabilities": {"kernel_mesh": $kern, "wpad_mesh": $wpad, "batman": $bat_cap, "batctl": $batctl_ok, "dawn": $dawn_ok, "umdns": $umdns_ok},
+ "batman": {"capable": $bat_cap, "enabled": $bat_on, "iface": "$(mesh_esc "$bat_if")", "hardifs": [$bat_hifs_json], "gw_mode": "$(mesh_esc "$bat_gw")", "gw_mode_conf": "$(mesh_esc "$(mesh_uci_getd main.batman_gw auto)")", "routing_algo": "$(mesh_esc "$bat_algo")"},
+ "radios": [$radios_json],
+ "channels": {$channels_json},
+ "backhaul": {"ifname": "$(mesh_esc "$bh_if")", "channel": "$(mesh_esc "$bh_ch")", "band": "$(mesh_esc "$bh_band")"},
+ "peers": {
+  "count": ${peer_count:-0},
+  "connected": ${peer_online:-0},
+  "wifi": ${wifi_peers:-0},
+  "eth": ${eth_peers:-0},
+  "list": [
+$(peers_tsv_to_json "$st")
+  ]
+ },
+ "sync": {
+  "state": "$(mesh_esc "$syncinfo")",
+  "code": "$(mesh_esc "$synccode")",
+  "last_ok": "$(mesh_esc "$lastok")",
+  "last_fail": "$(mesh_esc "$lastfail")",
+  "reason": "$(mesh_esc "$reason")",
+  "my_index": $myidx
+ },
+ "registry": [
+$(mesh_registry_json)
+ ],
+ "port_bridging": $(mesh_all_ports_in_lan && echo true || echo false),
+ "rollback": {"active": $rb_active, "ip": "$(mesh_esc "$rb_ip")", "deadline": $rb_deadline, "remain": $rb_left},
+ "daemon_running": $(pgrep -f 'meshctl daemon' >/dev/null 2>&1 && echo true || echo false),
+ "backup_exists": $([ -d "$MESH_BACKUP_DIR/config" ] && echo true || echo false)
+}
+EOF
+}
+
+# ================= 路径选择配置跟随主节点 =================
+# 解析主节点下发的 batman 配置，判断本机是否需要重新 apply。
+# 返回 0 = 真的需要重新 apply（唯一情形：本机 batman 开关不是启用态）；1 = 无需动作。
+#
+# 【为什么原来会无限重新 apply】旧实现把「主节点解析后的网关模式」当成待写入的配置值：
+#   uci set mesh.main.batman_gw="$mg"     # mg 是解析结果，如 client
+# 而 cmd_apply 又把 batman_gw **归一化回** auto（见其 [1/7]，再由角色解析成 server/client）。
+# 于是每轮同步都拿 `auto` 与 `client` 相比 → 永远"有变化" → uci commit + 触发一次完整
+# cmd_apply（含 wifi reload / network restart）；下一轮 apply 又写回 auto …… 无限循环。
+# 实测：子节点每 ~24 秒重新应用一次（logread 累计 72 条），主节点 0 条。
+# 后果不只是刷屏：闪存被持续写入、无线反复热重载、mesh 链路抖动，而且同步路径在不停地
+# 跑 apply，任何用户手点的 apply 都会与它并发，进而丢改动。
+#
+# 【正确做法】比较「生效值」而不是「字面量」：
+#   · batman 开关恒为启用（cmd_apply 强制写 1），只有本机不是 1 时才需要写回并 apply；
+#   · 网关模式对本机恒由「角色 + auto」决定（client 角色 → client），因此把主节点的
+#     生效模式与**本机解析后的生效模式**比即可，**绝不把解析后的字面量写回 batman_gw**。
+mesh_sync_batman_from_json() {
+	local json="$1" mb mg cur_gw
+	[ -n "$JF" ] || return 1
+	[ -x "$JF" ] || return 1
+	mb=$("$JF" -s "$json" -e '@.batman.enabled' 2>/dev/null)
+	case "$mb" in 0|1) ;; *) return 1;; esac
+	# 有线回程模式不下发也不跟随：两端都跑同一份代码，拓扑恒为 B 方案（br-lan 二层桥接）。
+	# 旧主节点发来的 @.batman.wired 会被直接忽略 —— 这正是想要的：本端保持固定拓扑，
+	# 不会因为对端版本不同而被切到别的模式上去。
+	mg=$("$JF" -s "$json" -e '@.batman.gw' 2>/dev/null)
+	# 主节点是出网网关(server) → 自己必须是客户端；主节点都不是网关时跟着它降级
+	case "$mg" in
+		server) mg=client;;
+		client|off) ;;
+		*) mg=client;;
+	esac
+	# batman 开关：本包恒启用（cmd_apply 强制写 1）。对端若下发 0，本机也无法跟随
+	# （apply 会强制改回 1），写回只会来回打架 → 只告警，不动配置。
+	if [ "$mb" != "1" ]; then
+		mesh_log warn "主节点下发 batman.enabled=$mb；本包恒启用 batman-adv，已忽略"
+		return 1
+	fi
+	if [ "$(mesh_uci_getd main.batman 1)" != "1" ]; then
+		uci set mesh.main.batman=1
+		uci commit mesh
+		mesh_log info "路径选择配置跟随主节点: batman=1（需重新 apply 以搭建 bat0）"
+		return 0
+	fi
+	# 网关模式：本机配置恒为 auto，按角色解析成生效值后再与主节点比。
+	cur_gw=$(mesh_uci_getd main.batman_gw auto)
+	[ "$cur_gw" = auto ] && { [ "$(mesh_uci_getd main.role master)" = master ] && cur_gw=server || cur_gw=client; }
+	[ "$mg" = "$cur_gw" ] || \
+		mesh_log warn "主节点网关模式($mg)与本机生效模式($cur_gw)不一致（本机按角色 $(mesh_uci_getd main.role master) 运行）"
+	return 1
+}
+
+# ================= 同步（子节点拉取并比对） =================
+mesh_fetch_master() {
+	local addr="$1" mac="$2" tok="$3" wmac="$4" url u t
+	# 令牌就是回程密码，可能含 & # + % 空格等 URL 保留字符，必须编码后再拼进查询串
+	u=$(mesh_urlenc "$mac")
+	t=$(mesh_urlenc "$tok")
+	url="http://$addr/cgi-bin/mesh-sync?mac=$u&token=$t&link=auto&hostname=$(mesh_urlenc "$(mesh_hostname)")&board=$(mesh_urlenc "$(mesh_board)")&wmac=$(mesh_urlenc "$wmac")"
+	curl -fsS --max-time 8 "$url" 2>/dev/null || wget -q -O - -T 8 "$url" 2>/dev/null
+}
+
+# 缓存主节点身份: mac|wmac(逗号分隔)|hostname —— 子节点据此在邻居表里认出主节点
+mesh_save_master_id() {
+	local json="$1" mmac mwmac mhost
+	mmac=$(printf '%s' "$json" | sed -n 's/.*"master"[^}]*"mac": *"\([^"]*\)".*/\1/p' | head -n1)
+	mwmac=$(printf '%s' "$json" | sed -n 's/.*"master"[^}]*"wmac": *"\([^"]*\)".*/\1/p' | head -n1)
+	mhost=$(printf '%s' "$json" | sed -n 's/.*"master"[^}]*"hostname": *"\([^"]*\)".*/\1/p' | head -n1)
+	[ -z "$mmac" ] && [ -z "$mwmac" ] && return 0
+	# 每轮同步都会调用：内容不变时不落盘（见 mesh_state_write），避免刷闪存
+	printf '%s|%s|%s\n' "$mmac" "$mwmac" "$mhost" | mesh_state_write "$MESH_STATE_DIR/master-id"
+}
+
+# 从主节点 JSON 载入 APS_buf / RADIOS_buf
+mesh_load_buffers_from_json() {
+	local json="$1" n i ssid enc key r w mdid nasid rad band ch ht real
+	APS_buf=""
+	RADIOS_buf=""
+# 以 band 是否真实存在作为下标有效哨兵，不再用"SSID 非空"——空 SSID 是合法的
+# 隐藏网络，旧逻辑遇空 SSID 直接 break 会让其后所有 AP 都不被镜像。
+# 新增 disabled 字段（第 10 列）传递主节点 AP 的启用状态，子节点按主节点意图镜像。
+	i=0
+	while [ "$i" -le 15 ]; do
+		band=$("$JF" -s "$json" -e "@.ap[$i].band" 2>/dev/null)
+		[ -n "$band" ] || break
+		ssid=$("$JF" -s "$json" -e "@.ap[$i].ssid" 2>/dev/null)
+		enc=$("$JF" -s "$json" -e "@.ap[$i].enc" 2>/dev/null); enc=${enc:-none}
+		key=$("$JF" -s "$json" -e "@.ap[$i].key" 2>/dev/null); key=${key:-}
+		r=$("$JF" -s "$json" -e "@.ap[$i].r" 2>/dev/null); r=${r:-0}
+		w=$("$JF" -s "$json" -e "@.ap[$i].ft_over_ds" 2>/dev/null); w=${w:-1}
+		mdid=$("$JF" -s "$json" -e "@.ap[$i].mdid" 2>/dev/null)
+		nasid=$("$JF" -s "$json" -e "@.ap[$i].nasid" 2>/dev/null)
+		rad=$("$JF" -s "$json" -e "@.ap[$i].reassoc" 2>/dev/null)
+		dis=$("$JF" -s "$json" -e "@.ap[$i].disabled" 2>/dev/null); dis=${dis:-0}
+		APS_buf="$APS_buf$band|$ssid|$enc|$key|$r|$w|$mdid|$nasid|$rad|$dis
+"
+		i=$((i+1))
+	done
+	i=0
+	while :; do
+		band=$("$JF" -s "$json" -e "@.radios[$i].band" 2>/dev/null)
+		[ -n "$band" ] || break
+		ch=$("$JF" -s "$json" -e "@.radios[$i].channel" 2>/dev/null); ch=${ch:-auto}
+		real=$("$JF" -s "$json" -e "@.radios[$i].real" 2>/dev/null)
+		case "$real" in ''|*[!0-9]*) real=0;; esac
+		ht=$("$JF" -s "$json" -e "@.radios[$i].htmode" 2>/dev/null)
+		RADIOS_buf="$RADIOS_buf$band|$ch|$real|$ht
+"
+		i=$((i+1))
+		[ "$i" -gt 8 ] && break
+	done
+	[ -n "$APS_buf" ] && return 0 || return 1
+}
+
+# ================= 同步（子节点拉取并比对） =================
+cmd_sync_once() {
+	local role enabled addr tok mac json idx st
+	role=$(mesh_uci_getd main.role master)
+	enabled=$(mesh_uci_getd main.enabled 0)
+	if [ "$role" != client ] || [ "$enabled" != 1 ]; then
+		echo "本节点不是启用的子节点，跳过同步"
+		return 0
+	fi
+	addr=$(mesh_master_addr)
+	# 没填主节点地址、又没有默认路由时，mesh_master_addr 会兜底到 192.168.1.1。
+	# 若本机 br-lan 就是这个地址（静态地址模式下很常见），下面就是在**向自己请求配置**，
+	# 必然失败，而且只会得到一句"无法从主节点获取配置"，看不出要改什么。
+	# 这里提前拦下并把「该改哪一项」说清楚。
+	if [ -z "$(mesh_uci_get main.master_addr)" ] && mesh_ip_is_local "$addr"; then
+		sync_fail "未设置主节点地址：自动回退到本机地址($addr)，无法向自己同步；请在【设置】中填写主节点地址"
+		return 1
+	fi
+	tok=$(mesh_uci_get main.mesh_key)
+	[ -n "$tok" ] || { sync_fail "未配置同步令牌(回程密码)"; return 1; }
+	mac=$(mesh_primary_mac)
+	[ -n "$mac" ] || { sync_fail "无法读取本机 MAC"; return 1; }
+	# 上报本机 mesh 接口(无线)MAC：主节点靠它把「无线邻居」和「已注册节点」合并成同一条
+	local wmac
+	wmac=$(mesh_mesh_iface_macs)
+
+	json=$(mesh_fetch_master "$addr" "$mac" "$tok" "$wmac")
+	if [ -z "$json" ] || ! printf '%s' "$json" | grep -q '"ok": *1'; then
+		sync_fail "无法从主节点($addr)获取配置"
+		return 1
+	fi
+	if printf '%s' "$json" | grep -q '"auth": *"bad"'; then
+		sync_fail "同步令牌与主节点不一致"
+		return 1
+	fi
+
+	mesh_load_buffers_from_json "$json" || { sync_fail "主节点未配置任何 AP"; return 1; }
+
+	idx=$(printf '%s' "$json" | sed -n 's/.*"index": *\([0-9]*\).*/\1/p' | head -n1)
+	case "$idx" in ''|*[!0-9]*) idx=1;; esac
+	[ "$idx" -lt 1 ] && idx=1
+	# 每轮同步写入；内容不变则不落盘（本机序号通常恒定）
+	printf '%s\n' "$idx" | mesh_state_write "$MESH_STATE_DIR/my-index"
+	mesh_save_master_id "$json"
+
+	local bh_band
+	# 与 cmd_apply 用同一套解析：配置里没写时按 auto 解析（有 5G 射频用 5G，否则退 2.4G），
+	# 避免"apply 判定 5G、同步/状态页却按字面量 5g 走"导致两端不一致
+	bh_band=$(mesh_resolve_backhaul_band "$(mesh_uci_getd main.band auto)")
+	[ -n "$bh_band" ] || bh_band=5g
+	# 同上：回程频段通常恒定，避免每 10 秒重复写闪存
+	printf '%s\n' "$bh_band" | mesh_state_write "$MESH_STATE_DIR/bh-band"
+
+	# 路径选择（batman-adv）必须跟随主节点：一端开一端不开，两端 mesh 接口会落在
+	# 不同的二层域，batman-adv 收不到对端 OGM，组网行为就不一致了。
+	# 有变化时需要重新 apply 才能真正搭建/拆除 bat0（sync 只改 wireless 是不够的）
+	if mesh_sync_batman_from_json "$json"; then
+		mesh_log info "路径选择配置已跟随主节点，重新应用组网配置"
+		MESH_NOROLLBACK=1 cmd_apply >>"$MESH_LOG" 2>&1
+	fi
+
+	# 应用（仅在变化时提交）
+	# 同步路径同样必须在锁内改 UCI；抢不到锁就放弃本轮（下一轮 10 秒后自然会重试），
+	# 而不是无锁提交去覆盖用户正在进行的 apply。
+	mesh_lock || { sync_fail "本机正在执行其他组网操作，本轮同步已跳过"; return 1; }
+	mesh_uci_mirror_aps "$idx" "$bh_band"
+	if [ -n "$(uci changes wireless)" ]; then
+		uci commit wireless
+		wifi reload >>"$MESH_LOG" 2>&1
+		# 与 apply 同样的兜底（见 mesh_wifi_ensure_aps_up 注释）：热重载在"AP 与
+		# mesh0 共用同一 radio"的设备上可能把 AP 留在 disabled。同步路径更要兜底 ——
+		# "主节点改密码 → 子节点跟随"走的正是这条路径，否则子节点 AP 会直接消失。
+		mesh_wifi_ensure_aps_up >>"$MESH_LOG" 2>&1
+		sync_ok "已从主节点同步配置(节点序号 $idx，非 auto 信道已错开)"
+	else
+		sync_ok "配置与主节点一致，无需变更"
+	fi
+	mesh_unlock
+	return 0
+}
+
+# ================= 守护进程 =================
+cmd_daemon() {
+	local n fail
+	n=0; fail=0
+	mesh_log info "守护进程启动"
+	while :; do
+		rollback_check 2>/dev/null
+		# 无线回程口 MTU 的周期收敛：只读比对，仅在确实不一致时才下发内核。
+		# 替代了原来 apply 里那个游离的 `( sleep 15; ... ) &` 后台进程 ——
+		# 无线接口 up 的时机不确定，事件驱动的 hotplug 可能扑空，这里再兜一层。
+		# （mesh_bat_fix_mtu 补 MTU：无线回程 2304，须容纳 41B 的 batman 头）
+		if [ "$(mesh_uci_getd main.batman 1)" = "1" ]; then
+			mesh_bat_fix_mtu 2>/dev/null
+		fi
+		if [ "$(mesh_uci_getd main.enabled 0)" = "1" ] && [ "$(mesh_uci_getd main.role master)" = client ]; then
+			if cmd_sync_once >/dev/null 2>&1; then
+				fail=0
+			else
+				fail=$((fail+1))
+				[ "$fail" = 3 ] && mesh_log warn "连续 3 次同步失败，稍后继续重试"
+			fi
+		fi
+		# 停用后降低轮询频率，避免空转
+		if [ "$(mesh_uci_getd main.enabled 0)" = "1" ]; then
+			sleep "$MESH_SYNC_INTERVAL"
+		else
+			sleep 30
+		fi
+	done
+}
+
+# ================= 诊断 =================
+cmd_diag() {
+	local r band ch ht sec mode p ifn st bgw h
+	echo "== 能力检测 =="
+	if mesh_kernel_mesh_cap; then echo "mesh_support = 1"; else echo "mesh_support = 0 (驱动不支持 802.11s)"; fi
+	if mesh_wpad_mesh_cap; then echo "wpad_mesh    = 1"; else echo "wpad_mesh    = 0 (需安装 wpad-openssl/wpad-wolfssl)"; fi
+	if mesh_batman_cap; then
+		if [ "$(mesh_uci_getd main.batman 1)" = "1" ]; then
+			echo "batman_adv   = 1 (已启用)"
+			echo "  bat_iface  = $(mesh_bat_iface 2>/dev/null)"
+			echo "  hardifs    = $(mesh_bat_hardifs 2>/dev/null | tr '\n' ' ')"
+			echo "  routing_algo = $(mesh_bat_routing_algo 2>/dev/null | grep . || echo default)"
+			# bat0 由 netifd 的 batadv 协议处理器创建；它随 batctl 一起装（kmod-batman-adv
+			# 依赖 batctl）。缺了它 proto=batadv 起不来，无线回程也就建不起来
+			echo "  batctl     = $(mesh_batctl 2>/dev/null || echo '(缺失)')"
+			echo "  proto_sh   = $(ls /lib/netifd/proto/batadv*.sh 2>/dev/null | tr '\n' ' ')"
+			# 逐个列出 hardif。B 方案下应当**只有 mesh0 一个** —— 若这里还冒出 lan*/wan
+			# 之类的有线口，说明历史版本的 batif_* 节没被清干净；hop_penalty 正常应为 0
+			local _ctl _hp
+			_ctl=$(mesh_batctl)
+			for h in $(mesh_bat_hardifs); do
+				_hp="-"
+				if [ -n "$_ctl" ]; then
+					_hp=$("$_ctl" hardif "$h" hop_penalty 2>/dev/null | tr -cd '0-9')
+					[ -n "$_hp" ] || _hp="-"
+				fi
+				echo "  hardif $h = $(mesh_bat_iface_link "$h") mtu=$(cat "/sys/class/net/$h/mtu" 2>/dev/null) hop_penalty=$_hp"
+			done
+			bgw=$(mesh_uci_getd main.batman_gw auto)
+			[ "$bgw" = auto ] && { [ "$(mesh_uci_getd main.role master)" = master ] && bgw=server || bgw=client; }
+			echo "  gw_mode    = $bgw (配置: $(mesh_uci_getd main.batman_gw auto))"
+			echo "  有线回程   = B 方案(唯一实现): 端口与 bat0 同进 br-lan, 二层直转走网线(BLA 防环, bat0 不被 STP 阻塞)"
+		else
+			echo "batman_adv   = 1 (已安装未启用; 在设置页「路径选择」里开启)"
+		fi
+	else
+		echo "batman_adv   = 0 (必须安装: $(mesh_pm_install) kmod-batman-adv batctl)"
+	fi
+	echo
+	echo "== 射频与接口 =="
+	for r in $(mesh_radios); do
+		band=$(mesh_radio_band "$r")
+		ch=$(q wireless.$r.channel); ch=${ch:-auto}
+		ht=$(q wireless.$r.htmode); ht=${ht:-HT20}
+		st="no"
+		if iw "$(mesh_radio_phy "$r")" info 2>/dev/null | grep -q 'mesh point'; then st="yes"; fi
+		echo "$r ($(mesh_radio_phy "$r"), ${band}GHz, CH $ch, $ht, mesh: $st)"
+	done
+	echo
+	echo "== 接口模式 =="
+	for sec in $(mesh_wifi_ifaces); do
+		mode=$(q wireless.$sec.mode)
+		echo "$sec: $mode ($(q wireless.$sec.device)) SSID=$(q wireless.$sec.ssid)"
+	done
+	echo
+	echo "== 组网 =="
+	echo "role     = $(mesh_uci_getd main.role master)"
+	echo "enabled  = $(mesh_uci_getd main.enabled 0)"
+	echo "mesh_id  = $(mesh_uci_getd main.mesh_id)"
+	_band=$(mesh_uci_getd main.band auto)
+	echo "channel  = $(mesh_uci_getd main.channel "$(mesh_default_channel "$_band")") ($_band GHz，回程信道两端必须相同)"
+	ifn=$(mesh_mesh_ifaces | head -n1)
+	if [ -n "$ifn" ]; then
+		echo "backhaul = $ifn ($(iw dev "$ifn" info 2>/dev/null | sed -n 's/^\tchannel /CH /p'))"
+		echo "peers    = $(iw dev "$ifn" station dump 2>/dev/null | grep -c '^Station')"
+	else
+		echo "backhaul = (未运行)"
+	fi
+	echo
+	echo "== 端口内网化 =="
+	if mesh_all_ports_in_lan; then echo "所有内网端口与 bat0 均在 br-lan: yes"; else echo "所有内网端口与 bat0 均在 br-lan: no"; fi
+	mesh_brlan_members_report
+	echo
+	if [ "$(mesh_uci_getd main.batman 1)" = "1" ] && mesh_batman_cap; then
+		echo "== batman-adv 路径表 (originator | TQ | 下一跳 | 出口 | 最近 | 网关) =="
+		mesh_bat_originators_tsv 2>/dev/null | awk -F'|' '{ printf "%-20s TQ=%-4s next=%-20s via=%-10s %s %s\n", $1, $2, $3, $4, $5, ($6=="1"?"[网关]":"") }'
+		echo
+	fi
+	echo "== DHCP =="
+	echo "dhcp.lan.ignore = $(uci -q get dhcp.lan.ignore 2>/dev/null || echo 0)"
+	echo
+	echo "== 同步 =="
+	echo "sync_role = $(mesh_uci_getd main.role master)"
+	echo "last_ok   = $(cat "$MESH_TMP_DIR/lastok" 2>/dev/null || echo '-')"
+	echo "last_fail = $(cat "$MESH_TMP_DIR/lastfail" 2>/dev/null || echo '-') $(head -c 120 "$MESH_TMP_DIR/failreason" 2>/dev/null)"
+	echo "my_index  = $(cat "$MESH_STATE_DIR/my-index" 2>/dev/null || echo 0)"
+	echo
+	echo "== 日志(最近 20 行) =="
+	tail -n 20 "$MESH_LOG" 2>/dev/null || echo "(无)"
+}
+
+# ================= 还原 / 清除 =================
+cmd_revert() {
+	mesh_do_revert || { echo "错误：未找到组网前备份"; return 1; }
+	echo "已还原组网前配置，路由器即将重启。"
+}
+
+cmd_confirm_rollback() {
+	mkdir -p "$MESH_STATE_DIR"
+	touch "$MESH_STATE_DIR/rollback.confirmed"
+	echo "ok"
+}
+
+# ================= 端口并入（手动触发） =================
+cmd_port_bridging() {
+	mesh_ports_into_brlan
+	if [ -n "$(uci changes network)" ]; then
+		uci commit network
+		/etc/init.d/network restart >/dev/null 2>&1
+	fi
+	mesh_all_ports_in_lan && echo "所有内网端口与 bat0 均已并入 br-lan" || echo "部分端口或 bat0 未能并入，请检查网络配置"
+}
+
+# ================= 入口 =================
+case "$1" in
+	apply)            shift; cmd_apply "$@";;
+	status)           cmd_status;;
+	diag)             cmd_diag;;
+	sync)             cmd_sync_once;;
+	daemon)           cmd_daemon;;
+	revert)           cmd_revert;;
+	confirm_rollback) cmd_confirm_rollback;;
+	port_bridging)    cmd_port_bridging;;
+	*)
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging>"
+		exit 1
+		;;
+esac

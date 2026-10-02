@@ -1,0 +1,155 @@
+#!/bin/sh
+# /www/cgi-bin/mesh-sync — 主节点配置下发端点
+# 子节点 GET /cgi-bin/mesh-sync?mac=XX&token=YY&link=wifi|wired&hostname=..&board=..
+# 返回 JSON: {ok, index, mesh:{...}, ap:[...], radios:[...]}
+. /usr/libexec/mesh/functions.sh
+
+JF=$(command -v jsonfilter || echo /usr/bin/jsonfilter)
+
+# ---- 解析 QUERY_STRING ----
+QS="${QUERY_STRING:-}"
+qs_get() {
+	printf '%s' "$QS" | tr '&' '\n' | sed -n "s/^$1=//p" | head -n1
+}
+mac=$(qs_get mac)
+token=$(qs_get token)
+link=$(qs_get link)
+hostname=$(qs_get hostname)
+board=$(qs_get board)
+wmac=$(qs_get wmac)
+mac=$(mesh_urldec "${mac:-}")
+token=$(mesh_urldec "${token:-}")
+hostname=$(mesh_urldec "${hostname:-}")
+board=$(mesh_urldec "${board:-}")
+wmac=$(mesh_urldec "${wmac:-}")
+# 对端地址：链路类型判定要用到，必须在下面判定之前就取出。
+# 之前是放在注册那段才赋值，判定里永远是空值，ip route 兜底分支等于没写
+peer_ip="${REMOTE_ADDR:-}"
+# wmac 只接受 MAC 列表，避免污染注册表
+case "$wmac" in *[!0-9A-Fa-f:,-]*) wmac="";; esac
+
+hdr() { echo "Content-Type: application/json"; echo ""; }
+
+# ---- 基本校验 ----
+if [ "$(mesh_uci_getd main.enabled 0)" != 1 ] || [ "$(mesh_uci_get main.role)" != master ]; then
+	hdr
+	echo '{"ok":0,"error":"not_master"}'
+	exit 0
+fi
+want=$(mesh_uci_get main.mesh_key)
+if [ -z "$want" ] || [ "$token" != "$want" ]; then
+	hdr
+	echo '{"ok":1,"auth":"bad"}'
+	exit 0
+fi
+case "$mac" in
+	''|*[!0-9A-Fa-f:-]*) hdr; echo '{"ok":0,"error":"bad_mac"}'; exit 0;;
+esac
+
+# ---- 判断链路类型（未指定时自动判定） ----
+# 注意：不能用注册用的 eth* MAC 去匹配无线邻居 —— 那是两个不同的 MAC。
+# 判定顺序：子节点上报的 mesh 接口 MAC 是否已在 station 表里 → 对端地址从哪个口进来。
+[ "$link" != wifi ] && [ "$link" != wired ] && {
+	link=wired
+	if [ -n "$wmac" ]; then
+		for w in $(printf '%s' "$wmac" | tr ',' ' '); do
+			for ifn in $(mesh_mesh_ifaces); do
+				if iw dev "$ifn" station dump 2>/dev/null | grep -qi "^Station $w"; then
+					link=wifi; break 2
+				fi
+			done
+		done
+	fi
+	if [ "$link" = wired ] && [ -n "$peer_ip" ]; then
+		dev=$(ip route get "$peer_ip" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)
+		case "$dev" in mesh*|wlan*) link=wifi;; esac
+	fi
+}
+
+# ---- 注册并取得节点序号 ----
+idx=$(mesh_registry_update "$mac" "$peer_ip" "$hostname" "$board" "$(mesh_fwver)" "$link" "$wmac")
+
+# ---- 组下发配置（mesh 参数 + AP 列表 + 射频信道） ----
+mesh_id=$(mesh_uci_get main.mesh_id)
+# 默认值一律取自 functions.sh 的 mesh_default_* 解析器，与 cmd_apply / cmd_status
+# 保持同一套 —— 否则主节点下发的参数会和它自己 apply 用的不一致。
+enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
+band=$(mesh_uci_getd main.band auto)
+# 回程信道：配置为空时按与 meshctl 相同的默认值下发（两端必须一致，见 mesh_default_channel）
+ch=$(mesh_uci_getd main.channel '')
+[ -n "$ch" ] || ch=$(mesh_default_channel "$band")
+resolved=$(mesh_resolve_backhaul_band "$band")
+[ -n "$resolved" ] && band="$resolved"
+
+# AP 列表（含 802.11r）
+ap_json() {
+	local sec radio band ssid enc key r w mdid nasid rad first=1
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(uci -q get "wireless.$sec.mode" 2>/dev/null)" = ap ] || continue
+		radio=$(uci -q get "wireless.$sec.device" 2>/dev/null)
+		[ -n "$radio" ] || continue
+		band=$(mesh_radio_band "$radio")
+		ssid=$(uci -q get "wireless.$sec.ssid" 2>/dev/null)
+		[ -n "$ssid" ] || continue
+		enc=$(uci -q get "wireless.$sec.encryption" 2>/dev/null); enc=${enc:-none}
+		key=$(uci -q get "wireless.$sec.key" 2>/dev/null); key=${key:-}
+		r=$(uci -q get "wireless.$sec.ieee80211r" 2>/dev/null); r=${r:-0}
+		w=$(uci -q get "wireless.$sec.ft_over_ds" 2>/dev/null); w=${w:-1}
+		mdid=$(uci -q get "wireless.$sec.mobility_domain" 2>/dev/null)
+		nasid=$(uci -q get "wireless.$sec.nasid" 2>/dev/null)
+		rad=$(uci -q get "wireless.$sec.reassociation_deadline" 2>/dev/null)
+		dis=$(uci -q get "wireless.$sec.disabled" 2>/dev/null); dis=${dis:-0}
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"band":"%s","ssid":"%s","enc":"%s","key":"%s","r":"%s","ft_over_ds":"%s","mdid":"%s","nasid":"%s","reassoc":"%s","disabled":"%s"}' \
+			"$band" "$(mesh_esc "$ssid")" "$enc" "$(mesh_esc "$key")" "$r" "$w" "$(mesh_esc "$mdid")" "$(mesh_esc "$nasid")" "$(mesh_esc "$rad")" "$dis"
+	done
+}
+
+# radios: channel 原样下发配置值（auto 就是 auto），real 给出实际运行信道
+# 子节点据此判断：只有 channel 非 auto 时才做信道错开
+radios_json() {
+	local first=1 radio band ch rch ht
+	for radio in $(mesh_radios); do
+		band=$(mesh_radio_band "$radio")
+		ch=$(uci -q get "wireless.$radio.channel" 2>/dev/null); ch=${ch:-auto}
+		rch=$(mesh_radio_running_channel "$radio")
+		[ -n "$rch" ] || rch=0
+		ht=$(uci -q get "wireless.$radio.htmode" 2>/dev/null); ht=${ht:-}
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"band":"%s","channel":"%s","real":%s,"htmode":"%s"}' \
+			"$band" "$ch" "$rch" "$(mesh_esc "$ht")"
+	done
+}
+
+hdr
+ch_real=$(mesh_radio_running_channel "$(mesh_band_radio "$band")")
+[ -n "$ch_real" ] || ch_real=0
+# 下发主节点身份（含 mesh 接口 MAC），子节点据此在邻居表里标出「主节点」
+mmac=$(mesh_primary_mac)
+mwmac=$(mesh_mesh_iface_macs)
+
+# 路径选择配置也必须下发：主节点开了 batman-adv 而子节点没开，
+# 两端 mesh 接口会落在不同二层域（主节点挂 batmesh，子节点挂 lan），
+# batman-adv 的 OGM 收不到对端，组网行为就不一致了。
+# 这里下发的是主节点"实际生效"的网关模式（绝不发 auto），子节点再按自己角色换算。
+# 有线回程模式（历史版本的 wired 字段）不再下发：本包只实现 B 方案，两端各自固定。
+bat_json() {
+	local en gw
+	en=$(mesh_uci_getd main.batman 1)
+	gw=$(mesh_uci_getd main.batman_gw auto)
+	[ "$gw" = auto ] && gw=server
+	if [ "$en" = "1" ] && [ "$gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
+		gw=client
+	fi
+	printf '{"enabled":%s,"gw":"%s"}' "$en" "$gw"
+}
+
+cat <<EOF
+{"ok":1,"index":$idx,"mesh":{"id":"$(mesh_esc "$mesh_id")","enc":"$enc","band":"$band","channel":"$ch","channel_real":$ch_real},
+"master":{"mac":"$(mesh_esc "$mmac")","wmac":"$(mesh_esc "$mwmac")","hostname":"$(mesh_esc "$(mesh_hostname)")"},
+"batman":$(bat_json),
+"ap":[$(ap_json)],
+"radios":[$(radios_json)]}
+EOF

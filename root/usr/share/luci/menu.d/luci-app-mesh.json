@@ -1,0 +1,22 @@
+{
+	"admin/network/mesh": {
+		"title": "Mesh 组网",
+		"order": 20,
+		"action": { "type": "firstchild" }
+	},
+	"admin/network/mesh/overview": {
+		"title": "组网状态",
+		"order": 10,
+		"action": { "type": "view", "path": "mesh/overview" }
+	},
+	"admin/network/mesh/settings": {
+		"title": "组网设置",
+		"order": 20,
+		"action": { "type": "view", "path": "mesh/settings" }
+	},
+	"admin/network/mesh/tools": {
+		"title": "诊断与维护",
+		"order": 30,
+		"action": { "type": "view", "path": "mesh/tools" }
+	}
+}

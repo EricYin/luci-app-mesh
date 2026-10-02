@@ -1,0 +1,57 @@
+package mesh
+
+config main 'main'
+	option enabled '0'
+	option role 'master'
+	option mesh_id 'OpenWrtMesh'
+	option mesh_key ''
+	option encryption 'sae'
+	option band '5g'
+	# 回程信道：同一组网内所有节点必须"完全相同"。
+	# 802.11s 回程不像手机连 WiFi 那样自动跟随对端信道 —— 两端射频必须落在同一信道上
+	# 才能收到对方信标并建立 plink，否则会出现"两个 mesh 接口都 up、却始终 0 个对端"。
+	# 默认 36（5GHz 非 DFS 段首个信道，无需雷达检测，支持面最广）。也可用
+	# 40/44/48/149/153/157/161；改的话两端一起改。
+	# 注意：该频段的 AP 与回程共用同一射频，所以这里同时决定了本频段 AP 的信道。
+	option channel '36'
+	option country 'CN'
+	option rssi '-80'
+	option max_peers '8'
+	# 以下三项属于 802.11s 自身的路由机制。batman-adv 恒为启用（见文末），
+	# apply 时会被强制置为"让位"状态（layer2=0 / hwmp_root=0），界面上也不再暴露，
+	# 保留仅用于旧配置兼容与状态展示。
+	option layer2 '1'
+	option gw_advertise '1'
+	option hwmp_mode 'auto'
+	# 主节点地址：一般留空即可 —— 子节点的内网地址由主节点 DHCP 分发，网关就是主节点。
+	# 子节点内网地址**不再有"手动设置"这条路**（历史选项 client_addr 已删除）：
+	# apply 恒写 proto=dhcp。这样也消除了"proto=static 而 ipaddr 为空 → br-lan 没有
+	# 任何地址 → 节点彻底失联"这个致命状态。br-lan 的 MAC 会被钉成设备主 MAC，
+	# 否则网桥 MAC 随端口就绪顺序漂移、DHCP 租约跟着换地址。
+	option master_addr ''
+	option status_text '尚未配置'
+	# ===== 路径选择 (batman-adv) —— 强制项，界面上不提供开关 =====
+	# 本包的编译依赖已硬绑定 kmod-batman-adv + batctl + wpad-mesh-openssl + kmod-mac80211，
+	# 安装即具备条件，因此 batman-adv 恒为启用、由它统一接管路径选择：
+	#   · batman=1        必须启用（不可关闭）；缺失内核模块时 apply 直接报错而不是静默降级
+	#   · batman_gw=auto  网关模式按角色自动判断：主节点 server、子节点 client；
+	#                     主节点没有默认路由时自动降为 client
+	# 有线回程固定为 B 方案（br-lan 二层桥接），本包只实现这一种，UCI 里没有开关：
+	#   物理端口全部进 br-lan，bat0 也只作为 br-lan 的一个成员加入；bat0 的 hardif
+	#   只有无线回程 mesh0 一个。两节点拉一根网线 → 两个 br-lan 合成同一个二层域 →
+	#   网桥按 MAC 学习直接从网口转发（零 batman 开销、满线速）；拔线后由 bat0 直接
+	#   接管（它一直是 forwarding）。跨 mesh 的环由 BLA 负责、STP 只管物理口之间的环。
+	# 历史版本曾有 option batman_wired '0|1|2' 表示三种有线回程模式，现已废弃：
+	# 另外两种（端口作 bat0 的 hardif / mesh-on-LAN 用 VLAN 子接口）的实现代码已移除，
+	# 旧配置残留由 apply 与 mesh_bat_legacy_purge 自动清理，升级设备无需手工干预。
+	# 以上各项在 meshctl apply 中会被强制写回，用户无需（也无法）在界面上设置。
+	# 注：batman=0 的旧配置会被自动纠正为 1。
+	option batman '1'
+	option batman_gw 'auto'
+	# 出网网关(batman_gw=server)向全网通告的出口带宽。
+	# 'auto' = 按角色自动：本节点作为网关时通告千兆口(1000mbit/1000mbit)，
+	# 非网关侧该项不写入（batman-adv 只在 gw_mode=server 时使用）。
+	# 之所以必须显式通告：留空时 batman-adv 按内核默认 10mbit/2mbit 估算，
+	# 子节点会据此选错网关（明明有千兆出口，却可能绕去更近但"只有 10mbit"的节点）。
+	# 如需限速可手工改成形如 '300mbit/100mbit'，界面上不提供该项。
+	option gw_bandwidth 'auto'
