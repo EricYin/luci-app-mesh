@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# 预装场景的"安装钩子"补偿：给 97-wifi-roaming / 99-dawn-roaming 建立
+# 开机自启 + 每分钟 cron 巡检。
+#
+# 为什么要它：
+#   Makefile 的 postinst 里本来就写了 enable + cron_enable，但那只在 opkg/apk
+#   **安装**包时执行。把本包编译进 image（随固件预装）时没有任何安装钩子，
+#   postinst 一次都不会跑 —— 于是两个自检脚本既没有自启链接（若构建时也没建），
+#   更没有 cron 条目。而 97 的 start() 开头有 mesh 守卫（mesh.main.enabled 必须为 1），
+#   新机首次开机用户还没启用组网，那唯一一次机会也被挡下，此后就再无触发点了。
+#   结果就是 802.11k/v/r 与 dawn 广播地址长期缺着，且 LuCI 无线页一保存还会把
+#   已有项冲掉（本系列固件不发 procd 的 config.change 事件，无法用事件触发自愈）。
+#
+# 为什么用 uci-defaults：
+#   它由 /etc/init.d/boot 在**首次开机**执行（成功即自删），是 OpenWrt 里唯一
+#   能在"预装 + 首次启动"这个时间点做初始化动作的官方机制。
+#
+# 幂等性：enable 与 cron_enable 都可重复执行（cron_enable 先 grep -v 再追加，
+#   不会产生重复行）。opkg/apk 安装时 postinst 已经做过一遍也没关系。
+#
+# 注意：本脚本在 S10boot 阶段执行，此时 S50cron 还没启动，cron_enable 内部对
+#   cron 的 restart 是无害的空操作，crond 稍后由它自己的 rc 链接拉起。
+
+for s in 97-wifi-roaming 99-dawn-roaming; do
+	[ -x "/etc/init.d/$s" ] || continue
+	"/etc/init.d/$s" enable      >/dev/null 2>&1
+	"/etc/init.d/$s" cron_enable >/dev/null 2>&1
+done
+
+exit 0

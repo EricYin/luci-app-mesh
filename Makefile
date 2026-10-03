@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mesh
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=22
+PKG_RELEASE:=23
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=dffxy
 
@@ -59,6 +59,16 @@ define Package/$(PKG_NAME)/install
 # 这里只负责装文件；enable + cron_enable 在 postinst，cron 清理在 prerm。
 	$(INSTALL_BIN) $(CURDIR)/root/etc/init.d/97-wifi-roaming $(1)/etc/init.d/
 	$(INSTALL_BIN) $(CURDIR)/root/etc/init.d/99-dawn-roaming $(1)/etc/init.d/
+# 上面注释里说的"enable + cron_enable 在 postinst"，只对 opkg/apk **安装**生效。
+# 把本包编译进 image（随固件预装）时没有安装钩子，postinst 一次都不会跑 —— 于是
+# 两个自检脚本既可能没有自启链接、更一定没有 cron 条目，加上 97 的 start() 有
+# mesh 守卫（新机首次开机 enabled 还是 0），那唯一一次机会也落空，此后永不再触发。
+# 症状：802.11k/v/r 与 dawn 广播地址长期缺失，且 LuCI 无线页一保存就又被冲掉。
+# uci-defaults 由 /etc/init.d/boot 在**首次开机**执行（成功即自删），是唯一能在
+# "预装 + 首次启动"这个时间点做初始化的官方机制，用来把 postinst 欠下的补回来。
+# 它内部同样只调脚本自带的 enable / cron_enable，保持单一真相源。
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) $(CURDIR)/root/etc/uci-defaults/40-luci-app-mesh-roaming $(1)/etc/uci-defaults/
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) $(CURDIR)/root/etc/hotplug.d/iface/30-mesh-bat-mtu $(1)/etc/hotplug.d/iface/
 	$(INSTALL_DIR) $(1)/etc/config

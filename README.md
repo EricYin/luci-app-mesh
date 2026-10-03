@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**接光猫出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r22`（`PKG_RELEASE` 22）
+- 当前版本：`1.0.0-r23`（`PKG_RELEASE` 23）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -112,8 +112,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r22.apk
-opkg install luci-app-mesh_1.0.0-r22_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r23.apk
+opkg install luci-app-mesh_1.0.0-r23_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -178,6 +178,17 @@ sh install.sh
   2. `ensureKeyOptions()` 补写空值项，且**调用时机是成败关键**：必须放进 `m.save(ensureKeyOptions)` 回调里（在 `parse()` 之后、真正发起 uci 保存之前）。放在 `m.save()` **之前**（第一版补丁就是这么写的）会被随后的 `parse()` 里的 `remove()` 直接取消，实测无效。
 - **状态页不再撒谎**：`meshctl status` 原来把空的 `role` 兜底成 `master`——这正是「我明明是主节点」的来源。现在如实上报（`role` 为空 + `role_set=0`），同步状态也不再显示「配置源(下发中)」；`role_set=0` 时状态页顶部红框提示、「本机角色」卡显示未选择。
 - **报错可读**：`mesh-sync` 的 `not_master` 拆成 `disabled` / `role_unset` / `not_master`（后两者附实际值），各带一句 `hint`；`meshctl apply` 报未设置角色时直接给出可执行的修复命令。
+
+### r23（2026-10-03）
+修复「预装固件场景下 802.11k/11v/11r 与 dawn 广播地址长期缺失」：
+- **现象**：主节点无线配置半残（有 `ieee80211k` / `bss_transition`，缺 `ieee80211v` / `rrm_neighbor_report` / `rrm_beacon_report`），子节点全空。看起来像「k/v 没同步」，实际上 **k/v 本来就不走同步通道**——它们是每台 AP 的本地能力，设计上由随包的 `97-wifi-roaming` / `99-dawn-roaming` 在各节点自己补齐。
+- **根因（三环，缺一不可）**：
+  1. `enable` + `cron_enable` 写在 Makefile 的 `postinst` 里，那是 **opkg/apk 安装**钩子。把包编译进 image（随固件预装）时没有安装动作，postinst 一次都没跑 → cron 巡检条目从未建立。
+  2. 开机那唯一一次机会也落空：`97-wifi-roaming` 的 `start()` 开头有 mesh 守卫（`mesh.main.enabled` 必须为 1），新机首次开机用户还没启用组网，值为 0 直接 `return 0`。
+  3. 之后就再无触发点。而这两个脚本存在的意义正是**配置漂移自愈**——本系列固件不发 procd 的 `config.change` 事件，`procd_add_config_trigger` 无效，只能靠轮询；LuCI 无线页一保存会重写整段 wireless，把这些项冲掉后再没人补得回来。
+- **修法**：新增 `root/etc/uci-defaults/40-luci-app-mesh-roaming`，由 Makefile 的 install 段装进 `/etc/uci-defaults/`。uci-defaults 由 `/etc/init.d/boot` 在**首次开机**执行（成功即自删），是唯一能在「预装 + 首次启动」这个时间点做初始化的官方机制，用来把 postinst 欠下的事补回来。脚本内部同样只调两个 init 脚本自带的 `enable` / `cron_enable`，保持单一真相源；两者都幂等，与 postinst 重复执行也无副作用。
+- **不改同步协议**：11k/11v 是本机能力而非全网契约，主节点自己缺项时会反向传染子节点；且 `ap[]` 是 `IFS='|'` 的位置解析，加字段等于改协议、主子版本错配就错位。
+- **已知边界**：uci-defaults 只在首次开机跑一次、跑完自删。已刷过的机器将来用 sysupgrade **保留配置**升级时它不会再执行，需要手动补一次（`/etc/init.d/97-wifi-roaming cron_enable` 与 99 同名命令），或后续再加开机 `boot()` 钩子做二次加固。
 
 ---
 
