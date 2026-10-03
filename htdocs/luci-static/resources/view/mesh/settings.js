@@ -20,6 +20,61 @@ var callMeshStatus = rpc.declare({
 
 var m;
 
+/* 关键项兜底落盘 —— 修 2026-10-02 真机 bug（根因比想象的深，务必看完）
+ *
+ * 现象：用户在设置页改完点保存，UCI 里反而**少掉** role / encryption / country /
+ * band 四个键，meshctl apply 在 [1/7] 报"未设置本节点角色"。
+ *
+ * 真正的机制不是"没写进去"，而是 **LuCI 主动把它们删了**。form.js 的
+ * AbstractValue.parse()：
+ *     if (fval == null || fval == ''
+ *         || (fval == this.default && (this.optional || this.rmempty))) {
+ *             if (this.rmempty || this.optional) return this.remove(section_id);
+ *             ...
+ *     } else if (this.forcewrite || !isEqual(cval, fval)) {
+ *             return this.write(section_id, fval);
+ *     }
+ * —— 只要下拉框停在 default 上、且 rmempty 为真（LuCI 的默认值就是真），保存时
+ *   走的是 remove() → uci.unset() → 向 rpcd 提交一条**删除**。用户"没动过它"
+ *   反而被抹掉出厂默认值；手改过的项（fval != default）走 write() 才留下来。
+ *   这正好解释现场配置文件的古怪之处：enabled / mesh_id / channel / mesh_key
+ *   （都改过）在，role / encryption / country / band / master_addr（没动过或为空）全没了。
+ *
+ * 对策两层，缺一不可：
+ *   ① 治本：给这四个 ListValue 显式 o.rmempty = false（见下方表单定义）。
+ *      rmempty 为假时不再走 remove 分支，转为 "cval != fval → write"，
+ *      值缺失(cval=null) 就会被正常写入；值已存在且未改动则不动。
+ *   ② 兜底：ensureKeyOptions() 补写空值项。但**调用时机是成败关键** ——
+ *      必须在 m.save() 的回调里执行：
+ *          save(cb, silent) { return this.parse().then(cb)
+ *                                       .then(this.data.save.bind(this.data)) }
+ *      即 parse() 之后、真正发起 uci 保存之前。放在 m.save() **之前**（第一版
+ *      补丁就是这么写的）会被随后的 parse() 里的 remove()/unset() 直接取消，
+ *      实测无效。放进去之后，uci.set 会顺带清掉 parse 留下的待删除项。
+ */
+var MESH_KEY_FALLBACK = { role: 'master', encryption: 'sae', country: 'CN', band: '5g' };
+
+function optionDefault(k) {
+	var secs = m.children || [];
+	for (var i = 0; i < secs.length; i++) {
+		var opts = secs[i].children || [];
+		for (var j = 0; j < opts.length; j++) {
+			if (opts[j].option === k && opts[j].default != null) {
+				return opts[j].default;
+			}
+		}
+	}
+	return MESH_KEY_FALLBACK[k];
+}
+
+function ensureKeyOptions() {
+	['role', 'encryption', 'country', 'band'].forEach(function (k) {
+		var v = uci.get('mesh', 'main', k);
+		if (v != null && v !== '') { return; }
+		uci.set('mesh', 'main', k, optionDefault(k));
+	});
+}
+
 /* 「上次应用结果」显示区 —— apply 走后台且固定返回 code=0（因为子节点会改 IP +
    network restart，应答发不回来），真实成败只能事后回读。 */
 var lastApplyBox = null;
@@ -116,10 +171,14 @@ return view.extend({
 		o.rmempty = false;
 		o.default = o.disabled;
 
-		o = s.option(form.ListValue, 'role', _('本节点角色'));
-		o.value('master', _('主节点(接光猫 · 配置源)'));
-		o.value('client', _('子节点(全端口内网 · 跟随主节点)'));
-		o.default = 'master';
+	o = s.option(form.ListValue, 'role', _('本节点角色'));
+	o.value('master', _('主节点(接光猫 · 配置源)'));
+	o.value('client', _('子节点(全端口内网 · 跟随主节点)'));
+	o.default = 'master';
+	/* rmempty=false 是必须的，不是可选项 —— 见文件头 ensureKeyOptions 的说明：
+	   rmempty 为真时，只要下拉框停在 default 上，LuCI 保存时会把这个键从 UCI
+	   里**删除**，等于用户"什么都没改"却被抹掉了出厂默认值。 */
+	o.rmempty = false;
 		o.description = _('主节点：接光猫并作为配置源，终端 Wi-Fi 在「网络 → 无线」里设置；'
 			+ '子节点：自动采用主节点的无线设置（SSID/密码/802.11r），每 10 秒核对一次，'
 			+ '全部物理端口(WAN/LAN)都将并入内网 br-lan，并关闭本机 DHCP 服务。');
@@ -139,9 +198,10 @@ return view.extend({
 		o = s.option(form.ListValue, 'encryption', _('Mesh 回程加密'));
 		o.value('sae', _('WPA3-SAE(推荐, 802.11s 强制要求)'));
 		o.value('sae-mixed', _('WPA3/WPA2 混合(兼容老旧节点)'));
-		o.value('none', _('不加密(不建议)'));
-		o.default = 'sae';
-		o.description = _('路由器之间互联所用的加密方式，所有节点必须一致。');
+	o.value('none', _('不加密(不建议)'));
+	o.default = 'sae';
+	o.rmempty = false;   // 同 role：停在默认值时不得被 LuCI 删掉
+	o.description = _('路由器之间互联所用的加密方式，所有节点必须一致。');
 
 		o = s.option(form.ListValue, 'band', _('回程频段'));
 		// 按本机实际射频能力列出频段：从后端 status.channels 取（缺省回退固定列表）
@@ -160,8 +220,9 @@ return view.extend({
 		if (meshBands['5g']) { o.value('5g', _('5 GHz(推荐)')); }
 		if (meshBands['2g']) { o.value('2g', _('2.4 GHz(穿墙好)')); }
 		if (meshBands['6g']) { o.value('6g', _('6 GHz(Wi-Fi 6E)')); }
-		o.value('auto', _('自动选择'));
-		o.default = meshBands['5g'] ? '5g' : (meshBands['2g'] ? '2g' : (meshBands['6g'] ? '6g' : 'auto'));
+	o.value('auto', _('自动选择'));
+	o.default = meshBands['5g'] ? '5g' : (meshBands['2g'] ? '2g' : (meshBands['6g'] ? '6g' : 'auto'));
+	o.rmempty = false;   // 同 role：停在默认值时不得被 LuCI 删掉
 		o.description = _('路由器之间互联所用的频段，按本机实际射频能力列出。'
 			+ '5GHz 干扰少、速率高；2.4GHz 穿墙好、覆盖远；本机没有的频段不会出现。');
 
@@ -199,9 +260,10 @@ return view.extend({
 		o.value('US', _('美国'));
 		o.value('JP', _('日本'));
 		o.value('DE', _('德国'));
-		o.value('00', _('全球(宽松)'));
-		o.default = 'CN';
-		o.description = _('影响可用信道与发射功率。');
+	o.value('00', _('全球(宽松)'));
+	o.default = 'CN';
+	o.rmempty = false;   // 同 role：停在默认值时不得被 LuCI 删掉
+	o.description = _('影响可用信道与发射功率。');
 
 		o = s.option(form.Value, 'master_addr', _('主节点地址(子节点)'));
 		o.placeholder = '192.168.1.1';
@@ -268,9 +330,12 @@ return view.extend({
 		});
 	},
 
-	/* 保存后额外触发一次 meshctl apply */
+	/* 保存后额外触发一次 meshctl apply
+	   注意 ensureKeyOptions 是作为 m.save() 的**回调**传入的（不是提前调用）：
+	   m.save(cb) 的执行顺序是 parse() → cb → uci.save()，放在 cb 里才能盖住
+	   parse() 对默认值的 remove()。详见文件头注释。 */
 	handleSave: function () {
-		return m.save();
+		return m.save(ensureKeyOptions);
 	},
 
 	/* 「保存并应用」= 三步，顺序绝不能颠倒：
@@ -313,7 +378,8 @@ return view.extend({
 			}
 			return false;
 		}
-		return m.save()
+		/* 同 handleSave：兜底必须在 m.save() 的回调里跑，不能提前 */
+		return m.save(ensureKeyOptions)
 			.then(function () {
 				return uci.apply().catch(function (rv) {
 					if (isNoData(rv)) {

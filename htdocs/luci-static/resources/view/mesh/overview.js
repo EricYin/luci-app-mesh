@@ -373,6 +373,17 @@ return view.extend({
 			capBox.textContent = t;
 		}
 
+		/* 角色没落盘时的红框：后端不再把空 role 兜底成 master（status 里给 role_set=0），
+		   这里必须显眼提示 —— 否则界面照旧写"主节点 · 配置源(下发中)"，而 apply 在
+		   第一步就退出、mesh0/bat0 建不起来、子节点只能拿到 not_master。
+		   真机踩到过（2026-10-02）。 */
+		var roleBox = null;
+		if (d.role_set === 0) {
+			roleBox = E('div', { 'class': 'mesh-note red' });
+			roleBox.textContent = _('未设置本节点角色：/etc/config/mesh 里没有 mesh.main.role，组网不会生效。')
+				+ ' ' + _('请到「组网设置」选择主节点或子节点后保存并应用，或执行：uci set mesh.main.role=master; uci commit mesh');
+		}
+
 		/* 运行状态卡片 */
 		var on = d.enabled == 1;
 		var isClient = d.role === 'client';
@@ -385,7 +396,10 @@ return view.extend({
 			card(_('Mesh ID'), d.mesh_id),
 			card(_('已连接邻居'), cardVal, nConn > 0 ? '#37c837' : null),
 			card(_('路径选择'), batmanText(d), (d.batman && d.batman.enabled == 1) ? '#37c837' : null),
-			card(_('本机角色'), isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(接光猫 · 配置源)')),
+			card(_('本机角色'), d.role_set === 0
+				? _('未选择')
+				: (isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(接光猫 · 配置源)')),
+				d.role_set === 0 ? '#e24b4a' : null),
 			card(_('本机地址'), d.lan_ip),
 			card(_('地址获取'),
 				isClient ? ((d.lan_proto === 'dhcp') ? _('DHCP(从主节点获取)') : _('静态(本机保留)')) : _('本机静态')),
@@ -416,6 +430,7 @@ return view.extend({
 
 		return E('div', {}, [
 			rb,
+			roleBox,
 			section(_('能力检测'), capBox),
 			section(_('运行状态'), cards),
 			section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),

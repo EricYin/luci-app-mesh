@@ -31,9 +31,23 @@ case "$wmac" in *[!0-9A-Fa-f:,-]*) wmac="";; esac
 hdr() { echo "Content-Type: application/json"; echo ""; }
 
 # ---- 基本校验 ----
-if [ "$(mesh_uci_getd main.enabled 0)" != 1 ] || [ "$(mesh_uci_get main.role)" != master ]; then
+# 原来三种完全不同的情况都返回同一个 not_master：没启用、没配角色、配成了子节点。
+# 排查时除了"我不是主节点吗"之外得不到任何信息 —— 真机踩到过（2026-10-02）：
+# UCI 里压根没有 mesh.main.role，子节点看到的就是一句 not_master，无从下手。
+# 这里拆开：disabled / role_unset / not_master(附实际角色)，并给一句可执行的提示。
+if [ "$(mesh_uci_getd main.enabled 0)" != 1 ]; then
 	hdr
-	echo '{"ok":0,"error":"not_master"}'
+	echo '{"ok":0,"error":"disabled","hint":"本节点未启用 Mesh 组网（mesh.main.enabled != 1）"}'
+	exit 0
+fi
+mesh_role=$(mesh_uci_get main.role)
+if [ "$mesh_role" != master ]; then
+	hdr
+	if [ -z "$mesh_role" ]; then
+		echo '{"ok":0,"error":"role_unset","hint":"本节点未设置角色，请在组网设置页选择主节点后保存，或执行：uci set mesh.main.role=master; uci commit mesh"}'
+	else
+		echo "{\"ok\":0,\"error\":\"not_master\",\"role\":\"$(mesh_esc "$mesh_role")\",\"hint\":\"本节点角色是 $mesh_role，配置下发只由主节点提供\"}"
+	fi
 	exit 0
 fi
 want=$(mesh_uci_get main.mesh_key)

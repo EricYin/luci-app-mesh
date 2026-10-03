@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**接光猫出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r21`（`PKG_RELEASE` 21）
+- 当前版本：`1.0.0-r22`（`PKG_RELEASE` 22）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -112,8 +112,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r21.apk
-opkg install luci-app-mesh_1.0.0-r21_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r22.apk
+opkg install luci-app-mesh_1.0.0-r22_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -160,6 +160,24 @@ sh install.sh
 修复组网设置「回程频段 / 回程信道」不联动、且频段不按实际硬件列出的问题：
 - **回程频段按硬件列出**：`meshctl status` 新增 `channels` 字段（各射频用 `iw phy info` 取真实信道号，含 DFS）；前端据此只显示本机实际拥有的频段（没有的频段不出现），默认频段也按硬件择优。
 - **回程信道随频段联动**：原来信道下拉把 5G/2.4G 信道静态混在一个列表里、与频段选择毫无关联。现拆成 `channel_5g/2g/6g/auto` 四个选项，各自 `depends('band', …)` —— 选 5G 只列 5G 信道、选 2.4G 只列 2.4G 信道，LuCI 在切换频段时自动显隐并重渲染；四个选项映射到同一 UCI 项 `channel`，隐藏时不删值。
+
+### r22（2026-10-02）
+修复「本机明明是主节点、`/cgi-bin/mesh-sync` 却恒返回 `not_master`、组网始终起不来」这个极难自查的故障（真机复现并验证：PonWrt / aarch64 两台）：
+- **根因不在 mesh 协议，而在配置项没落盘**：LuCI 的 `m.save()` 只提交「值发生变化」的项，而 `role` / `encryption` / `country` / `band` 在设置页都是**带默认值的下拉框**——用户没动过时界面照常显示 `master` / `sae` / `CN`，UCI 里却没有这些键。于是 `meshctl apply` 在 `[1/7]` 就报「请选择本节点角色」退出，`mesh0` / `bat0` 从未建立，子节点只能拿到 `not_master`。用户手改过的 `enabled` / `mesh_id` / `channel` / `mesh_key` 反而都在，所以单看配置文件很难看出缺了什么。
+- **★ 真凶：LuCI 不是「没写」，是主动删**。上一版判定只说对了一半。设备上的 `form.js` 里 `AbstractValue.parse()` 是这样的：
+  ```js
+  if (fval == null || fval == '' || (fval == this.default && (this.optional || this.rmempty))) {
+      if (this.rmempty || this.optional) return this.remove(section_id);   // → uci.unset()
+  } else if (this.forcewrite || !isEqual(cval, fval)) {
+      return this.write(section_id, fval);
+  }
+  ```
+  `rmempty` 在 LuCI 里默认就是真，所以**下拉框停在默认值上 = 保存时把这个键从 UCI 里删掉**。用户「什么都没改」反而被抹掉出厂默认值；手改过的项（`fval != default`）走 `write()` 才留下来——这正是现场配置文件里 `enabled` / `mesh_id` / `channel` / `mesh_key` 在、而 `role` / `encryption` / `country` / `band` / `master_addr` 全没了的成因。
+- **设置页根治（两层，缺一不可）**：
+  1. `role` / `encryption` / `band` / `country` 四个 ListValue 各加 `o.rmempty = false`。为假后不再走 `remove` 分支，而 `cfgvalue()` 不回退 `default`（只有 `textvalue` 回退），于是 `cval=null != fval` → 走 `write()`，缺失即写入、已存在且未改动则不动。
+  2. `ensureKeyOptions()` 补写空值项，且**调用时机是成败关键**：必须放进 `m.save(ensureKeyOptions)` 回调里（在 `parse()` 之后、真正发起 uci 保存之前）。放在 `m.save()` **之前**（第一版补丁就是这么写的）会被随后的 `parse()` 里的 `remove()` 直接取消，实测无效。
+- **状态页不再撒谎**：`meshctl status` 原来把空的 `role` 兜底成 `master`——这正是「我明明是主节点」的来源。现在如实上报（`role` 为空 + `role_set=0`），同步状态也不再显示「配置源(下发中)」；`role_set=0` 时状态页顶部红框提示、「本机角色」卡显示未选择。
+- **报错可读**：`mesh-sync` 的 `not_master` 拆成 `disabled` / `role_unset` / `not_master`（后两者附实际值），各带一句 `hint`；`meshctl apply` 报未设置角色时直接给出可执行的修复命令。
 
 ---
 

@@ -360,7 +360,13 @@ cmd_apply() {
 
 	echo "[1/7] 校验参数"
 	if [ "$role" != master ] && [ "$role" != client ]; then
-		echo "错误：请选择本节点角色（主节点/子节点）"; return 1
+		if [ -z "$role" ]; then
+			# 单行输出：rpcd 取的是 grep '^错误' 的最后一行，提示必须塞进这一行里
+			echo "错误：未设置本节点角色（UCI 里没有 mesh.main.role）—— 请在组网设置页选择主节点/子节点后保存，或执行 uci set mesh.main.role=master; uci commit mesh"
+		else
+			echo "错误：本节点角色非法（'$role'，只能是 master 或 client）"
+		fi
+		return 1
 	fi
 	if [ -z "$id" ]; then
 		echo "错误：Mesh ID 不能为空"; return 1
@@ -894,8 +900,15 @@ peers_tsv_to_json() {
 # ================= 状态 =================
 cmd_status() {
 	local role enabled id enc country band ch rssi maxp fwd gw hwmp bh_radio bh_band now
+	local role_set=1
 	local peer_count peer_online wifi_peers eth_peers lastok lastfail reason myidx syncinfo synccode
-	role=$(mesh_uci_getd main.role master)
+	# 这里**绝不能**兜底成 master：role 缺失时若照常显示"主节点(配置源)"、同步状态
+	# 显示"配置源(下发中)"，用户会以为配置没问题 —— 而 apply 在 [1/7] 就因读不到
+	# role 退出、mesh-sync 回 not_master，界面与真实状态完全相反。真机踩到过
+	# （2026-10-02：主节点 UCI 里没有 role，状态页却一直显示主节点）。
+	# 缺失就如实上报：role 给空串、role_set 给 0，由前端红框提示去选角色。
+	role=$(mesh_uci_get main.role)
+	[ -n "$role" ] || role_set=0
 	enabled=$(mesh_uci_getd main.enabled 0)
 	id=$(mesh_uci_getd main.mesh_id OpenWrtMesh)
 	# 与 cmd_apply 用同一套解析器取默认值，避免"状态页显示 A、下发却是 B"
@@ -958,6 +971,10 @@ cmd_status() {
 			syncinfo="尚未同步"
 			synccode="none"
 		fi
+	elif [ "$role_set" = 0 ]; then
+		# 角色都没设，谈不上是配置源 —— 别再显示"下发中"误导人
+		syncinfo="未设置角色（无法作为配置源）"
+		synccode="role_unset"
 	else
 		syncinfo="配置源(下发中)"
 		synccode="master"
@@ -1050,6 +1067,7 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
 {
  "enabled": $enabled,
  "role": "$(mesh_esc "$role")",
+ "role_set": $role_set,
  "mesh_id": "$(mesh_esc "$id")",
  "encryption": "$(mesh_esc "$enc")",
  "country": "$(mesh_esc "$country")",
