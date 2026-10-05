@@ -1519,6 +1519,35 @@ reg_unlock() { rmdir "$MESH_TMP_DIR/registry.lock" 2>/dev/null; }
 # 字段: mac|ip|hostname|board|fw|link|first_seen|last_seen|wmac
 #        wmac = 该子节点 mesh 接口(无线)MAC，逗号分隔；用于把无线邻居归并到本节点
 # 返回该节点的序号(1 起，按首次注册时间排序；0 为主节点)
+
+# 节点离线多久后从注册表剔除（秒），默认 1 小时。
+# 下限取 60 秒：太短会把「正在重启/升级」的节点也删掉，而序号是按首次注册时间排的，
+# 删掉再注册等于重新排号 —— 信道错开的分配会跟着跳。
+# 上限不设：想让离线节点一直挂着就把 peer_ttl 调大（例如 86400）。
+mesh_registry_ttl() {
+	local v
+	v=$(mesh_uci_getd main.peer_ttl 3600)
+	case "$v" in ''|*[!0-9]*) v=3600;; esac
+	[ "$v" -ge 60 ] 2>/dev/null || v=3600
+	echo "$v"
+}
+
+# 单独跑一次清理。
+# 注册表平时只在「有子节点上报」时才顺带清理（见 mesh_registry_update 末尾），
+# 于是会出现：最后一台子节点掉线后，全网再没有上报发生，那条幽灵行就一直挂在
+# 列表里没人清。status 是界面每 10 秒都会调的路径，在这里主动清一遍最省事。
+mesh_registry_prune() {
+	[ -f "$MESH_REGISTRY" ] || return 0
+	local now ttl
+	now=$(date +%s)
+	ttl=$(mesh_registry_ttl)
+	reg_lock || return 0
+	awk -F'|' -v now="$now" -v ttl="$ttl" '$8+0 >= now-ttl' \
+		"$MESH_REGISTRY" > "$MESH_REGISTRY.p" 2>/dev/null \
+		&& mv "$MESH_REGISTRY.p" "$MESH_REGISTRY"
+	rm -f "$MESH_REGISTRY.p"
+	reg_unlock
+}
 mesh_registry_update() {
 	local mac="$1" ip="$2" host="$3" board="$4" fw="$5" link="$6" wmac="$7"
 	local now first found=0 m rest tmp idx _f1 _f2 _f3 _f4 _f5 _f7 _f8
@@ -1554,10 +1583,10 @@ EOF
 		fi
 	done < "$MESH_REGISTRY"
 	[ "$found" = "0" ] && printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$mac" "$ip" "$host" "$board" "$fw" "$link" "$now" "$now" "$wmac" >> "$tmp"
-	# 按首次注册时间排序，并清理 24h 未上线的节点。
+	# 按首次注册时间排序，并清理超时未上线的节点（阈值见 mesh_registry_ttl）。
 	# 第二键必须带 MAC：两台子节点同时第一次上电（同一秒注册）时，若排序结果不确定，
 	# 节点序号会在两次同步之间来回跳，信道错开结果也跟着跳
-	sort -t'|' -k7,7n -k1,1 "$tmp" | awk -F'|' -v now="$now" '$8+0 >= now-86400' > "$MESH_REGISTRY.t"
+	sort -t'|' -k7,7n -k1,1 "$tmp" | awk -F'|' -v now="$now" -v ttl="$(mesh_registry_ttl)" '$8+0 >= now-ttl' > "$MESH_REGISTRY.t"
 	mv "$MESH_REGISTRY.t" "$MESH_REGISTRY"
 	rm -f "$tmp"
 	idx=0
@@ -1841,11 +1870,18 @@ mesh_all_physical_ports() {
 			mesh_has "$base" "$ports" && continue
 			ports="$ports $base"
 		done
-	elif ls -d /sys/class/net/lan* /sys/class/net/wan* >/dev/null 2>&1; then
+	# ★ 判据是"lan* 或 wan* **任一**存在"，不能写成
+	#     ls -d /sys/class/net/lan* /sys/class/net/wan* >/dev/null
+	#   —— 只要有一个 glob 没匹配上，整条 ls 就返回非 0，于是掉进下面的 eth* 兜底，
+	#   把 DSA 的 conduit(eth0) 当成物理口。真机踩到过：这几台上行是 pon0 光口，
+	#   压根没有 wan* 端口（2026-10-05），结果"端口内网化"永远是 false。
+	elif [ -n "$(ls -d /sys/class/net/lan* /sys/class/net/wan* 2>/dev/null)" ]; then
 		# DSA 目标：lan1..lanN / wan 用户端口
 		for p in /sys/class/net/lan* /sys/class/net/wan*; do
 			[ -e "$p" ] || continue
 			base=${p##*/}
+			# 跳过 VLAN 子接口（lan1.1 之类），它们不是物理口
+			case "$base" in *.*) continue;; esac
 			mesh_has "$base" "$ports" && continue
 			ports="$ports $base"
 		done
@@ -2114,7 +2150,7 @@ mesh_brlan_fdb_tsv() {
 # 用于状态页「端口内网化」：主节点保留的 WAN 上行口不算"未并入"，
 # 其余全部内网端口都必须在 br-lan 的成员表里（B 方案下端口就是直接进 br-lan 的）
 mesh_all_ports_in_lan() {
-	local p sec opt existing net live=0
+	local p sec opt existing net live=0 role
 	sec=$(mesh_brlan_section)
 	[ -n "$sec" ] || return 1
 	opt=$(mesh_section_members_opt "$sec")
@@ -2127,6 +2163,20 @@ mesh_all_ports_in_lan() {
 	# br-lan 还没起来时退回只看配置。
 	net="${MESH_SYS_NET:-/sys/class/net}"
 	[ -d "$net/br-lan/brif" ] && live=1
+
+	# ★ 主节点是另一把尺子：「全部物理端口并入内网」这个需求对它根本不适用 ——
+	#   它必须保留上行口（这几台的上行是 pon0 光口，另有 lan1 当第二上行），
+	#   没被任何接口用上的空闲口（实测 lan2）也不该算"未并入"。拿子节点的尺子
+	#   量主节点，结果就是它永远挂红告警（2026-10-05 真机）。
+	#   所以主节点只校验 bat0 真的挂进了 br-lan —— 那是它参与二层域的唯一条件。
+	role=$(mesh_uci_get main.role)
+	if [ "$role" = master ]; then
+		[ "$(mesh_uci_getd main.batman 1)" = "1" ] || return 0
+		mesh_has bat0 "$existing" || return 1
+		[ "$live" = 1 ] && { mesh_brlan_has_port bat0 || return 1; }
+		return 0
+	fi
+
 	for p in $(mesh_brlan_expected_members); do
 		mesh_has "$p" "$existing" || return 1
 		if [ "$live" = 1 ] && ! mesh_brlan_has_port "$p"; then return 1; fi
@@ -2137,14 +2187,19 @@ mesh_all_ports_in_lan() {
 # 端口内网化体检明细（诊断页用）：期望 / 配置 / 运行时三份对比 + 缺失清单。
 # 出问题时这里能一眼看出是"没写进配置"还是"写了但内核里没生效"。
 mesh_brlan_members_report() {
-	local sec opt existing p net live=0 miss=""
+	local sec opt existing p net live=0 miss="" role
 	sec=$(mesh_brlan_section)
 	opt=$(mesh_section_members_opt "$sec")
 	existing=$(uci -q get "network.$sec.$opt" 2>/dev/null)
+	role=$(mesh_uci_get main.role)
 	net="${MESH_SYS_NET:-/sys/class/net}"
 	[ -d "$net/br-lan/brif" ] && live=1
 	echo "br-lan 节        = ${sec:-未找到}"
 	echo "成员选项        = $opt"
+	echo "本节点角色      = ${role:-未设置}"
+	if [ "$role" = master ]; then
+		echo "判定口径        = 主节点不适用「全端口内网化」，本页只校验 bat0"
+	fi
 	echo "期望成员        = $(mesh_brlan_expected_members | tr '\n' ' ')"
 	echo "配置里的成员    = $(printf '%s\n' "$existing" | tr '\n' ' ')"
 	echo "运行时成员      = $(ls "$net/br-lan/brif" 2>/dev/null | tr '\n' ' ')"

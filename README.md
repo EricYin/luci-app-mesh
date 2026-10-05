@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r28`（`PKG_RELEASE` 28）
+- 当前版本：`1.0.0-r29`（`PKG_RELEASE` 29）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r28.apk
-opkg install luci-app-mesh_1.0.0-r28_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r29.apk
+opkg install luci-app-mesh_1.0.0-r29_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -236,3 +236,33 @@ sh install.sh
   顶部角色红框也改成指向这两个按钮。
 - 为支持整页即时重画，`render()` 的内容抽成 `buildBody(d)`，`repaintAll()` 直接
   替换根节点 —— 不用 `location.reload()`（那会把整个 LuCI 外壳重新加载一遍）。
+
+### r29（2026-10-05）
+修两个长期误报的显示问题。
+
+**①「端口内网化」恒为 false（主子节点都报“部分端口未并入”）**
+- 根因：这几台机器**根本没有 `wan*` 端口**（上行是 `pon0` 光口），而枚举函数写的是
+  `ls -d /sys/class/net/lan* /sys/class/net/wan*` —— `wan*` 不匹配时**整条命令返回非 0**，
+  于是掉进 `eth*` 兜底分支，把 DSA 的 conduit **`eth0`** 当成物理口。期望成员变成
+  `eth0 bat0`，而 eth0 不可能出现在 br-lan 的成员里，判定自然永远失败。
+- 改法：`lan*` 与 `wan*` **分开判断，任一存在即按 DSA 处理**；`eth*` 只在两者都不存在时兜底。
+- 语义修正（主节点）：主节点本来就要保留上行口，不该拿“全端口内网化”这把尺子量它。
+  现在主节点**只校验 bat0 是否真的在 br-lan 里**，文案改为
+  「主节点：bat0 已并入 br-lan（上行口按要求保留，全端口内网化不适用）」。
+  子节点维持全量校验（全部物理口 + bat0）。
+
+**② 节点列表里的“幽灵行”（掉线的子节点一直挂在那里）**
+- 根因：注册表只在**有子节点上报**时才顺带清理一次，且阈值硬编码 **24 小时**。
+  于是“最后一台子节点掉线后再无上报”时，那条记录会一直以 offline 常驻一整天。
+- 改法：
+  - 新增 `mesh_registry_ttl()`（`mesh.main.peer_ttl`，默认 **3600** 秒，下限 60），
+    替换原来的硬编码 86400；下限取 60 是为了不把“正在重启/升级”的节点删掉重排号
+    （节点序号按首次注册时间排，决定信道错开）。
+  - 新增 `mesh_registry_prune()`，并在 **`meshctl status` 里主动调一次** ——
+    status 是界面每 10 秒都会走的路径，这样即使全网再无上报也能自愈。
+  - peers JSON 增加 `lastseen`（epoch），离线行在界面上显示「最后上报 X 前」，
+    据此分辨“刚重启”和“早就不在了”。
+  - 设置页「链路控制」新增「离线节点保留时长(秒)」。
+
+**顺带**：`mesh_brlan_members_report` 现在会打印判定口径、上行口排除清单与缺失项，
+排障时能一眼看出到底按什么规则算的。

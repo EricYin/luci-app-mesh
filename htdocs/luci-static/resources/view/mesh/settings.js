@@ -431,6 +431,14 @@ return view.extend({
 		o.datatype = 'range(1,32)';
 		o.description = _('单个射频最多同时连接的邻居数量，1 ~ 32。');
 
+		o = s.option(form.Value, 'peer_ttl', _('离线节点保留时长(秒)'));
+		o.placeholder = '3600';
+		o.datatype = 'range(60,604800)';
+		o.description = _('子节点最后一次上报后，在节点列表里保留多久，默认 3600（1 小时）；'
+			+ '最短 60 秒。留太久，早已拆走的节点会一直以「离线」挂在列表里；'
+			+ '留太短，正在重启或升级的节点会被当成新节点重新排号（节点序号决定信道错开）。'
+			+ '离线行会显示「最后上报 X 前」，据此判断它是刚掉线还是老记录。');
+
 		/* 放在表单上方：apply 是后台执行且固定返回成功，这里补上"上一次到底成了没有" */
 		var lastBox = E('div', {
 			'style': 'display:none;margin:0 0 1em 0;padding:.6em .8em;border-radius:4px;'

@@ -105,6 +105,13 @@ function batmanText(d) {
    后端同时核对了 UCI 配置与内核 brif 的真实成员关系 —— 只看 UCI 会出现"写进了
    device 节不认的选项名、界面报绿而内网实际不通"的假象，见 mesh_all_ports_in_lan。 */
 function portBridgingText(d) {
+	/* 主节点不适用「全部物理端口并入内网」—— 它必须保留上行口（这几台的上行是
+	   pon0 光口），空闲口也不该算未并入。后端对它只校验 bat0，这里照实说明，
+	   否则主节点会永远挂一条橙色告警。 */
+	if (d.role === 'master') {
+		return d.port_bridging ? _('主节点：bat0 已并入内网（保留上行口，不适用全端口内网化）')
+			: _('主节点：bat0 未并入内网');
+	}
 	if (d.port_bridging) return _('全部内网端口与 bat0 已并入内网');
 	return _('部分端口或 bat0 未并入');
 }
@@ -236,6 +243,17 @@ function batCell(p) {
 }
 
 /* ---------- 节点表 ---------- */
+/* "多久之前"的中文说法。离线节点必须给出最后上报时间，否则界面上一条灰色的
+   "离线"让人无从判断它是刚掉线还是半年前的老记录。 */
+function agoText(sec) {
+	if (sec == null || isNaN(sec)) return '-';
+	sec = Math.max(0, Math.floor(sec));
+	if (sec < 60) return _('%d 秒前').format(sec);
+	if (sec < 3600) return _('%d 分钟前').format(Math.floor(sec / 60));
+	if (sec < 86400) return _('%d 小时前').format(Math.floor(sec / 3600));
+	return _('%d 天前').format(Math.floor(sec / 86400));
+}
+
 function peersTable(d) {
 	var list = (d.peers && d.peers.list) ? d.peers.list : [];
 	var hasBat = list.some(function (p) { return p.bat && p.bat.tq != null; });
@@ -319,6 +337,12 @@ function peersTable(d) {
 				}, _('连接时长 %s s').format(p.connected)));
 		} else {
 			stCell.appendChild(pill(_('离线'), 'grey'));
+			/* 离线行给最后上报时间：注册表里没清掉的行会一直显示"离线"，
+			   没有时间就无法分辨"刚重启"和"早就不在了"。 */
+			if (p.lastseen)
+				stCell.appendChild(E('div', {
+					'style': 'font-size:11px;color:#999;margin-top:2px'
+				}, _('最后上报 %s').format(agoText(d.now - p.lastseen))));
 		}
 
 		var cells = [ nameCell, linkCell, sigCell, ipCell ];

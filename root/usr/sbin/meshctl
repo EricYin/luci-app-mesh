@@ -932,9 +932,10 @@ peers_tsv_to_json() {
 			idx  = (mac in ridx) ? ridx[mac] : 0
 			if (!first) printf ",\n"
 			first = 0
-			printf "{\"mac\":\"%s\",\"hostname\":\"%s\",\"link\":\"%s\",\"ip\":\"%s\",\"path\":\"%s\",\"signal\":%s,\"txrate\":\"%s\",\"connected\":\"%s\",\"index\":%d,\"status\":\"%s\",\"role\":\"%s\",\"bat\":{\"tq\":%s,\"via\":\"%s\",\"preferred\":\"%s\",\"gw\":%d}}",
+			printf "{\"mac\":\"%s\",\"hostname\":\"%s\",\"link\":\"%s\",\"ip\":\"%s\",\"path\":\"%s\",\"signal\":%s,\"txrate\":\"%s\",\"connected\":\"%s\",\"index\":%d,\"status\":\"%s\",\"role\":\"%s\",\"lastseen\":%d,\"bat\":{\"tq\":%s,\"via\":\"%s\",\"preferred\":\"%s\",\"gw\":%d}}",
 				esc(mac), esc(host), esc(link), esc(ip), esc(bpath),
 				(sig == "" ? "null" : "\"" sig "\""), esc(tx), esc(ct), idx, esc(status), esc(role),
+				((mac in rlast) ? rlast[mac] : 0),
 				(btq == "" ? "null" : "\"" btq "\""), esc(bvia), esc(bpref), bgw
 		}
 		END { if (first) printf " " }
@@ -973,6 +974,9 @@ cmd_status() {
 	now=$(date +%s)
 
 	local st
+	# 先清一遍过期行再建表：否则「最后一台子节点掉线后再无上报」时，那条幽灵行
+	# 会一直以 offline 常驻（清理原本只发生在有节点上报的时候）
+	mesh_registry_prune
 	st=$(build_peers_tsv)
 	peer_count=$(wc -l < "$st" 2>/dev/null); peer_count=${peer_count:-0}
 	peer_count=$(printf '%s' "$peer_count" | tr -d ' ')
@@ -1524,7 +1528,16 @@ cmd_port_bridging() {
 		uci commit network
 		/etc/init.d/network restart >/dev/null 2>&1
 	fi
-	mesh_all_ports_in_lan && echo "所有内网端口与 bat0 均已并入 br-lan" || echo "部分端口或 bat0 未能并入，请检查网络配置"
+	if [ "$(mesh_uci_get main.role)" = master ]; then
+		# 主节点不适用"全部物理端口并入内网"（它要保留上行口），只校验 bat0
+		if mesh_all_ports_in_lan; then
+			echo "主节点：bat0 已并入 br-lan（上行口按要求保留，全端口内网化不适用）"
+		else
+			echo "bat0 未并入 br-lan，二层域不通 —— 请到诊断页看端口并入明细"
+		fi
+	else
+		mesh_all_ports_in_lan && echo "所有内网端口与 bat0 均已并入 br-lan" || echo "部分端口或 bat0 未能并入，请检查网络配置"
+	fi
 }
 
 # ================= 一步选角色（状态页直接选主/子节点） =================
