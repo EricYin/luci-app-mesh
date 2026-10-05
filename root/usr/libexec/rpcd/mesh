@@ -128,6 +128,13 @@ case "$1" in
 					out=$("$MESHCTL" pair-status 2>&1)
 					code=$?
 					;;
+				set_role)
+					# 同步执行（只写一次 UCI，毫秒级）；arg = master|client
+					case "$arg" in
+						master|client) out=$("$MESHCTL" set-role "$arg" 2>&1); code=$?;;
+						*) out='用法：arg 必须是 master 或 client'; code=1;;
+					esac
+					;;
 				diag|sync|revert|port_bridging|confirm_rollback)
 						out=$("$MESHCTL" "$cmd" 2>&1)
 						code=$?

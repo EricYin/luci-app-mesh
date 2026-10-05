@@ -348,6 +348,9 @@ var callMeshPair = rpc.declare({
 var pairTimers = [];
 var pairBusyTimer = null;
 var pairHost = null;
+/* 整页根节点。选完角色后要立刻重画整页（角色卡片、运行状态卡片、配对区块
+   全都变了），只重画配对区块的话上面几张卡片要等 10 秒轮询才更新。 */
+var rootNode = null;
 
 function clearPairTimers() {
 	pairTimers.forEach(function (t) { clearInterval(t); });
@@ -425,6 +428,31 @@ function doPair(cmd, arg) {
 	});
 }
 
+/* 整页重画：换掉根节点，而不是 location.reload() —— 后者会把整个 LuCI 外壳
+   重新加载一遍，慢且打断轮询。 */
+function repaintAll(d) {
+	if (!rootNode || !rootNode.parentNode) { return; }
+	clearPairTimers();
+	var n = buildBody(d || {});
+	rootNode.parentNode.replaceChild(n, rootNode);
+	rootNode = n;
+}
+
+/* 状态页直接选角色：只写 UCI，不应用（子节点还没凭证，apply 必失败）。 */
+function setRole(role) {
+	return callMeshPair('set_role', role).then(function (res) {
+		var out = (res && res.stdout) ? res.stdout : '';
+		ui.addNotification(null, E('p', {}, out || _('已设置')), 'success');
+		setTimeout(function () {
+			callMeshStatus().then(repaintAll, function () {});
+		}, 800);
+		return out;
+	}, function (e) {
+		ui.addNotification(null, E('p', {}, _('操作失败：%s').format(e)), 'danger');
+		return null;
+	});
+}
+
 function pairSection(d) {
 	var p = d.pair || {};
 	var prog = p.progress || {};
@@ -443,22 +471,47 @@ function pairSection(d) {
 				+ '窗口到期自动关闭；窗口关着时配对信号根本不存在，所以固定密码本身不构成风险。'))
 	]);
 
-	/* A. 还没启用 / 还没选角色：任何配对动作都没有意义，直接挡掉并给出可执行的下一步。
-	   子节点这段提示特意点明"先点保存、别点保存并应用" —— 凭证还没领到的时候跑
-	   apply 必然报「子节点没有 Mesh ID」，那是预期内的失败，不该让用户以为是坏了。 */
+	/* A. 还没启用 / 还没选角色：配对动作没有意义，但**不该把人支到别的页面去** ——
+	   角色与开关就在这里给按钮，点了只写配置（不应用），选完立刻回到配对流程。
+	   子节点这一段必须强调"先别应用"：凭证还没领到时跑 apply 必然报
+	   「子节点没有 Mesh ID」，那是预期内的失败，不该让用户以为是坏了。 */
 	if (!roleSet || !on) {
-		var hint;
 		if (!roleSet) {
-			hint = _('未设置本节点角色：请先到「组网设置」选择主节点或子节点并保存。');
+			box.appendChild(E('div', { 'class': 'mesh-note red' },
+				_('本节点还没选角色，组网不会生效。选一个就能继续（只写配置，不改网络、不重启无线）：')));
 		} else if (isClient) {
-			hint = _('Mesh 组网尚未启用：请到「组网设置」把「启用 Mesh 组网」打开、'
-				+ '角色选「子节点」，然后点『保存』——**先别点「保存并应用」**，'
-				+ '凭证还没领到，这时应用会报「子节点没有 Mesh ID」。保存完回到本页点下面的按钮。');
+			box.appendChild(E('div', { 'class': 'mesh-note orange' },
+				_('本节点已是子节点，但 Mesh 组网当前未启用。点下面的按钮启用它（只写配置）：')));
 		} else {
-			hint = _('Mesh 组网尚未启用：请先到「组网设置」打开「启用 Mesh 组网」并保存应用，'
-				+ '主节点只有启用后才能开放加入。');
+			box.appendChild(E('div', { 'class': 'mesh-note orange' },
+				_('本节点已是主节点，但 Mesh 组网当前未启用。点下面的按钮启用它（只写配置）：')));
 		}
-		box.appendChild(E('div', { 'class': 'mesh-note red' }, hint));
+
+		var pickRow = E('div', { 'class': 'mesh-btnrow' });
+
+		var btnMaster = E('button', { 'class': 'btn cbi-button-apply', 'type': 'button' },
+			_('设为主节点(上网网关 · 配置源)并启用'));
+		btnMaster.addEventListener('click', function () {
+			if (!confirm(_('把本节点设为主节点并启用组网？\n\n只写配置，不会改动网络。'
+				+ '设完即可点「开放加入」；要让 mesh0/bat0 立刻跑起来，'
+				+ '再到组网设置页点一次「保存并应用」。'))) { return; }
+			setRole('master');
+		});
+
+		var btnClient = E('button', { 'class': 'btn cbi-button-apply', 'type': 'button' },
+			_('设为子节点(全端口内网 · 跟随主节点)并启用'));
+		btnClient.addEventListener('click', function () {
+			if (!confirm(_('把本节点设为子节点并启用组网？\n\n只写配置，不会改动网络。'
+				+ '\n⚠ 设完之后先点本页的「一键加入」领凭证，领到之后再应用 ——'
+				+ '现在就应用会报「子节点没有 Mesh ID」。'))) { return; }
+			setRole('client');
+		});
+
+		pickRow.appendChild(btnMaster);
+		pickRow.appendChild(btnClient);
+		box.appendChild(pickRow);
+		box.appendChild(E('div', { 'class': 'mesh-muted' },
+			_('也可以到「组网设置」页改；那边的保存按钮还能顺带直接应用配置。')));
 		return box;
 	}
 
@@ -577,6 +630,120 @@ function pairSection(d) {
 	return box;
 }
 
+function buildBody(d) {
+	ensureCss();
+	d = d || {};
+
+	/* 能力检测 */
+	var cap = d.capabilities || {};
+	var ok = cap.kernel_mesh && cap.wpad_mesh && cap.batman && cap.batctl;
+	/* 漫游引导（dawn + umdns）不是组网的前置条件 —— 缺了照样能组 mesh，
+	   只是客户端不会被引导到更优的 AP。所以单独判定：缺失时只把提示框降级为
+	   橙色提醒，不整框变红（否则没装 dawn 的设备会被误报成"组网不可用"）。 */
+	var roamOk = cap.dawn && cap.umdns;
+	var capBox = E('div', { 'class': 'mesh-note ' + (ok ? (roamOk ? 'green' : 'orange') : 'red') });
+	if (ok) {
+		var t2 = _('无线驱动已上报 mesh point 能力，已安装完整版 wpad，且已具备 batman-adv 内核模块与 batctl —— 802.11s 组网可用。');
+		if (roamOk) {
+			t2 += ' ' + _('漫游引导已就绪（dawn + umdns）：客户端会被引导到信号更优的 AP。');
+		} else {
+			t2 += ' ' + _('但缺少漫游引导：');
+			if (!cap.dawn) t2 += ' ' + _('需安装 dawn；');
+			if (!cap.umdns) t2 += ' ' + _('需安装 umdns（dawn 的邻居发现）。');
+			t2 += ' ' + _('客户端不会主动切换 AP（组网本身不受影响）。');
+		}
+		capBox.textContent = t2;
+	} else {
+		var t = _('组网能力不满足：');
+		if (!cap.kernel_mesh) t += ' ' + _('驱动未上报 mesh point；');
+		if (!cap.wpad_mesh) t += ' ' + _('需安装 wpad-openssl / wpad-wolfssl。');
+		if (!cap.batman) t += ' ' + _('需安装 kmod-batman-adv batctl。');
+		/* 内核模块在但 batctl 二进制缺失：界面不能显示全绿，否则 apply 会被静默拒绝 */
+		if (cap.batman && !cap.batctl) t += ' ' + _('已装 batman-adv 内核模块但缺少 batctl 工具。');
+		if (!cap.dawn) t += ' ' + _('缺少漫游引导 dawn；');
+		if (!cap.umdns) t += ' ' + _('缺少 dawn 的邻居发现组件 umdns。');
+		capBox.textContent = t;
+	}
+
+	/* 角色没落盘时的红框：后端不再把空 role 兜底成 master（status 里给 role_set=0），
+	   这里必须显眼提示 —— 否则界面照旧写"主节点 · 配置源(下发中)"，而 apply 在
+	   第一步就退出、mesh0/bat0 建不起来、子节点只能拿到 not_master。
+	   真机踩到过（2026-10-02）。 */
+	var roleBox = null;
+	if (d.role_set === 0) {
+		roleBox = E('div', { 'class': 'mesh-note red' });
+			roleBox.textContent = _('未设置本节点角色：/etc/config/mesh 里没有 mesh.main.role，组网不会生效。')
+				+ ' ' + _('直接在下面「一键加入」区块里点「设为主节点」或「设为子节点」即可（也可到「组网设置」页改，或执行：uci set mesh.main.role=master; uci commit mesh）');
+	}
+
+	/* 运行状态卡片 */
+	var on = d.enabled == 1;
+	var isClient = d.role === 'client';
+	var pr = d.peers || {};
+	var nConn = pr.connected || 0;
+	/* 节点卡片：一台设备同时走无线+有线只算一个节点 */
+	var cardVal = nConn + (nConn ? ' (%s %s / %s %s)'.format(pr.wifi || 0, _('无线'), pr.eth || 0, _('有线')) : '');
+	var cards = E('div', { 'class': 'mesh-cards' }, [
+		card(_('Mesh 状态'), on ? _('已启用') : _('未启用'), on ? '#37c837' : '#999'),
+		/* Mesh ID 为空 = 还没生成过（出厂默认留空）。这里如实说明，
+		   不要显示成"未设置"以外的假值，也不要替用户猜测。 */
+		card(_('Mesh ID'), d.mesh_id
+			|| (isClient ? _('未设置（从主节点获取）') : _('未设置（应用后按 MAC 自动派生）'))),
+		card(_('已连接节点'), cardVal, nConn > 0 ? '#37c837' : null),
+		card(_('路径选择'), batmanText(d), (d.batman && d.batman.enabled == 1) ? '#37c837' : null),
+		card(_('本机角色'), d.role_set === 0
+			? _('未选择')
+			: (isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(上网网关 · 配置源)')),
+			d.role_set === 0 ? '#e24b4a' : null),
+		card(_('本机地址'), d.lan_ip),
+		card(_('地址获取'),
+			isClient ? ((d.lan_proto === 'dhcp') ? _('DHCP(从主节点获取)') : _('静态(本机保留)')) : _('本机静态')),
+		card(_('回程接口'), (d.backhaul && d.backhaul.ifname && d.backhaul.ifname !== '-')
+			? '%s (CH %s)'.format(d.backhaul.ifname, d.backhaul.channel) : _('未运行')),
+		card(_('配置同步'), isClient ? ((d.sync && d.sync.state) || '-')
+			: _('下发中(作为配置源)'),
+			isClient ? ((d.sync && d.sync.code === 'ok') ? '#37c837' : '#f0ad4e') : '#37c837'),
+		card(_('上次同步'), (d.sync && d.sync.last_ok) || '-'),
+		card(_('端口内网化'), portBridgingText(d), d.port_bridging ? '#37c837' : '#f0ad4e')
+	]);
+
+	/* 图例：线的粗细/虚实表示"谁在实际承载"，颜色表示链路类型与质量 */
+	var legend = E('div', {}, [
+		E('div', { 'class': 'mesh-topo-legend' }, [
+			E('span', {}, [ E('i', { 'style': 'border-top:4px solid #4a6fa5' }), _('粗实线 = 实际承载(有线)') ]),
+			E('span', {}, [ E('i', { 'style': 'border-top:4px solid #37c837' }), _('粗实线 = 实际承载(无线)') ]),
+			E('span', {}, [ E('i', { 'style': 'border-top:2px dashed #bbb' }), _('细虚线 = 备用链路') ]),
+			E('span', {}, [ E('i', { 'style': 'border-top:2px solid #f0ad4e' }), _('无线信号偏弱') ])
+		]),
+		E('div', { 'class': 'mesh-muted' },
+			_('承载链路按 br-lan 内核转发表实测：batman-adv 只认无线 hardif，网线是桥端口，它看不到。'))
+	]);
+
+	/* 操作区已整体移除（2026-09-23）：原「立即应用配置」由组网设置页保存时 LuCI 自动应用，
+	   「立即同步一次」在主节点是空操作，故状态页不再保留手动操作入口。 */
+	var rb = rollbackBox(d);
+
+	/* 配对卡片放在「运行状态」之后：它是"加新节点"的入口，属于状态页的高频操作，
+	   比拓扑图更该被先看到。放在最上面又会挤掉能力检测的红框，故居中。 */
+	clearPairTimers();
+	pairHost = E('div', { 'class': 'cbi-section-node' });
+	pairHost.appendChild(pairSection(d));
+	var pairSec = E('div', { 'class': 'cbi-section' }, [
+		E('h3', {}, _('一键加入（新节点免配置入网）')),
+		pairHost
+	]);
+
+	return E('div', {}, [
+		rb,
+		roleBox,
+		section(_('能力检测'), capBox),
+		section(_('运行状态'), cards),
+		pairSec,
+		section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),
+		section(_('节点列表'), peersTable(d))
+	]);
+}
+
 /* ---------- 视图 ---------- */
 return view.extend({
 	pollInterval: 10,
@@ -587,115 +754,7 @@ return view.extend({
 
 	render: function (d) {
 		ensureCss();
-		d = d || {};
-
-		/* 能力检测 */
-		var cap = d.capabilities || {};
-		var ok = cap.kernel_mesh && cap.wpad_mesh && cap.batman && cap.batctl;
-		/* 漫游引导（dawn + umdns）不是组网的前置条件 —— 缺了照样能组 mesh，
-		   只是客户端不会被引导到更优的 AP。所以单独判定：缺失时只把提示框降级为
-		   橙色提醒，不整框变红（否则没装 dawn 的设备会被误报成"组网不可用"）。 */
-		var roamOk = cap.dawn && cap.umdns;
-		var capBox = E('div', { 'class': 'mesh-note ' + (ok ? (roamOk ? 'green' : 'orange') : 'red') });
-		if (ok) {
-			var t2 = _('无线驱动已上报 mesh point 能力，已安装完整版 wpad，且已具备 batman-adv 内核模块与 batctl —— 802.11s 组网可用。');
-			if (roamOk) {
-				t2 += ' ' + _('漫游引导已就绪（dawn + umdns）：客户端会被引导到信号更优的 AP。');
-			} else {
-				t2 += ' ' + _('但缺少漫游引导：');
-				if (!cap.dawn) t2 += ' ' + _('需安装 dawn；');
-				if (!cap.umdns) t2 += ' ' + _('需安装 umdns（dawn 的邻居发现）。');
-				t2 += ' ' + _('客户端不会主动切换 AP（组网本身不受影响）。');
-			}
-			capBox.textContent = t2;
-		} else {
-			var t = _('组网能力不满足：');
-			if (!cap.kernel_mesh) t += ' ' + _('驱动未上报 mesh point；');
-			if (!cap.wpad_mesh) t += ' ' + _('需安装 wpad-openssl / wpad-wolfssl。');
-			if (!cap.batman) t += ' ' + _('需安装 kmod-batman-adv batctl。');
-			/* 内核模块在但 batctl 二进制缺失：界面不能显示全绿，否则 apply 会被静默拒绝 */
-			if (cap.batman && !cap.batctl) t += ' ' + _('已装 batman-adv 内核模块但缺少 batctl 工具。');
-			if (!cap.dawn) t += ' ' + _('缺少漫游引导 dawn；');
-			if (!cap.umdns) t += ' ' + _('缺少 dawn 的邻居发现组件 umdns。');
-			capBox.textContent = t;
-		}
-
-		/* 角色没落盘时的红框：后端不再把空 role 兜底成 master（status 里给 role_set=0），
-		   这里必须显眼提示 —— 否则界面照旧写"主节点 · 配置源(下发中)"，而 apply 在
-		   第一步就退出、mesh0/bat0 建不起来、子节点只能拿到 not_master。
-		   真机踩到过（2026-10-02）。 */
-		var roleBox = null;
-		if (d.role_set === 0) {
-			roleBox = E('div', { 'class': 'mesh-note red' });
-			roleBox.textContent = _('未设置本节点角色：/etc/config/mesh 里没有 mesh.main.role，组网不会生效。')
-				+ ' ' + _('请到「组网设置」选择主节点或子节点后保存并应用，或执行：uci set mesh.main.role=master; uci commit mesh');
-		}
-
-		/* 运行状态卡片 */
-		var on = d.enabled == 1;
-		var isClient = d.role === 'client';
-		var pr = d.peers || {};
-		var nConn = pr.connected || 0;
-		/* 节点卡片：一台设备同时走无线+有线只算一个节点 */
-		var cardVal = nConn + (nConn ? ' (%s %s / %s %s)'.format(pr.wifi || 0, _('无线'), pr.eth || 0, _('有线')) : '');
-		var cards = E('div', { 'class': 'mesh-cards' }, [
-			card(_('Mesh 状态'), on ? _('已启用') : _('未启用'), on ? '#37c837' : '#999'),
-			/* Mesh ID 为空 = 还没生成过（出厂默认留空）。这里如实说明，
-			   不要显示成"未设置"以外的假值，也不要替用户猜测。 */
-			card(_('Mesh ID'), d.mesh_id
-				|| (isClient ? _('未设置（从主节点获取）') : _('未设置（应用后按 MAC 自动派生）'))),
-			card(_('已连接节点'), cardVal, nConn > 0 ? '#37c837' : null),
-			card(_('路径选择'), batmanText(d), (d.batman && d.batman.enabled == 1) ? '#37c837' : null),
-			card(_('本机角色'), d.role_set === 0
-				? _('未选择')
-				: (isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(上网网关 · 配置源)')),
-				d.role_set === 0 ? '#e24b4a' : null),
-			card(_('本机地址'), d.lan_ip),
-			card(_('地址获取'),
-				isClient ? ((d.lan_proto === 'dhcp') ? _('DHCP(从主节点获取)') : _('静态(本机保留)')) : _('本机静态')),
-			card(_('回程接口'), (d.backhaul && d.backhaul.ifname && d.backhaul.ifname !== '-')
-				? '%s (CH %s)'.format(d.backhaul.ifname, d.backhaul.channel) : _('未运行')),
-			card(_('配置同步'), isClient ? ((d.sync && d.sync.state) || '-')
-				: _('下发中(作为配置源)'),
-				isClient ? ((d.sync && d.sync.code === 'ok') ? '#37c837' : '#f0ad4e') : '#37c837'),
-			card(_('上次同步'), (d.sync && d.sync.last_ok) || '-'),
-			card(_('端口内网化'), portBridgingText(d), d.port_bridging ? '#37c837' : '#f0ad4e')
-		]);
-
-		/* 图例：线的粗细/虚实表示"谁在实际承载"，颜色表示链路类型与质量 */
-		var legend = E('div', {}, [
-			E('div', { 'class': 'mesh-topo-legend' }, [
-				E('span', {}, [ E('i', { 'style': 'border-top:4px solid #4a6fa5' }), _('粗实线 = 实际承载(有线)') ]),
-				E('span', {}, [ E('i', { 'style': 'border-top:4px solid #37c837' }), _('粗实线 = 实际承载(无线)') ]),
-				E('span', {}, [ E('i', { 'style': 'border-top:2px dashed #bbb' }), _('细虚线 = 备用链路') ]),
-				E('span', {}, [ E('i', { 'style': 'border-top:2px solid #f0ad4e' }), _('无线信号偏弱') ])
-			]),
-			E('div', { 'class': 'mesh-muted' },
-				_('承载链路按 br-lan 内核转发表实测：batman-adv 只认无线 hardif，网线是桥端口，它看不到。'))
-		]);
-
-		/* 操作区已整体移除（2026-09-23）：原「立即应用配置」由组网设置页保存时 LuCI 自动应用，
-		   「立即同步一次」在主节点是空操作，故状态页不再保留手动操作入口。 */
-		var rb = rollbackBox(d);
-
-		/* 配对卡片放在「运行状态」之后：它是"加新节点"的入口，属于状态页的高频操作，
-		   比拓扑图更该被先看到。放在最上面又会挤掉能力检测的红框，故居中。 */
-		clearPairTimers();
-		pairHost = E('div', { 'class': 'cbi-section-node' });
-		pairHost.appendChild(pairSection(d));
-		var pairSec = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('一键加入（新节点免配置入网）')),
-			pairHost
-		]);
-
-		return E('div', {}, [
-			rb,
-			roleBox,
-			section(_('能力检测'), capBox),
-			section(_('运行状态'), cards),
-			pairSec,
-			section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),
-			section(_('节点列表'), peersTable(d))
-		]);
+		rootNode = buildBody(d);
+		return rootNode;
 	}
 });

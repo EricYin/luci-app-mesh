@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r27`（`PKG_RELEASE` 27）
+- 当前版本：`1.0.0-r28`（`PKG_RELEASE` 28）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r27.apk
-opkg install luci-app-mesh_1.0.0-r27_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r28.apk
+opkg install luci-app-mesh_1.0.0-r28_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -222,3 +222,17 @@ sh install.sh
 - 「已连接邻居」→「**已连接节点**」；状态页最下面的大框标题「邻居节点」→「**节点列表**」，框内表格第一列的列头「邻居节点」→「**节点**」。空表提示同步改为「暂无已连接的节点」。
 - 配对信号默认值改为 **`XxMesh-Pair` / `xxmesh-pair`**（原 `PonWrt-Pair` / `ponwrt-pair`），与 Mesh ID 的 `XxMesh-` 前缀一致：`functions.sh` 的两个 DEFAULT 常量、`/etc/config/mesh` 的出厂值、设置页两个 placeholder、状态页配对卡片的兜底显示全部同步。
   ⚠ 已经配过的机器不受影响（UCI 里已有值就用已有值），只有恢复出厂或 `uci set mesh.main.pair_ssid=...` 才会拿到新默认；若全网已有节点用的是旧值，请手动统一。
+
+### r28（2026-10-05）
+状态页直接选角色，不再把人支到设置页。
+- **新增 `meshctl set-role master|client`**：写 `mesh.main.role` + `enabled=1` 并 commit，
+  **只落配置、不应用**。理由是子节点此时手里没有凭证，立刻 apply 必然报
+  「子节点没有 Mesh ID」——那是预期内的失败，不该在用户刚点完按钮就弹出来。
+  主节点额外把空的 Mesh ID / 回程密码先派生出来（复用与 apply 相同的解析器），
+  这样点「开放加入」时才有东西发给新节点。与 apply 共用同一把配置锁。
+- **rpcd 放行 `set_role`**（同步执行，毫秒级；`arg` 必须是 `master` 或 `client`）。
+- 前端：状态页「一键加入」区块在未选角色 / 未启用时，直接给「设为主节点并启用」
+  「设为子节点并启用」两个按钮（子节点那段强调**先别应用、先领凭证**）；
+  顶部角色红框也改成指向这两个按钮。
+- 为支持整页即时重画，`render()` 的内容抽成 `buildBody(d)`，`repaintAll()` 直接
+  替换根节点 —— 不用 `location.reload()`（那会把整个 LuCI 外壳重新加载一遍）。

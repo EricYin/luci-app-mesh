@@ -1527,6 +1527,53 @@ cmd_port_bridging() {
 	mesh_all_ports_in_lan && echo "所有内网端口与 bat0 均已并入 br-lan" || echo "部分端口或 bat0 未能并入，请检查网络配置"
 }
 
+# ================= 一步选角色（状态页直接选主/子节点） =================
+# 用法: meshctl set-role master|client
+# 只写 UCI 并 commit，**绝不应用**。理由：子节点此时手里还没有凭证，
+# 立刻 apply 必然报「子节点没有 Mesh ID」—— 那是预期内的失败，不该在用户
+# 刚点完按钮就弹出来。所以这里只落配置，剩下的动作交给界面上的下一步按钮。
+# 主节点例外处理：空的 mesh_id / 回程密码在这里就派生好并写回，因为「开放加入」
+# 要靠它们给新节点发凭证（派生只改 UCI，不动网络，与 apply 走同一套解析器）。
+cmd_set_role() {
+	local role="${1:-}" id key enc
+	case "$role" in
+		master|client) ;;
+		*) echo "用法: meshctl set-role master|client"; return 1;;
+	esac
+	# 与 apply 共用同一把锁：并发下 uci 的"读-改-写"会把对方的改动整段覆盖掉
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	uci set mesh.main.role="$role"
+	uci set mesh.main.enabled=1
+	if [ "$role" = master ]; then
+		if [ -z "$(mesh_uci_get main.mesh_id)" ]; then
+			id=$(mesh_default_mesh_id)
+			if [ -n "$id" ]; then
+				uci set mesh.main.mesh_id="$id"
+				echo "已自动生成 Mesh ID: $id"
+			fi
+		fi
+		enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
+		if [ "$enc" != none ] && [ -z "$(mesh_uci_get main.mesh_key)" ]; then
+			key=$(mesh_gen_key)
+			if [ -n "$key" ]; then
+				uci set mesh.main.mesh_key="$key"
+				echo "已自动生成回程密码: $key"
+			fi
+		fi
+	fi
+	uci commit mesh
+	mesh_unlock
+	mesh_log info "角色设置：${role}（enabled=1，未应用）"
+	if [ "$role" = master ]; then
+		echo "已设为主节点并启用组网（未应用配置）：现在可以点「开放加入」；"
+		echo "想让 mesh0/bat0 立刻跑起来，到组网设置页点一次「保存并应用」。"
+	else
+		echo "已设为子节点并启用组网（未应用配置）：先点「一键加入」领凭证，"
+		echo "领到之后再应用 —— 现在应用会报「子节点没有 Mesh ID」。"
+	fi
+	return 0
+}
+
 # ================= 配对：主节点开放加入窗口 =================
 # 用法: meshctl pair-open [秒数]   （省略则用 mesh.main.pair_window，默认 600；0 = 常开）
 # 开窗 = 临时起一个配对 AP（固件固定的 SSID/密码，桥在 lan 上）+ 到点自动撤掉。
@@ -1787,8 +1834,9 @@ case "$1" in
 	pair-close)       cmd_pair_close;;
 	pair-status)      cmd_pair_status;;
 	pair-join)        shift; cmd_pair_join "$@";;
+	set-role)         shift; cmd_set_role "$@";;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join|set-role>"
 		exit 1
 		;;
 esac
