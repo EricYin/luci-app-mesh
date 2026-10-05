@@ -1732,6 +1732,19 @@ cmd_pair_join() {
 	case "$maxwait" in ''|*[!0-9]*) maxwait=300;; esac
 	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
 
+	# ★ 加入前必须确保"已启用"（r37）。退出组网 / 自动还原会把 enabled 置 0，
+	#   但 role 往往残留成 client —— 于是本函数放行、凭证也顺利领到，
+	#   紧接着的 --apply 却因为 enabled=0 一头撞进"停用"分支：把刚凭凭证建好的
+	#   mesh 接口整个拆掉、batman 移除、status_text 写成'组网已停用'，还照样返回 0。
+	#   上层（按键 / 网页 / 命令行）看到返回 0 就报"已加入网络"，界面于是同时
+	#   显示"已加入"和"未启用"（真机 .245 就是这样）。在这里兜底，三个入口一起修好。
+	if [ "$(mesh_uci_get main.enabled)" != "1" ]; then
+		echo "      组网此前处于未启用状态，加入前先置为启用（role=client）"
+		uci set mesh.main.enabled=1
+		uci set mesh.main.role=client
+		uci commit mesh
+	fi
+
 	radio=$(mesh_pair_radio)
 	ssid=$(mesh_pair_ssid)
 	key=$(mesh_pair_key)
@@ -2053,7 +2066,13 @@ cmd_button_join() {
 		return 1
 	fi
 	mesh_led_act busy
-	if [ "$role" != client ]; then
+	# ★ 条件必须带上 enabled（r37）。退出组网 / 自动还原之后，role 会残留成 client，
+	#   但 enabled 已经被置 0 —— 只按 role 判断就会跳过 set-role，而"置 enabled=1"
+	#   正是 set-role 干的活。于是带着 enabled=0 去 apply，apply 一头撞进"停用"分支：
+	#   把刚凭凭证建好的 mesh 接口整个拆掉、batman 移除、status_text 写成
+	#   '组网已停用'，却照样 return 0。上层看到 rc=0 就报"已加入网络"，
+	#   界面于是同时显示"已加入（按键触发）"和"未启用"（真机 .245 就是这样）。
+	if [ "$role" != client ] || [ "$(mesh_uci_get main.enabled)" != "1" ]; then
 		out=$(cmd_set_role client 2>&1) || {
 			mesh_led_clear; mesh_led_act fail
 			mesh_button_last join "$seen" 1 "设置子节点角色失败：$(printf '%s\n' "$out" | tail -n1)"
@@ -2063,6 +2082,13 @@ cmd_button_join() {
 	# --apply 是"一键"的关键：领到凭证后直接应用（子节点会换成 DHCP 获取地址）
 	out=$(cmd_pair_join --apply 2>&1); rc=$?
 	mesh_led_clear
+	# 兜底复查：apply 在 enabled!=1 时会走"停用"分支（拆 mesh 接口 / 移除 batman），
+	# 但那条分支本身是成功的、返回 0。不复查的话，"其实根本没启用"会被报成
+	# "已加入网络"，界面上就是"已加入"和"未启用"并存的怪状态（r37）。
+	if [ "$rc" = 0 ] && [ "$(mesh_uci_get main.enabled)" != "1" ]; then
+		rc=1
+		out="错误：加入流程结束时组网仍处于未启用状态（apply 走了停用分支，mesh 接口已被移除）"
+	fi
 	if [ "$rc" = 0 ]; then
 		mesh_led_act ok
 		id=$(printf '%s\n' "$out" | sed -n 's/^  Mesh ID   = //p' | head -n1)
@@ -2085,7 +2111,7 @@ cmd_button_open() {
 		return 1
 	fi
 	mesh_led_act busy
-	if [ "$role" != master ]; then
+	if [ "$role" != master ] || [ "$(mesh_uci_get main.enabled)" != "1" ]; then
 		out=$(cmd_set_role master 2>&1) || {
 			mesh_led_clear; mesh_led_act fail
 			mesh_button_last open "$seen" 1 "设置主节点角色失败：$(printf '%s\n' "$out" | tail -n1)"

@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r36`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r37`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r36.apk
-opkg install luci-app-mesh_1.0.0-r36_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r37.apk
+opkg install luci-app-mesh_1.0.0-r37_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -389,5 +389,27 @@ sh install.sh
   2. 新增 `mesh_pair_ap_purge()`（删到东西才返回 0，调用方据此决定要不要 reload），
      在三处兜底：`cmd_apply`（窗口关闭时，且放在 wifi reload 之前）、`set-role` 切成
      子节点时、守护进程启动时（并立即 reload 撤广播）。
+
+### r37（2026-10-05）
+修"**凭证领到了、也报已加入，但组网其实是未启用**"——真机 .245 按键组网踩到。
+
+- 现象：主节点"已加入数量 +1"、子节点按键结果显示"已加入网络（按键触发）"，
+  但状态页 MESH 状态是**未启用**；主节点 `mesh0` / `batctl` 里根本没有它。
+- 根因：`cmd_button_join` 只按 **role** 判断要不要走 `set-role`
+  （`if [ "$role" != client ]`），而退出组网 / 自动还原会把 `enabled` 置 0、
+  **role 却残留成 client** → 跳过 `set-role` → 而"置 `enabled=1`"正是 `set-role`
+  干的活 → 带着 `enabled=0` 去 `pair-join --apply` → `cmd_apply` 开头
+  `if [ "$enabled" != "1" ]` 成立，**走停用分支**：刚凭凭证建好的 mesh 接口整个拆掉、
+  batman 移除、`status_text` 写成'组网已停用'，然后**照样 return 0**。
+  上层看到 rc=0 就报成功 —— "已加入"与"未启用"于是并存。
+  （`cmd_button_open` 有对称问题：role 残留 master + enabled=0 时同样跳过 set-role。）
+- 修法（三处）：
+  1. `cmd_button_join` / `cmd_button_open` 的判断改为
+     `[ "$role" != X ] || [ "$(mesh_uci_get main.enabled)" != "1" ]`。
+  2. `cmd_pair_join` 入口兜底：未启用就先置 `enabled=1` + `role=client`，
+     **按键 / 网页 / 命令行三个入口一起修好**（网页"一键加入网络"不经过 `setRole`，
+     同样会踩）。
+  3. `cmd_button_join` 在 `--apply` 返回 0 之后复查一次 `enabled`，非 1 就改判失败 ——
+     以后再有类似"apply 静默走停用分支"也不会被报成成功。
 
 
