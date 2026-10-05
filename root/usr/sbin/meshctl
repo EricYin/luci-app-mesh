@@ -1916,6 +1916,20 @@ cmd_button_join() {
 		mesh_log warn "按键加入被拒绝：本节点是运行中的主节点"
 		return 1
 	fi
+	# ★ 已在网的**子节点**同样拒绝（r31）。这不是洁癖，是被真机打脸换来的：
+	#   pair-join 的第一步就是把射频切到配对信号所在信道、并起一个 STA ——
+	#   回程 mesh0 多半就挂在这个 phy 上，等于亲手把正在跑的回程打断；
+	#   紧接着的 --apply 又会把 lan 改成 DHCP、重启网络。有线节点断一下还能靠
+	#   回滚窗口救回来，**纯无线回程的节点此刻是没有任何备用通路的**（.219
+	#   就是在这一步失联、最后由回滚窗口自动还原的）。所以加入档只服务"手里
+	#   没凭证的新节点"，在网节点想重新入网，先退出再按。
+	if [ "$role" = client ] && mesh_button_in_network; then
+		mesh_led_act deny
+		id=$(mesh_uci_get main.mesh_id)
+		mesh_button_last join "$seen" 1 "已拒绝：本节点已在网（Mesh ID=${id:-未知}），加入档只用于未入网的新节点 —— 它会切射频去连配对信号并重启网络；要重新入网请先长按 14~20 秒退出组网，再按一次"
+		mesh_log warn "按键加入被拒绝：本节点已在网（Mesh ID=${id:-未知}），避免 apply 打断无线回程"
+		return 1
+	fi
 	mesh_led_act busy
 	if [ "$role" != client ]; then
 		out=$(cmd_set_role client 2>&1) || {

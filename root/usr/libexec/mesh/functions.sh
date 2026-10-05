@@ -2419,7 +2419,10 @@ mesh_backup_once() {
 	[ -d "$MESH_BACKUP_DIR/config" ] && return 0
 	mkdir -p "$MESH_BACKUP_DIR/config"
 	local f
-	for f in wireless network dhcp firewall; do
+	# mesh 也备份：用户在组网前调过的按键档位、TTL、配对参数都在这里，
+	# 还原时应该跟着回来（否则"退出组网"会顺手把用户的个人设置也抹掉）。
+	# ★ 但它不能原样还原 —— 见 mesh_do_revert 里的清洗步骤。
+	for f in wireless network dhcp firewall mesh; do
 		[ -f "/etc/config/$f" ] && cp -a "/etc/config/$f" "$MESH_BACKUP_DIR/config/$f"
 	done
 	date '+%Y-%m-%d %H:%M:%S' > "$MESH_BACKUP_DIR/created"
@@ -2432,11 +2435,20 @@ mesh_do_revert() {
 		mesh_log warn "未找到组网前备份"
 		return 1
 	fi
-	for f in wireless network dhcp firewall; do
+	for f in wireless network dhcp firewall mesh; do
 		[ -f "$MESH_BACKUP_DIR/config/$f" ] && cp -a "$MESH_BACKUP_DIR/config/$f" "/etc/config/$f"
 	done
+	# ★ /etc/config/mesh 不能整份照搬回来：备份是在 apply 时做的，那一刻本机
+	#   已经拿到（或派生好）凭证了，备份里必然带着 mesh_id / mesh_key /
+	#   master_addr 这些"主节点信息"。原样还原的后果就是：网络其实已经退干净了，
+	#   界面上却还显示着 Mesh ID、主节点地址和"子节点"身份（真机 .219 就是这样
+	#   留下残影的，用户以为是"没退干净"）。所以先还原（保住用户自己调过的
+	#   档位 / TTL / 配对参数），再把凭证类字段清空，让本机回到"从未入网"的状态。
 	uci set mesh.main.enabled=0
 	uci set mesh.main.status_text='已还原组网前配置'
+	uci set mesh.main.mesh_id=''
+	uci set mesh.main.mesh_key=''
+	uci set mesh.main.master_addr=''
 	uci commit mesh
 	rm -rf "$MESH_STATE_DIR"
 	rm -f "$MESH_TMP_DIR"/lastok "$MESH_TMP_DIR"/lastfail "$MESH_TMP_DIR"/failreason "$MESH_TMP_DIR"/registry.tsv
