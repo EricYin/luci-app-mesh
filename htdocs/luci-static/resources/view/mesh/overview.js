@@ -330,6 +330,253 @@ function peersTable(d) {
 	return table;
 }
 
+/* ---------- 一键加入（配对） ---------- */
+/* 界面侧只有三件事：开窗 / 关窗 / 加入，全部走后台执行——它们都要动无线，
+   pair-join 还要等主节点开窗并紧接着跑一次 apply（子节点会换 IP + 重启网络），
+   同步等只会让 RPC 超时。所以点了就立刻返回，真实进度靠 status 里的
+   pair.progress 轮询（页面本身 10 秒一轮，忙时另开 3 秒一轮的快轮询）。 */
+var callMeshPair = rpc.declare({
+	object: 'mesh',
+	method: 'exec',
+	params: [ 'cmd', 'arg' ],
+	expect: { stdout: '', code: 0 }
+});
+
+/* 倒计时用的本地定时器与"忙时快轮询"定时器。
+   页面每 10 秒会整体重渲染一次，不清掉旧定时器就会越积越多（每轮多一个
+   每秒跑的 interval），所以每次渲染前统一清理。 */
+var pairTimers = [];
+var pairBusyTimer = null;
+var pairHost = null;
+
+function clearPairTimers() {
+	pairTimers.forEach(function (t) { clearInterval(t); });
+	pairTimers = [];
+}
+
+function fmtDur(s) {
+	s = Math.max(0, parseInt(s, 10) || 0);
+	var m = Math.floor(s / 60), sec = s % 60;
+	return m > 0 ? ('%d 分 %02d 秒'.format(m, sec)) : ('%d 秒'.format(sec));
+}
+
+/* 剩余时间倒计时：后端给的 remain 是"此刻还剩多少秒"，本地按秒自减。
+   不用服务端绝对时间戳，避免设备与浏览器时钟不一致导致显示跳变。 */
+function countdown(remain, onEnd) {
+	var left = parseInt(remain, 10) || 0;
+	var span = E('span', { 'style': 'font-weight:600' }, fmtDur(left));
+	var t = setInterval(function () {
+		left--;
+		if (left <= 0) {
+			clearInterval(t);
+			span.textContent = _('已到期，正在自动关闭');
+			if (onEnd) { onEnd(); }
+		} else {
+			span.textContent = fmtDur(left);
+		}
+	}, 1000);
+	pairTimers.push(t);
+	return span;
+}
+
+function pairOpTitle(op) {
+	if (op === 'pair_open') { return _('正在开放加入…'); }
+	if (op === 'pair_close') { return _('正在关闭加入窗口…'); }
+	if (op === 'pair_join') { return _('正在加入网络…'); }
+	return _('正在处理…');
+}
+
+/* 后台跑完之前的快轮询：3 秒一次，直到 busy 消失为止。
+   只重画配对这一块，不动整页（整页重画会把拓扑图也重建，闪得厉害）。 */
+function watchPair() {
+	if (pairBusyTimer) { return; }
+	pairBusyTimer = setInterval(function () {
+		callMeshStatus().then(function (d) {
+			var pr = (d && d.pair && d.pair.progress) || {};
+			repaintPair(d || {});
+			if (pr.busy != 1) {
+				clearInterval(pairBusyTimer);
+				pairBusyTimer = null;
+			}
+		}, function () { /* 拉不到就等下一轮 */ });
+	}, 3000);
+}
+
+function repaintPair(d) {
+	if (!pairHost) { return; }
+	clearPairTimers();
+	pairHost.innerHTML = '';
+	pairHost.appendChild(pairSection(d));
+}
+
+function doPair(cmd, arg) {
+	return callMeshPair(cmd, arg).then(function (res) {
+		var out = (res && res.stdout) ? res.stdout : '';
+		ui.addNotification(null, E('p', {}, out || _('已触发')), 'success');
+		/* 立刻快轮询一次：不等页面 10 秒的常规刷新，进度马上可见 */
+		setTimeout(function () {
+			callMeshStatus().then(repaintPair, function () {});
+		}, 1200);
+		watchPair();
+		return out;
+	}, function (e) {
+		ui.addNotification(null, E('p', {}, _('操作失败：%s').format(e)), 'danger');
+		return null;
+	});
+}
+
+function pairSection(d) {
+	var p = d.pair || {};
+	var prog = p.progress || {};
+	var last = prog.last || {};
+	var busy = (prog.busy == 1);
+	var on = (d.enabled == 1);
+	var roleSet = (d.role_set !== 0);
+	var isClient = (d.role === 'client');
+
+	/* 标题由 render() 统一渲染（放进 .cbi-section 里），这里只产出区块内容：
+	   重画时只换内容、不换外壳，也不会把标题画两遍 */
+	var box = E('div', {}, [
+		E('div', { 'class': 'mesh-muted', 'style': 'margin:4px 0 10px;line-height:1.8' },
+			_('新节点不必手工填 Mesh ID 与回程密码：主节点点「开放加入」临时起一个配对信号'
+				+ '（固件固定的 SSID/密码），新节点连上来领走凭证并自动生效。'
+				+ '窗口到期自动关闭；窗口关着时配对信号根本不存在，所以固定密码本身不构成风险。'))
+	]);
+
+	/* A. 还没启用 / 还没选角色：任何配对动作都没有意义，直接挡掉并给出可执行的下一步。
+	   子节点这段提示特意点明"先点保存、别点保存并应用" —— 凭证还没领到的时候跑
+	   apply 必然报「子节点没有 Mesh ID」，那是预期内的失败，不该让用户以为是坏了。 */
+	if (!roleSet || !on) {
+		var hint;
+		if (!roleSet) {
+			hint = _('未设置本节点角色：请先到「组网设置」选择主节点或子节点并保存。');
+		} else if (isClient) {
+			hint = _('Mesh 组网尚未启用：请到「组网设置」把「启用 Mesh 组网」打开、'
+				+ '角色选「子节点」，然后点『保存』——**先别点「保存并应用」**，'
+				+ '凭证还没领到，这时应用会报「子节点没有 Mesh ID」。保存完回到本页点下面的按钮。');
+		} else {
+			hint = _('Mesh 组网尚未启用：请先到「组网设置」打开「启用 Mesh 组网」并保存应用，'
+				+ '主节点只有启用后才能开放加入。');
+		}
+		box.appendChild(E('div', { 'class': 'mesh-note red' }, hint));
+		return box;
+	}
+
+	/* 上一次后台操作的真实结果（code=2 = 尚无记录，不显示） */
+	if (last.code != null && last.code !== 2) {
+		var ok = (last.code === 0);
+		box.appendChild(E('div', {
+			'style': 'margin:0 0 10px;padding:.6em .8em;border-radius:4px;font-size:90%;background:'
+				+ (ok ? '#e8f5e9' : '#ffebee') + ';color:' + (ok ? '#1b5e20' : '#b71c1c')
+		}, _(ok ? '上次配对操作：成功' : '上次配对操作：失败')
+			+ (last.time ? '（' + last.time + '）' : '')
+			+ (last.msg ? ' —— ' + last.msg : '')));
+	}
+
+	/* 进度条：pair-join 会依次打出 [1/4]…[4/4]，把它原样显示出来最好懂 */
+	if (busy) {
+		box.appendChild(E('div', { 'class': 'mesh-note orange' }, [
+			E('b', {}, pairOpTitle(prog.op)),
+			E('div', { 'style': 'margin-top:4px' }, prog.tail || _('处理中…'))
+		]));
+	}
+
+	var row = E('div', { 'class': 'mesh-btnrow' });
+
+	if (isClient) {
+		/* D. 子节点：一个「一键加入」按钮。
+		   先后顺序无所谓——点完之后它会一直等到主节点开窗为止（默认 5 分钟），
+		   所以文案必须说清"现在可以去主节点点开放加入"。 */
+		if (d.mesh_id) {
+			box.appendChild(E('div', { 'class': 'mesh-tag', 'style': 'margin-bottom:8px' },
+				_('当前 Mesh ID：%s（已入网；换网络或凭证丢失时可重新加入）').format(d.mesh_id)));
+		} else {
+			box.appendChild(E('div', { 'class': 'mesh-tag', 'style': 'margin-bottom:8px' },
+				_('尚未获取组网凭证（Mesh ID 为空）—— 点下面的按钮自动领取。')));
+		}
+
+		var btnJoin = E('button', {
+			'class': 'btn cbi-button-apply', 'type': 'button',
+			'style': busy ? 'opacity:.5' : ''
+		}, busy && prog.op === 'pair_join' ? _('加入中…') : _('一键加入网络'));
+		btnJoin.disabled = busy;
+		btnJoin.addEventListener('click', function () {
+			if (busy) { return; }
+			if (!confirm(_('将临时连到配对信号领取组网凭证，并立即应用组网。'
+				+ '应用后本机管理地址会改由主节点分配（出厂地址会变）。确定继续？'))) { return; }
+			doPair('pair_join', 'apply');
+		});
+		row.appendChild(btnJoin);
+		box.appendChild(row);
+		box.appendChild(E('div', { 'class': 'mesh-muted', 'style': 'margin-top:6px' },
+			_('点完这个按钮再去主节点的「组网状态」页点「开放加入」，两边顺序不分先后：'
+				+ '本节点会等待最长 %s，期间每 10 秒重试一次。').format(fmtDur(p.wait || 300))));
+		box.appendChild(E('div', { 'class': 'mesh-muted' },
+			_('也可以命令行执行：meshctl pair-join --apply')));
+		return box;
+	}
+
+	/* B / C. 主节点 */
+	if (p.open == 1) {
+		var cards = E('div', { 'class': 'mesh-cards' }, [
+			card(_('配对信号 (SSID)'), p.ssid || '-'),
+			card(_('配对密码'), p.key || 'ponwrt-pair'),
+			card(_('所在射频'), p.radio || '-'),
+			card(_('本轮已加入'), '%s %s'.format(p.joined || 0, _('台')))
+		]);
+		box.appendChild(cards);
+
+		var line = E('div', { 'style': 'margin:10px 0;font-size:14px' }, [
+			E('b', { 'style': 'color:#37c837' }, _('已开放加入')),
+			' · ',
+			(p.remain == -1 ? _('常开（不会自动关闭）') : countdown(p.remain, function () {
+				setTimeout(function () { callMeshStatus().then(repaintPair, function () {}); }, 3000);
+			}))
+		]);
+		box.appendChild(line);
+		box.appendChild(E('div', { 'class': 'mesh-muted', 'style': 'margin-bottom:8px' },
+			_('新节点连上这个信号后会自动领走 Mesh ID 与回程密码。所有已入网的子节点也会'
+				+ '自动广播同一个配对信号（走现有的 AP 镜像），新节点可以连信号最好的那个。')));
+
+		var btnClose = E('button', { 'class': 'btn cbi-button-negative', 'type': 'button' },
+			_('立即关闭'));
+		btnClose.disabled = busy;
+		btnClose.addEventListener('click', function () { doPair('pair_close'); });
+		row.appendChild(btnClose);
+	} else {
+		var sel = E('select', { 'class': 'cbi-input-select', 'style': 'max-width:14em' }, [
+			E('option', { 'value': '120' }, _('2 分钟')),
+			E('option', { 'value': '300' }, _('5 分钟')),
+			E('option', { 'value': '600' }, _('10 分钟（默认）')),
+			E('option', { 'value': '1800' }, _('30 分钟')),
+			E('option', { 'value': '0' }, _('常开（不自动关闭）'))
+		]);
+		sel.value = String(p.window == null ? 600 : p.window);
+		/* 配置里的值不在预设里时（比如手工填了 900），补一个选项，避免静默变成 600 */
+		if (sel.value !== String(p.window == null ? 600 : p.window)) {
+			sel.appendChild(E('option', { 'value': String(p.window) }, fmtDur(p.window)));
+			sel.value = String(p.window);
+		}
+
+		var btnOpen = E('button', { 'class': 'btn cbi-button-apply', 'type': 'button' },
+			_('开放加入'));
+		btnOpen.disabled = busy;
+		btnOpen.addEventListener('click', function () { doPair('pair_open', sel.value); });
+
+		row.appendChild(sel);
+		row.appendChild(btnOpen);
+		box.appendChild(row);
+		box.appendChild(E('div', { 'class': 'mesh-muted', 'style': 'margin-top:6px' },
+			_('开放后本节点会临时多一个配对信号（桥在内网上），到期自动撤掉。'
+				+ '窗口期内任何"连得上本节点、知道固件固定配对密码"的设备都能领到凭证，'
+				+ '所以默认只开几分钟——兜底就是"得本人在现场开窗"。')));
+		return box;
+	}
+
+	box.appendChild(row);
+	return box;
+}
+
 /* ---------- 视图 ---------- */
 return view.extend({
 	pollInterval: 10,
@@ -431,11 +678,22 @@ return view.extend({
 		   「立即同步一次」在主节点是空操作，故状态页不再保留手动操作入口。 */
 		var rb = rollbackBox(d);
 
+		/* 配对卡片放在「运行状态」之后：它是"加新节点"的入口，属于状态页的高频操作，
+		   比拓扑图更该被先看到。放在最上面又会挤掉能力检测的红框，故居中。 */
+		clearPairTimers();
+		pairHost = E('div', { 'class': 'cbi-section-node' });
+		pairHost.appendChild(pairSection(d));
+		var pairSec = E('div', { 'class': 'cbi-section' }, [
+			E('h3', {}, _('一键加入（新节点免配置入网）')),
+			pairHost
+		]);
+
 		return E('div', {}, [
 			rb,
 			roleBox,
 			section(_('能力检测'), capBox),
 			section(_('运行状态'), cards),
+			pairSec,
 			section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),
 			section(_('邻居节点'), peersTable(d))
 		]);

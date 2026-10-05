@@ -2,7 +2,7 @@
 # rpcd exec 插件：为 LuCI(JS) 界面提供 meshctl 调用
 #   ubus 对象: mesh
 #   方法:      status           -> 返回 meshctl status 的 JSON
-#              exec {cmd:"..."} -> 执行白名单内的 meshctl 子命令
+#              exec {cmd:.., arg:..} -> 执行白名单内的 meshctl 子命令
 # 部署后需重启 rpcd: /etc/init.d/rpcd restart
 . /usr/share/libubox/jshn.sh
 
@@ -10,7 +10,7 @@ MESHCTL=/usr/sbin/meshctl
 
 case "$1" in
 	list)
-		echo '{ "status": { }, "exec": { "cmd": "str" } }'
+		echo '{ "status": { }, "exec": { "cmd": "str", "arg": "str" } }'
 		;;
 
 	call)
@@ -24,6 +24,7 @@ case "$1" in
 			exec)
 				json_load "$(cat)" 2>/dev/null
 				json_get_var cmd cmd 2>/dev/null
+				json_get_var arg arg 2>/dev/null
 				code=1
 				case "$cmd" in
 				apply)
@@ -60,6 +61,72 @@ case "$1" in
 						out=$(printf 'code=2\nmsg=%s' '尚无应用记录')
 						code=2
 					fi
+					;;
+				pair_open|pair_close|pair_join)
+					# ★ 这三个必须后台执行、立即返回，理由各不相同但结论一致：
+					#   · pair-open / pair-close 都会触发 wifi reload（实测十几秒）
+					#   · pair-join 最坏要等满 main.pair_wait（默认 300 秒）才领到凭证，
+					#     领到之后还紧接着跑一次 apply —— 子节点会把自己改成 DHCP 并
+					#     network restart，承载本次应答的连接必然被掐断
+					# 同步等只会让 rpcd 应答超时、前端看到"网络错误"。
+					# 真实结果写进 /tmp/mesh/pair-last、进度写 /tmp/mesh/pair.log，
+					# 都在 tmpfs 上 —— 重启即消失，不会留下过时的提示。
+					# 界面靠 meshctl status 的 pair.progress（10 秒一轮轮询）看进度。
+					mkdir -p /tmp/mesh
+					busy=/tmp/mesh/pair-busy; last=/tmp/mesh/pair-last; log=/tmp/mesh/pair.log
+					if [ -f "$busy" ]; then
+						out='错误：已有一个配对操作正在进行，请等它结束后再操作'
+						code=1
+					else
+						margs=""
+						case "$cmd" in
+						pair_open)
+							# arg = 窗口秒数（0 = 常开）；非法或省略则交给 meshctl 用配置值
+							case "$arg" in ''|*[!0-9]*) margs="pair-open";; *) margs="pair-open $arg";; esac
+							;;
+						pair_close)
+							margs="pair-close"
+							;;
+						pair_join)
+							# 网页上点「一键加入」= 领凭证 + 立即应用（这才是"一键"）。
+							# 只想领凭证不改网络的调用方可以传 arg=noapply。
+							if [ "$arg" = "noapply" ]; then margs="pair-join"; else margs="pair-join --apply"; fi
+							;;
+						esac
+						printf 'op=%s\nstart=%s\n' "$cmd" "$(date +%s)" > "$busy"
+						rm -f "$last"; : > "$log"
+						(
+							"$MESHCTL" $margs >"$log" 2>&1
+							rc=$?
+							# 取最后一句"人话"：meshctl 的成功/失败行都以 错误/已/正在 开头
+							msg=$(grep -E '^(错误|已|正在)' "$log" 2>/dev/null | tail -n 1)
+							# pair-join 成功时会把实际领到的凭证打出来，比"已领取并写入："
+							# 这一句有用得多 —— 界面上用户最想看到的就是"拿到哪个网络了"
+							extra=$(grep -E '^[[:space:]]*Mesh ID ' "$log" 2>/dev/null | tail -n 1)
+							[ -n "$extra" ] && msg="$msg $(printf '%s' "$extra" | sed 's/^[[:space:]]*//')"
+							[ -n "$msg" ] || msg=$(grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -n 1)
+							[ -n "$msg" ] || msg='（无明确结果，详见 /tmp/mesh/pair.log）'
+							{
+								echo "op=$cmd"
+								echo "code=$rc"
+								echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+								echo "msg=$msg"
+							} > "$last"
+							rm -f "$busy"
+						) >/dev/null 2>&1 &
+						case "$cmd" in
+						pair_open)  out='已触发：正在开放加入（无线重载约 10~20 秒后生效）';;
+						pair_close) out='已触发：正在关闭加入窗口（子节点镜像的配对信号会在下一轮同步内清除）';;
+						pair_join)  out='已触发：正在加入网络（最长等待数分钟，期间请勿断电）';;
+						esac
+						code=0
+					fi
+					;;
+				pair_status)
+					# 同步执行：只读几个 tmpfs 上的小文件，毫秒级。
+					# 输出是 key=value 行（含 busy/last/tail），前端按行解析。
+					out=$("$MESHCTL" pair-status 2>&1)
+					code=$?
 					;;
 				diag|sync|revert|port_bridging|confirm_rollback)
 						out=$("$MESHCTL" "$cmd" 2>&1)

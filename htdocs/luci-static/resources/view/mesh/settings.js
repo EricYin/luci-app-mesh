@@ -380,6 +380,39 @@ return view.extend({
 		// 802.11s 自身的二层转发 / 网关通告 / HWMP 根模式在 batman-adv 接管后必然让位，
 		// 同样不暴露给用户（UCI 里仍保留，仅用于旧配置兼容与状态展示）。
 
+		/* ================= 一键加入（配对） ================= */
+		// 这里的四项都属于"新节点入网的临时通道"，与主网络的 Mesh ID / 回程密码
+		// 是两回事（那两把钥匙在上面）。绝大多数人**不需要动这里**：同固件设备
+		// 出厂就带同一套配对凭证，改了反而要全网跟着改，否则新节点连不上配对信号。
+		s = m.section(form.NamedSection, 'main', 'main', _('一键加入（配对）'));
+		s.addremove = false;
+
+		o = s.option(form.Value, 'pair_window', _('加入窗口时长(秒)'));
+		o.placeholder = '600';
+		o.datatype = 'range(0,86400)';
+		o.description = _('主节点点「开放加入」后，配对信号自动撤掉前的秒数，默认 600（10 分钟）；0 = 常开。'
+			+ '网页上开窗时可以临时选别的时长，不必改这里。窗口期内任何"连得上本节点、'
+			+ '知道固件固定配对密码"的设备都能领到凭证，所以默认只开几分钟。');
+
+		o = s.option(form.Value, 'pair_wait', _('子节点最长等待(秒)'));
+		o.placeholder = '300';
+		o.datatype = 'range(30,3600)';
+		o.description = _('子节点点「加入」后，等待主节点开窗的最长时间，默认 300（5 分钟）。'
+			+ '给得宽是刻意的：通常是先在子节点上按、再走去开主节点的窗，顺序不该成为负担。');
+
+		o = s.option(form.Value, 'pair_ssid', _('配对信号名称 (SSID)'));
+		o.placeholder = 'PonWrt-Pair';
+		o.datatype = 'maxlength(32)';
+		o.description = _('新节点临时连入用的信号名。与回程用的 Mesh ID 无关，最长 32 字符。');
+
+		o = s.option(form.Value, 'pair_key', _('配对密码'));
+		o.password = true;
+		o.placeholder = 'ponwrt-pair';
+		o.datatype = 'minlength(8)';
+		o.description = _('配对信号的密码，至少 8 位。它**不是**回程密码，公开也无妨 ——'
+			+ '窗口关闭时配对信号根本不存在，这串密码只在开窗的那几分钟里有意义。'
+			+ '一般不用改；真要改，全网所有节点必须改成同一个值。');
+
 		/* ================= 链路控制 ================= */
 		// 这两项决定"无线链路能否建立"；链路建立之后多跳路径的优劣由 batman-adv
 		// 按 TQ(传输质量)自动判定，所以这里不提供任何选路相关的开关。

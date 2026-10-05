@@ -1246,6 +1246,72 @@ mesh_pair_joined_add() {
 	printf '%s\n' "$mac" >> "$f"
 }
 
+# ================= 配对：后台任务的进度与结果 =================
+#
+# 网页上的「开放加入 / 立即关闭 / 一键加入」三个动作都不能同步等：
+#   · pair-open / pair-close 会触发 wifi reload（十几秒）
+#   · pair-join 最坏要等满 pair_wait 秒（默认 300），领到凭证后还紧接着跑一次
+#     apply —— 子节点会把自己改成 DHCP 并 network restart，承载应答的连接必然断
+# 所以 rpcd 侧把它们丢到后台、立即返回，结果与进度落在下面这三个文件里，
+# 由 meshctl status / pair-status 读出来给界面轮询。
+#
+# ★ 必须放在 $MESH_TMP_DIR(/tmp/mesh，tmpfs) 而不是 $MESH_STATE_DIR(/etc/mesh-state)：
+#   这是"一次操作的进度"，不是需要跨重启保留的状态。写进 /etc 既白耗闪存，
+#   重启后还会留一条"上次加入失败"的过时提示。
+mesh_pair_busy_file() { echo "$MESH_TMP_DIR/pair-busy"; }   # op=<cmd> start=<epoch>，任务结束后删除
+mesh_pair_last_file() { echo "$MESH_TMP_DIR/pair-last"; }   # op/code/time/msg
+mesh_pair_log_file()  { echo "$MESH_TMP_DIR/pair.log"; }    # meshctl 的完整输出
+
+# 读后台任务状态，输出一段可直接嵌进 JSON 的对象（meshctl status 用）
+mesh_pair_progress_json() {
+	local busyf lastf logf op since lop code tm msg line
+	busyf=$(mesh_pair_busy_file); lastf=$(mesh_pair_last_file); logf=$(mesh_pair_log_file)
+	op=""; since=0
+	if [ -f "$busyf" ]; then
+		op=$(sed -n 's/^op=//p' "$busyf" 2>/dev/null | head -n1)
+		since=$(sed -n 's/^start=//p' "$busyf" 2>/dev/null | head -n1)
+		case "$since" in ''|*[!0-9]*) since=0;; esac
+	fi
+	lop=""; code=2; tm=""; msg=""
+	if [ -f "$lastf" ]; then
+		lop=$(sed -n 's/^op=//p'   "$lastf" 2>/dev/null | head -n1)
+		code=$(sed -n 's/^code=//p' "$lastf" 2>/dev/null | head -n1)
+		tm=$(sed -n 's/^time=//p'   "$lastf" 2>/dev/null | head -n1)
+		msg=$(sed -n 's/^msg=//p'   "$lastf" 2>/dev/null | head -n1)
+		case "$code" in ''|*[!0-9]*) code=2;; esac
+	fi
+	# 进度行：pair-join 会依次打 [1/4]…[4/4]，给界面一个"确实还在动"的凭据
+	line=$(tail -n 1 "$logf" 2>/dev/null)
+	printf '{"busy":%s,"op":"%s","since":%s,"last":{"op":"%s","code":%s,"time":"%s","msg":"%s"},"tail":"%s"}' \
+		"$([ -n "$op" ] && echo 1 || echo 0)" "$(mesh_esc "${op:--}")" "$since" \
+		"$(mesh_esc "${lop:--}")" "$code" "$(mesh_esc "$tm")" "$(mesh_esc "$msg")" \
+		"$(mesh_esc "$line")"
+}
+
+# 同上，但输出 key=value 行（meshctl pair-status 用，rpcd 原样透传给前端）
+mesh_pair_progress_lines() {
+	local busyf lastf logf op since line
+	busyf=$(mesh_pair_busy_file); lastf=$(mesh_pair_last_file); logf=$(mesh_pair_log_file)
+	op=""; since=0
+	if [ -f "$busyf" ]; then
+		op=$(sed -n 's/^op=//p' "$busyf" 2>/dev/null | head -n1)
+		since=$(sed -n 's/^start=//p' "$busyf" 2>/dev/null | head -n1)
+		case "$since" in ''|*[!0-9]*) since=0;; esac
+	fi
+	echo "busy=$([ -n "$op" ] && echo 1 || echo 0)"
+	echo "busy_op=${op:--}"
+	echo "busy_since=$since"
+	if [ -f "$lastf" ]; then
+		echo "last_op=$(sed -n 's/^op=//p' "$lastf" 2>/dev/null | head -n1)"
+		echo "last_code=$(sed -n 's/^code=//p' "$lastf" 2>/dev/null | head -n1)"
+		echo "last_time=$(sed -n 's/^time=//p' "$lastf" 2>/dev/null | head -n1)"
+		echo "last_msg=$(sed -n 's/^msg=//p' "$lastf" 2>/dev/null | head -n1)"
+	fi
+	# 进度行放最后：前端按行解析时取最后一行即可，不会被上面的空值干扰
+	line=$(tail -n 1 "$logf" 2>/dev/null)
+	echo "tail=$line"
+}
+
 # 扫描配对信号所在的信道。
 #
 # ★★ 这个函数是必需的，别删。同一个 phy 上的所有接口共享**一个**信道，

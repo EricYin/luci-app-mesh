@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**接光猫出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r23`（`PKG_RELEASE` 23）
+- 当前版本：`1.0.0-r26`（`PKG_RELEASE` 26）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -19,6 +19,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 | batman-adv 路径选择 | 强制启用（缺内核模块或 batctl 时 apply 直接拒绝并提示安装命令）；按 TQ 传输质量自动择优，网关模式按角色自动（主节点 server / 子节点 client），无界面开关 |
 | 有线回程（B 方案） | 所有物理端口与 bat0 同入 br-lan：插网线 → 网桥 MAC 学习直接转发（零 batman 开销、满线速）；拔线 → bat0 立即接管。跨 mesh 环路由 BLA 抑制，物理口之间的环由 STP 阻塞 |
 | 子节点全端口内网化 | WAN/LAN 所有物理口并入 br-lan（swconfig VLAN 与 DSA 均自动处理），删除上行接口、关闭本机 DHCP；子节点自身与下挂终端地址一律由主节点分发（恒 `proto=dhcp`），br-lan MAC 钉成设备主 MAC 防租约漂移 |
+| 一键加入（配对） | 新节点免手工填参数：主节点点「开放加入」临时起一个配对信号（固件固定 SSID/密码），子节点点「一键加入」连上来领取 Mesh ID 与回程密码并自动应用。窗口默认 10 分钟自动关闭，可改或设为常开；窗口关着时配对信号根本不存在，固定密码不构成风险 |
 | 配置自动同步 | 子节点守护进程每 10 秒经 `http://<主节点>/cgi-bin/mesh-sync` 拉取配置，镜像主节点的 SSID/密码/加密/802.11r；一致时不做任何变更（不重启无线） |
 | AP 信道错开 | 主节点信道固定时，各子节点 AP 按注册序号在 2.4G {1,6,11} / 5G 36·149·44·157… 轮转错开，减少同频干扰（回程频段除外，回程必须同信道） |
 | 回滚保护 | 应用后开启看护窗口（静态地址 120 秒 / DHCP 子节点 180 秒），到期管理地址不可达则自动还原组网前配置并整机重启；页面顶部出现「保留新配置 / 立即还原」确认条 |
@@ -45,9 +46,6 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 luci-app-mesh/
 ├── Makefile                                  # OpenWrt feed 打包（依赖 / conffiles / postinst）
 ├── install.sh                                # 免编译直装脚本（复制到设备上 sh install.sh）
-├── docs/                                     # 赞助收款码
-│   ├── donate-alipay.jpg
-│   └── donate-wechat.png
 ├── htdocs/luci-static/resources/view/mesh/   # LuCI JS 界面
 │   ├── overview.js                           #   组网状态
 │   ├── settings.js                           #   组网设置
@@ -112,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r23.apk
-opkg install luci-app-mesh_1.0.0-r23_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r26.apk
+opkg install luci-app-mesh_1.0.0-r26_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -126,7 +124,10 @@ sh install.sh
 ## 组网步骤
 
 1. **主节点**（接光猫）：组网设置 → 角色选「主节点」→ 保存并应用。**Mesh ID 与回程密码可留空**——留空时主节点首次应用会自动生成：Mesh ID 按本机 MAC 派生为 `XxMesh-XXXXXX`（避免与邻居的同款固件重名），回程密码为 16 位随机串；生成后长期固定。也可以自己填（填了就以你填的为准，不会被改掉）。WAN 保持接光猫不动，DHCP 服务自动确保开启。
-2. **子节点**：组网设置 → 角色选「子节点」→ 填**相同**的 Mesh ID 与密码 → 保存并应用。应用后子节点会删除 WAN 口、全端口并入内网、管理地址改为 DHCP 获取（出厂 `192.168.1.1` 会变化，请到主节点的 DHCP 租约列表找它的新地址）。
+2. **子节点（两种方式二选一）**：
+   - **一键加入（推荐，不用知道任何密码）**：组网设置 → 角色选「子节点」→ 启用 → 保存并应用；再到组网状态页点「一键加入」，然后去主节点点「开放加入」。子节点会自动连上配对信号、领走 Mesh ID 与回程密码并自动应用。先后顺序无所谓——子节点会一直等（默认 5 分钟）到主节点开窗为止。
+   - **手工填**：组网设置 → 角色选「子节点」→ 填**相同**的 Mesh ID 与密码 → 保存并应用。
+   两种方式应用后子节点都会删除 WAN 口、全端口并入内网、管理地址改为 DHCP 获取（出厂 `192.168.1.1` 会变化，请到主节点的 DHCP 租约列表找它的新地址）。
 3. **等待回程建立**：两台都应用完约 1~2 分钟，组网状态页应看到邻居节点、mesh0 对端与 bat0 就绪；子节点 AP 名称/密码此后自动跟随主节点。
 4. **（可选）有线回程**：任意一根网线连接两台设备的任意 LAN/WAN 口即可——端口已全部在 br-lan 内，插上就走二层直转，拔掉自动回落无线，无需任何配置。
 5. **验证**：终端连接任一节点的 Wi-Fi 或网口，获取的地址应由主节点分发，可直接访问两台的 LuCI；组网状态页拓扑中两节点均在线。
@@ -140,13 +141,13 @@ sh install.sh
 - **组网拓扑（B 方案，唯一实现）**：所有物理端口与 `bat0` 同入 `br-lan`；`bat0` 的 hard interface 只有无线回程 `mesh0`（mesh0 本身不进网桥）。有线在线时流量走网桥 MAC 学习直达（满线速）；无线经 batman-adv 封包转发。跨 mesh 的环由 batman-adv **BLA**（桥环规避）抑制，物理口之间的环由 **STP**（定时器 4/1/6）阻塞，两者分工不冲突。
 - **apply 的执行顺序**：校验参数与能力（驱动 / wpad / kmod-batman-adv / batctl，缺一拒绝）→ 首次备份 4 个配置 → 按角色改写 network/dhcp（子节点删 WAN、全端口进 br-lan、`proto=dhcp`）→ 建 mesh0 + bat0/batmesh + 桥接 → 开回滚保护窗口 → 提交并 `network restart` + `wifi reload`。
 - **为什么「保存并应用」总是立刻返回成功**：子节点 apply 会把自己的 LAN 改成 DHCP 并重启网络，承载 RPC 应答的连接会被当场掐断——所以 rpcd 后台执行、立即返回 `code=0`。真实结果写入 `/tmp/mesh/last_apply`（tmpfs），设置页表单上方会显示「上次应用：成功/失败」，触发后 8 秒 / 22 秒各回读一次；**重启后记录消失，界面不再显示**。
+- **一键加入（配对）为什么用「两把钥匙」**：回程密码既是 802.11s 的 SAE 密钥、也是子节点拉配置的令牌，出厂/恢复出厂的新节点手里没有它，连问都问不到——所以必须另开一条**免鉴权**通道。配对密码是固件里写死的固定值（`PonWrt-Pair` / `ponwrt-pair`），它只在一扇"平时根本不存在"的门上有效：窗口关闭时配对 AP 压根没起来，知道密码也连不上。风险窗口就是开窗的那几分钟，兜底是"得本人在现场开窗"。主节点开窗后，这个配对信号会经现有的 AP 镜像机制**自动同步到所有子节点**，新节点可以就近连信号最好的那个，凭证请求经 bat0 二层域照样回到主节点。
+- **配对为什么不能用「第二个 mesh 接口」**：`wpa_supplicant` 一个进程只允许加入一个 mesh group，真机实测第二个 mesh 起来后正式回程立刻被踢（`Avoiding join because we already joined a mesh group`），所以配对通道只能走 AP/STA。配对 STA 还必须是独立 interface 且 `defaultroute=0`：桥进 `br-lan` 会与主节点的配对 AP 成环，走 dhcp 又会抢走默认路由。
 - **配置同步协议**：子节点每 10 秒 `GET /cgi-bin/mesh-sync?mac=..&token=<回程密码>&link=wifi|wired` → 主节点校验角色 / enabled / token 后返回 JSON（含 AP 列表、信道、序号）；子节点按序号镜像配置，一致则跳过。链路类型由 station 表与入口端口判定，无线、有线断一个都能继续同步。
 - **备份 / 还原 / 回滚语义**：`/etc/mesh-backup/` 只在首次启用时创建，停用再启用**不覆盖**；「还原」= 备份整份覆盖回 wireless/network/dhcp/firewall + `enabled=0` + 删备份 + 延迟 2 秒整机重启（先让成功应答返回页面）；自动回滚到期不可达时走同一条还原路径。
 - **防静默失败**：能力缺失（wpad / kmod-batman-adv / batctl）在状态页红框明示 + apply 强制拦截；`capabilities` 中 `batctl` 独立于内核模块判定，避免「模块在、工具缺」时界面假绿。
 - **漫游配置自愈（为什么用轮询而不是事件）**：本系列固件**不发 procd 的 `config.change` 事件**（命令行 `uci commit` 与 LuCI 的 `uci apply` 两条路径实测都不发），而 LuCI 无线页保存会**重写整段 wireless**，把 `rrm_neighbor_report` / `rrm_beacon_report` 这类它不认识的项直接冲掉。因此 `97-wifi-roaming` / `99-dawn-roaming` 采用每分钟 cron 巡检：配置未变时一轮只做一次 md5 比较即退出，检测到差异才 `uci commit` 并后台重载。两者都是**差异修复器**而非配置器——只补缺失项、不重写已正确的项，所以不会每次巡检都断一次无线。
 - **mesh 守卫**：两个脚本都以 `/etc/config/mesh` 的 `enabled` 为总开关。安装时默认 `enable`（开机自启）+ `cron_enable`（每分钟巡检），但在未启用组网的设备上（`enabled != 1`）一律静默退出——**装包本身不会改动无线配置**；卸载时 `prerm` 自动清掉 cron 条目与自启链接。
-
----
 
 ## 变更记录
 
@@ -192,10 +193,25 @@ sh install.sh
 
 ---
 
-## 赞助
+---
 
-如果这个项目对你有帮助，欢迎请作者喝一杯 🙂
+### r24（2026-10-05）
+回程凭证自动生成 + 修好设置页密码工具按钮：
+- **Mesh ID 按本机 MAC 派生**：主节点首次应用且 `mesh_id` 为空时，派生为 `XxMesh-<MAC 后 6 位>` 并写回 UCI。全网同固件不再都叫同一个名字——同信道上邻居的同款设备会反复尝试 SAE 握手（空口干扰 + 刷日志）。取 MAC 时特意避开 `bat0`（它是 batman-adv 的软接口，MAC 由 batman 自己生成），只从 `eth*`/`br-lan` 取。
+- **回程密码自动生成**：同样只在为空时生成 16 位 `[A-Za-z0-9]` 随机串（不含 `+/=` 等 URL 保留字符——它要拼进同步请求的查询串）。判定只看"是否为空"，用户手工填的弱密码不会被悄悄改掉。
+- **出厂配置必须留空**：`/etc/config/mesh` 里 `mesh_id` / `mesh_key` 改成空串。原来写死 `OpenWrtMesh`，新刷机永远走不到派生逻辑。
+- **修好密码工具按钮点了没反应**：LuCI 的密码框是**两层结构**——`getElementById('cbid.mesh.main.mesh_key')` 拿到的是外层 `div`，真正的 `input` 的 id 是 `widget.cbid.mesh.main.mesh_key`；且 `<button>` 在 form 里默认 `type=submit`，不写就会触发保存。现在按 `widget.` → 容器内 `input` → `input.cbi-input-password` 三级查找，并全部显式 `type=button`。
 
-| 支付宝 | 微信支付 |
-|:---:|:---:|
-| <img src="docs/donate-alipay.jpg" width="220" alt="支付宝收款码"> | <img src="docs/donate-wechat.png" width="220" alt="微信收款码"> |
+### r25（2026-10-05）
+后端打通「一键加入」：新增 `action=join` 端点与 `meshctl pair-open / pair-close / pair-status / pair-join`（真机端到端验收通过）。
+- **免鉴权端点必须放在 token 校验之前**：`mesh-sync` 的 token 就是回程密码，出厂节点连那道门都敲不开——"先有凭证还是先有连接"这个死循环只能靠一条免鉴权通道解开。安全性只依赖「只有已启用组网的主节点响应」+「只在窗口期响应」。
+- **窗口到期改由守护进程收摊**：早期版本用一次性 `sleep` 后台进程看门狗，连续开窗时残留的旧进程会把新窗口误关。现在窗口是一个 expire 时间戳，守护进程每 10 秒核对（实测 240 秒窗口准时自动关闭）。
+- **配对 STA 必须先对齐信道**：同一 phy 上所有接口共享**一个**信道，STA 没法独自跳频——真机实测子节点射频在 ch11、配对 AP 在 ch1 时永远关联不上。所以起 STA 前先用 `mesh_pair_scan_channel` 扫出配对信号所在信道并临时切过去，用完还原。
+- **踩坑记录**：`jsonfilter` 表达式里带连字符的键必须写成 `@['ipv4-address'][0]['address']`，写成 `@.ipv4-address[0].address` 会报 `Invalid escape sequence` 且**静默返回空**（表现为"接口明明 up 了，脚本却以为没拿到地址"）。
+
+### r26（2026-10-05）
+把一键加入做成网页按钮（第三步）：rpcd 放行 `pair_*` 并后台化，组网状态页加配对卡片、组网设置页加配对设置区。
+- **三个配对动作必须后台执行并立即返回**：`pair-open` / `pair-close` 会触发 `wifi reload`（十几秒），`pair-join` 最坏要等满 5 分钟并紧接着跑一次 `apply`（子节点会改 IP + 重启网络）。同步等只会让 rpcd 连接超时、前端看到"网络错误"。真实结果写进 `/tmp/mesh/pair-last`（tmpfs，重启即消失），进度行写 `/tmp/mesh/pair.log`。
+- **进度可见**：`meshctl status` 新增 `pair` 块（窗口状态 / 剩余秒数 / 已加入台数 / 后台任务 busy / 上次结果 / 最新进度行），状态页 10 秒一轮的轮询顺带刷新，不用额外加定时器。
+- **网页上开窗可改时长**（默认 10 分钟，可选 2/5/10/30 分钟或常开），开窗期间显示倒计时、配对 SSID/密码、已加入台数，可随时「立即关闭」。
+- 仓库归属整理：`origin` 指向 `https://github.com/xxosdev/luci-app-mesh.git`，维护者改为 `Xx`，移除原作者的赞助收款码。

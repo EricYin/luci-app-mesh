@@ -409,7 +409,7 @@ cmd_apply() {
 	if [ -z "$id" ]; then
 		# 主节点走到这里说明 MAC 派生失败（拿不到主 MAC）；子节点则是"还没领到凭证"
 		if [ "$role" = client ]; then
-			echo "错误：子节点没有 Mesh ID —— 填与主节点完全相同的值（主节点组网设置页可复制），后续版本可用配对窗口自动领取"
+			echo "错误：子节点没有 Mesh ID —— 到组网状态页点「一键加入」自动领取（主节点需先点「开放加入」），或手工填与主节点完全相同的值（主节点组网设置页可复制）"
 		else
 			echo "错误：Mesh ID 不能为空，且本机读不到主 MAC（无法自动派生），请手工填写"
 		fi
@@ -1100,6 +1100,15 @@ cmd_status() {
 		"$(mesh_list_to_json "$chans_6g")")
 
 local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
+	# 配对（一键加入）状态：窗口是否开着、剩余秒数、已加入台数、后台任务进度。
+	# 界面每 10 秒轮询一次 status，配对卡片的所有状态都从这里取，不用另开定时器。
+	local pr_open=0 pr_remain pr_joined pr_radio pr_window pr_wait
+	mesh_pair_window_open && pr_open=1
+	pr_remain=$(mesh_pair_remain)          # -1 = 常开, 0 = 未开
+	pr_joined=$(mesh_pair_joined_count)
+	pr_radio=$(cat "$MESH_STATE_DIR/pair-radio" 2>/dev/null)
+	pr_window=$(mesh_pair_window_default); case "$pr_window" in ''|*[!0-9]*) pr_window=600;; esac
+	pr_wait=$(mesh_uci_getd main.pair_wait 300); case "$pr_wait" in ''|*[!0-9]*) pr_wait=300;; esac
 	if [ -f "$MESH_STATE_DIR/rollback" ]; then
 		rb_active=1
 		rb_ip=$(sed -n 's/^ip=//p' "$MESH_STATE_DIR/rollback")
@@ -1158,6 +1167,7 @@ $(peers_tsv_to_json "$st")
 $(mesh_registry_json)
  ],
  "port_bridging": $(mesh_all_ports_in_lan && echo true || echo false),
+ "pair": {"open": $pr_open, "remain": $pr_remain, "joined": ${pr_joined:-0}, "ssid": "$(mesh_esc "$(mesh_pair_ssid)")", "key": "$(mesh_esc "$(mesh_pair_key)")", "radio": "$(mesh_esc "${pr_radio:--}")", "window": $pr_window, "wait": $pr_wait, "progress": $(mesh_pair_progress_json)},
  "rollback": {"active": $rb_active, "ip": "$(mesh_esc "$rb_ip")", "deadline": $rb_deadline, "remain": $rb_left},
  "daemon_running": $(pgrep -f 'meshctl daemon' >/dev/null 2>&1 && echo true || echo false),
  "backup_exists": $([ -d "$MESH_BACKUP_DIR/config" ] && echo true || echo false)
@@ -1583,6 +1593,8 @@ cmd_pair_status() {
 	echo "joined=$joined"
 	echo "ssid=$(mesh_pair_ssid)"
 	echo "radio=${radio:--}"
+	# 后台任务（网页上触发的 open/close/join）的进度与结果，前端按 key=value 解析
+	mesh_pair_progress_lines
 }
 
 # ================= 配对：子节点领取凭证 =================

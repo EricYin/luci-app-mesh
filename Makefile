@@ -5,9 +5,9 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mesh
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=25
+PKG_RELEASE:=26
 PKG_LICENSE:=Apache-2.0
-PKG_MAINTAINER:=dffxy
+PKG_MAINTAINER:=Xx
 
 LUCI_TITLE:=802.11s Mesh 组网管理（JS 界面 · 主/子节点 · 配置同步 · 信道错开 · 全端口内网化）
 # ===== 前置条件补齐（2026-09-22，针对 K2P / mt7621 固定内核编译）=====
