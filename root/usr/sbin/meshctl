@@ -615,6 +615,14 @@ cmd_apply() {
 		uci set mesh.main.status_text='等待主节点下发配置'
 	fi
 
+	# 配对 AP 兜底清理：窗口没开时配置里不该还有配对 AP。
+	# 旧版本残留 / 状态文件丢失都会让它常驻，而它密码公开、还桥进内网。
+	# 放在 reload 之前，让下面的 wifi reload 一并把它撤掉。
+	pair_purged=0
+	if ! mesh_pair_window_open; then
+		mesh_pair_ap_purge && pair_purged=1
+	fi
+
 	echo "[7/7] 提交并重载"
 	net_chg=0; wl_chg=0; dhcp_chg=0
 	[ -n "$(uci changes network)" ] && net_chg=1
@@ -631,6 +639,13 @@ cmd_apply() {
 	# mesh_wifi_ensure_aps_up 注释）——apply 后同样要校验并兜底，否则"改一次密码
 	# 子节点 AP 就消失"。
 	[ "$wl_chg" = 1 ] && mesh_wifi_ensure_aps_up >>"$MESH_LOG" 2>&1
+	# 只清了配对 AP（无线没别的改动）时也要 reload，否则删的是配置、AP 还在广播
+	[ "$pair_purged" = 1 ] && [ "$wl_chg" != 1 ] && {
+		uci commit wireless
+		wifi reload >>"$MESH_LOG" 2>&1
+		mesh_wifi_ensure_aps_up >>"$MESH_LOG" 2>&1
+		mesh_log warn "已清除残留的配对 AP（窗口已关闭）"
+	}
 	[ "$dhcp_chg" = 1 ] && /etc/init.d/dnsmasq restart >>"$MESH_LOG" 2>&1
 	mesh_ensure_service
 	# batman-adv 的 hardif 兜底（netifd 设 MTU 的时机不保证，这里补一次）
@@ -1403,6 +1418,14 @@ cmd_daemon() {
 	local n fail pexp
 	n=0; fail=0
 	mesh_log info "守护进程启动"
+	# 启动即兜底：窗口没开，配置里却还有配对 AP（旧版本残留 / 状态文件丢失）→ 扫掉并撤广播。
+	# 常驻的配对 AP 密码是固件公开的固定值、还桥进内网，属于真实的暴露面。
+	if ! mesh_pair_window_open; then
+		if mesh_pair_ap_purge; then
+			mesh_log warn "启动清理：已移除残留的配对 AP"
+			wifi reload >>"$MESH_LOG" 2>&1
+		fi
+	fi
 	while :; do
 		rollback_check 2>/dev/null
 		# 配对窗口到期检查。放在守护进程里而不是"开窗时起一个 sleep N 的后台进程"：
@@ -1601,6 +1624,9 @@ cmd_set_role() {
 		fi
 	fi
 	uci commit mesh
+	# 切成子节点 = 本机不再发凭证，残留的配对 AP 要立刻从配置里扫掉
+	# （真正的撤广播由随后的 apply / wifi reload 完成）
+	[ "$role" != master ] && mesh_pair_ap_purge
 	mesh_unlock
 	mesh_log info "角色设置：${role}（enabled=1，未应用）"
 	if [ "$role" = master ]; then

@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r35`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r36`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r35.apk
-opkg install luci-app-mesh_1.0.0-r35_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r36.apk
+opkg install luci-app-mesh_1.0.0-r36_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -373,4 +373,21 @@ sh install.sh
   投递；再叠加 r33 的绑设备发送 + 主机路由，报文就能从配对网卡正常出去。
 - 只在检测到撞号时才走这条路，正常场景零额外开销；主节点版本较旧（没挂备用地址）
   时仍会超时，但超时提示会说明原因。
+
+### r36（2026-10-05）
+修一个**真实暴露面**：配对 AP 可能长期驻留在子节点上一直广播。
+
+- 现象（真机 .219）：`meshctl pair-status` 显示 `open=0`（窗口已关），但 radio0 上
+  就是有个 `phy0-ap1` 在发 `XxMesh-Pair`，`network=lan` —— **密码是固件里公开的
+  `xxmesh-pair`，且桥进了内网**：附近任何人连上它就直接进整个 mesh 局域网。
+- 根因：删除配对 AP 只认 `mesh_pair=1` 标记 + 状态文件；旧版本建的段**不带标记**，
+  状态文件一丢（重启 / 手改 / 跨版本升级）就再也找不到 → 关窗、退出组网都删不掉它。
+- 修法：
+  1. `mesh_pair_ap_sections()` 双轨认定 —— 标记优先，其次 `mode=ap + 配对 SSID +
+     配对密码` 三者同时命中（用户自建的同名 AP 不会有固件里那个固定密码，误删代价
+     可接受）；`mesh_pair_ap_del` 改为清除**全部**匹配段而不是只删第一个。
+  2. 新增 `mesh_pair_ap_purge()`（删到东西才返回 0，调用方据此决定要不要 reload），
+     在三处兜底：`cmd_apply`（窗口关闭时，且放在 wifi reload 之前）、`set-role` 切成
+     子节点时、守护进程启动时（并立即 reload 撤广播）。
+
 

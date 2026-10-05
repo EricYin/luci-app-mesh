@@ -1161,18 +1161,51 @@ mesh_pair_window_default() { mesh_uci_getd main.pair_window 600; }
 mesh_pair_expire_file() { echo "$MESH_STATE_DIR/pair-expire"; }
 mesh_pair_joined_file() { echo "$MESH_STATE_DIR/pair-joined"; }
 
-# 本机由本工具创建的配对 AP 段。
-# 只认 mesh_pair 标记（+ 状态文件兜底），**绝不按 SSID 猜** —— 用户完全可能有个同名 AP。
+# 所有"配对 AP"段。两条认定路径：
+#   ① 本工具打的 mesh_pair=1 标记（正常路径，零误判）
+#   ② 旧版本建的段**不带标记**，只靠状态文件找；状态文件一丢（重启 / 手改 /
+#      跨版本升级）就再也删不掉 —— 结果是一个「密码写在固件里、还桥进内网」的
+#      AP 长期广播。真机 .219 就是这样中招的：pair-status 显示 open=0，
+#      radio0 上却有个 phy0-ap1 在发 XxMesh-Pair。
+#      所以补一条内容认定：mode=ap + 配对 SSID + 配对密码 三者同时命中才算。
+#      用户自建的同名 AP 不会有"固件里那个固定配对密码"，误删代价可接受。
+mesh_pair_ap_sections() {
+	local sec ssid key
+	ssid=$(mesh_pair_ssid)
+	key=$(mesh_pair_key)
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(uci -q get "wireless.$sec.mesh_pair" 2>/dev/null)" = "1" ] && { echo "$sec"; continue; }
+		[ "$(uci -q get "wireless.$sec.mode" 2>/dev/null)" = "ap" ] || continue
+		[ "$(uci -q get "wireless.$sec.ssid" 2>/dev/null)" = "$ssid" ] || continue
+		[ "$(uci -q get "wireless.$sec.key" 2>/dev/null)" = "$key" ] && echo "$sec"
+	done
+	return 0
+}
+
+# 本机由本工具创建的配对 AP 段（取第一个）。
 mesh_pair_ap_section() {
 	local sec st
 	st=$(cat "$MESH_STATE_DIR/pair-section" 2>/dev/null)
 	if [ -n "$st" ] && uci -q get "wireless.$st" >/dev/null 2>&1; then
 		echo "$st"; return 0
 	fi
-	for sec in $(mesh_wifi_ifaces); do
-		[ "$(uci -q get "wireless.$sec.mesh_pair" 2>/dev/null)" = "1" ] && { echo "$sec"; return 0; }
+	for sec in $(mesh_pair_ap_sections); do
+		echo "$sec"; return 0
 	done
 	return 1
+}
+
+# 兜底清除：把所有配对 AP 段删掉。删到东西才返回 0（调用方据此决定要不要 reload）。
+mesh_pair_ap_purge() {
+	local sec n=0
+	for sec in $(mesh_pair_ap_sections); do
+		uci -q delete "wireless.$sec" 2>/dev/null && n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] || return 1
+	uci commit wireless
+	rm -f "$MESH_STATE_DIR/pair-section" "$MESH_STATE_DIR/pair-radio" \
+		"$MESH_STATE_DIR/ap-created-"*
+	return 0
 }
 
 # 配对 AP 放哪个射频：优先挑"非回程"的那个 —— 开窗/关窗的 wifi reload 就不会打扰回程。
@@ -1220,9 +1253,8 @@ mesh_pair_ap_add() {
 }
 
 mesh_pair_ap_del() {
-	local sec
-	sec=$(mesh_pair_ap_section 2>/dev/null) || sec=""
-	[ -n "$sec" ] && { uci -q delete "wireless.$sec"; uci commit wireless; }
+	# 走 purge：连旧版本留下的无标记段一起删掉（只删标记段会漏，见上面注释）
+	mesh_pair_ap_purge
 	rm -f "$MESH_STATE_DIR/pair-section" "$MESH_STATE_DIR/pair-radio" \
 		"$(mesh_pair_expire_file)" "$MESH_STATE_DIR/pair.token"
 	return 0
