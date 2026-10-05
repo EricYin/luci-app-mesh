@@ -1100,6 +1100,187 @@ mesh_default_rssi() { echo -80; }
 # 单个射频最多同时连接的邻居数。8 足够典型家庭/小型办公组网。
 mesh_default_max_peers() { echo 8; }
 
+# ================= 配对（一键加入）=================
+#
+# 背景：mesh-sync 下发的 mesh 对象**只有 id、没有回程密码**，而出厂/恢复出厂的
+# 子节点手里没有任何可用凭证 —— 它连 sync 那道门都敲不开（token 就是回程密码）。
+# 于是"加一台新节点"在改造前只能手工填 4 个参数。
+#
+# 解法是两把钥匙彻底分开：
+#   · 配对密码：固件里写死的固定值，**公开也无妨** —— 它只在一扇"平时根本不存在"
+#     的门上有效（窗口关闭时配对 AP 压根没起来）。
+#   · 回程密码：随机生成、长期固定，只经窗口期那条通道发给新节点，用户全程不用知道。
+#
+# 流程：主节点开窗（临时起配对 AP） → 新节点用固件固定的配对参数连上来 →
+#   DHCP 拿到地址（配对 AP 桥在 lan 上） → GET mesh-sync?action=join 领凭证 →
+#   落盘 → 拆掉 STA → 切 mesh 加入正式网络，此后长期有效。
+#
+# ★ 实现上的三个硬约束（都是实测得来的）：
+#   ① 不能用"配对 mesh"：wpa_supplicant 一个进程只允许加入一个 mesh group，
+#      真机实测第二个 mesh 起来后正式回程立刻 "Avoiding join because we already
+#      joined a mesh group" 被踢掉。所以配对通道只能走 AP/STA。
+#   ② STA 要独立 interface 且 defaultroute=0：桥进 br-lan 会与主节点的配对 AP
+#      形成二层环路；用 dhcp 又会抢走默认路由（实测 default 被改到 phy0-sta0）。
+#   ③ 配对 AP 打 mesh_pair=1 标记：主节点 ap_json() 目前会把所有 mode=ap 段镜像
+#      给子节点（这正是"所有节点都广播配对信号"的实现方式），标记用于本地识别。
+#      注意标记**不会**随下发传过去 —— 子节点那边看到的就是一个普通 AP。
+MESH_PAIR_SSID_DEFAULT='PonWrt-Pair'
+MESH_PAIR_KEY_DEFAULT='ponwrt-pair'
+MESH_PAIR_IFNAME='pair0'
+MESH_PAIR_STA_IFNAME='pairsta0'
+MESH_PAIR_NET='pair'
+
+mesh_pair_ssid() { mesh_uci_getd main.pair_ssid "$MESH_PAIR_SSID_DEFAULT"; }
+mesh_pair_key()  { mesh_uci_getd main.pair_key  "$MESH_PAIR_KEY_DEFAULT"; }
+# 窗口默认时长（秒）；0 = 常开
+mesh_pair_window_default() { mesh_uci_getd main.pair_window 600; }
+mesh_pair_expire_file() { echo "$MESH_STATE_DIR/pair-expire"; }
+mesh_pair_joined_file() { echo "$MESH_STATE_DIR/pair-joined"; }
+
+# 本机由本工具创建的配对 AP 段。
+# 只认 mesh_pair 标记（+ 状态文件兜底），**绝不按 SSID 猜** —— 用户完全可能有个同名 AP。
+mesh_pair_ap_section() {
+	local sec st
+	st=$(cat "$MESH_STATE_DIR/pair-section" 2>/dev/null)
+	if [ -n "$st" ] && uci -q get "wireless.$st" >/dev/null 2>&1; then
+		echo "$st"; return 0
+	fi
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(uci -q get "wireless.$sec.mesh_pair" 2>/dev/null)" = "1" ] && { echo "$sec"; return 0; }
+	done
+	return 1
+}
+
+# 配对 AP 放哪个射频：优先挑"非回程"的那个 —— 开窗/关窗的 wifi reload 就不会打扰回程。
+# 只有一个射频（或回程射频是唯一可用）时退回它自己（AP+AP 共存是标准能力，已实测）。
+mesh_pair_radio() {
+	local bh bhr r first=""
+	bh=$(mesh_resolve_backhaul_band "$(mesh_uci_getd main.band auto)" 2>/dev/null)
+	bhr=""
+	[ -n "$bh" ] && bhr=$(mesh_band_radio "$bh" 2>/dev/null)
+	for r in $(mesh_radios); do
+		[ -n "$first" ] || first="$r"
+		[ -n "$bhr" ] && [ "$r" = "$bhr" ] && continue
+		# 射频被禁用的话起不来，跳过
+		[ "$(uci -q get "wireless.$r.disabled" 2>/dev/null)" = "1" ] && continue
+		echo "$r"; return 0
+	done
+	[ -n "$bhr" ] && { echo "$bhr"; return 0; }
+	[ -n "$first" ] && echo "$first"
+	return 0
+}
+
+mesh_pair_ap_add() {
+	local radio sec ssid key
+	radio=$(mesh_pair_radio)
+	[ -n "$radio" ] || return 1
+	ssid=$(mesh_pair_ssid)
+	key=$(mesh_pair_key)
+	sec=$(mesh_pair_ap_section 2>/dev/null) || sec=""
+	[ -n "$sec" ] || sec=$(uci add wireless wifi-iface)
+	[ -n "$sec" ] || return 1
+	uci set "wireless.$sec.device=$radio"
+	uci set "wireless.$sec.mode=ap"
+	uci set "wireless.$sec.network=lan"
+	uci set "wireless.$sec.ifname=$MESH_PAIR_IFNAME"
+	uci set "wireless.$sec.ssid=$ssid"
+	uci set "wireless.$sec.encryption=psk2"
+	uci set "wireless.$sec.key=$key"
+	uci set "wireless.$sec.disabled=0"
+	uci set "wireless.$sec.mesh_pair=1"
+	uci commit wireless
+	mkdir -p "$MESH_STATE_DIR"
+	echo "$sec"   > "$MESH_STATE_DIR/pair-section"
+	echo "$radio" > "$MESH_STATE_DIR/pair-radio"
+	return 0
+}
+
+mesh_pair_ap_del() {
+	local sec
+	sec=$(mesh_pair_ap_section 2>/dev/null) || sec=""
+	[ -n "$sec" ] && { uci -q delete "wireless.$sec"; uci commit wireless; }
+	rm -f "$MESH_STATE_DIR/pair-section" "$MESH_STATE_DIR/pair-radio" \
+		"$(mesh_pair_expire_file)" "$MESH_STATE_DIR/pair.token"
+	return 0
+}
+
+# 窗口是否开着。只看过期时间戳：expire 文件里是"到期时刻"的 epoch 秒，0 表示常开。
+# 重启后 tmpfs 里的 expire 会消失 → 自动关闭，这是期望行为（不会留下一个永远开着的门）。
+mesh_pair_window_open() {
+	local exp now
+	exp=$(cat "$(mesh_pair_expire_file)" 2>/dev/null)
+	case "$exp" in ''|*[!0-9]*) return 1;; esac
+	[ "$exp" = 0 ] && return 0
+	now=$(date +%s)
+	[ "$now" -lt "$exp" ] || return 1
+	# 时间戳还在、但 AP 段已经没了（被人为删掉）也算关闭
+	mesh_pair_ap_section >/dev/null 2>&1
+}
+
+# 剩余秒数；-1 = 常开；0 = 未开
+mesh_pair_remain() {
+	local exp now
+	exp=$(cat "$(mesh_pair_expire_file)" 2>/dev/null)
+	case "$exp" in ''|*[!0-9]*) echo 0; return 0;; esac
+	[ "$exp" = 0 ] && { echo -1; return 0; }
+	now=$(date +%s)
+	[ "$now" -lt "$exp" ] || { echo 0; return 0; }
+	echo $((exp - now))
+}
+
+mesh_pair_joined_count() {
+	local f n
+	f=$(mesh_pair_joined_file)
+	n=$(grep -c . "$f" 2>/dev/null)
+	case "$n" in ''|*[!0-9]*) n=0;; esac
+	echo "$n"
+}
+
+# 记录一次成功的凭证领取（按 MAC 去重，同一台重复领取不重复计数）
+mesh_pair_joined_add() {
+	local mac="$1" f
+	[ -n "$mac" ] || return 0
+	f=$(mesh_pair_joined_file)
+	mkdir -p "$MESH_STATE_DIR"
+	grep -qi "^$mac\$" "$f" 2>/dev/null && return 0
+	printf '%s\n' "$mac" >> "$f"
+}
+
+# 扫描配对信号所在的信道。
+#
+# ★★ 这个函数是必需的，别删。同一个 phy 上的所有接口共享**一个**信道，
+#   STA 没法独自跳到别的信道去 —— 真机实测：子节点射频在 ch11、配对 AP 在 ch1 时，
+#   wpa_supplicant 一直关联不上（接口建得出来、就是拿不到 IP）；把射频切到 ch1 后
+#   立刻 Connected 并拿到 DHCP。所以起 STA 之前必须先把射频对齐到配对信号的信道。
+#
+# $1 = radio（如 radio0）  $2 = 配对 SSID
+mesh_pair_scan_channel() {
+	local radio="$1" ssid="$2" phy num ifn freq ch i
+	phy=$(mesh_radio_phy "$radio" 2>/dev/null)
+	[ -n "$phy" ] || return 1
+	num=${phy#phy}
+	# 借该射频上现有的任意一个接口来扫（AP 口就行）；扫描会有秒级中断，配对场景可接受
+	ifn=$(iw dev 2>/dev/null | awk -v p="phy#$num" '/^phy#/{cur=$1} $1=="Interface"{if(cur==p){print $2; exit}}')
+	[ -n "$ifn" ] || return 1
+	freq=""
+	for i in 1 2; do
+		freq=$(iw dev "$ifn" scan ssid "$ssid" 2>/dev/null \
+			| awk -v s="$ssid" '/freq:/{f=$2} $1=="SSID:"{if($2==s) print f}' | head -n1)
+		[ -n "$freq" ] && break
+		sleep 2
+	done
+	[ -n "$freq" ] || return 1
+	freq=${freq%.*}
+	case "$freq" in ''|*[!0-9]*) return 1;; esac
+	if [ "$freq" -lt 2500 ] 2>/dev/null; then
+		ch=$(( (freq - 2407) / 5 ))
+	else
+		ch=$(( (freq - 5000) / 5 ))
+	fi
+	[ "$ch" -gt 0 ] 2>/dev/null || return 1
+	echo "$ch"
+}
+
 # 信道错开：master 信道 -> 节点序号 idx(>=1) 的错开信道
 # 2.4G 互不重叠组 {1,6,11}；5G 在 36-48 与 149-161 两组间交替拉开
 mesh_base_member() {

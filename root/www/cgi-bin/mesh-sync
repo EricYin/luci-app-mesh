@@ -30,6 +30,46 @@ case "$wmac" in *[!0-9A-Fa-f:,-]*) wmac="";; esac
 
 hdr() { echo "Content-Type: application/json"; echo ""; }
 
+# ---- 配对：新节点领取组网凭证（免鉴权，仅窗口期有效）----
+#
+# ★ 必须放在下面 token 校验**之前**。出厂/恢复出厂的节点手里根本没有回程密码，
+#   而 sync 的 token 就是回程密码 —— 它连那道门都敲不开（meshctl:1255 会在
+#   本地 key 为空时直接报"未配置同步令牌"）。所以"先有凭证还是先有连接"这个
+#   死循环只能靠一条免鉴权通道解开。
+#
+# 安全性只依赖两点：① 只有已启用组网的主节点响应；② 只在窗口期内响应。
+# 窗口关闭时配对 AP 根本不存在，固件里那份固定配对密码谁都连不上 ——
+# 所以"固定密码"本身不构成风险，风险窗口就是开窗的那几分钟。
+# 代价要说清：窗口期内任何"连得上本节点、知道固件固定密码"的设备都能领到凭证，
+# 802.11s 的 SAE 没有 ACL，主节点无法按 MAC 拒绝 —— 兜底是"得本人在现场开窗"。
+if [ "$(qs_get action)" = "join" ]; then
+	hdr
+	if [ "$(mesh_uci_getd main.enabled 0)" != 1 ] || [ "$(mesh_uci_get main.role)" != master ]; then
+		echo '{"ok":0,"error":"not_master","hint":"只有已启用组网的主节点才能发放凭证"}'
+		exit 0
+	fi
+	if ! mesh_pair_window_open; then
+		echo '{"ok":0,"error":"pair_window_closed","hint":"主节点当前没有开放加入，请先在原主节点点『开放加入』"}'
+		exit 0
+	fi
+	j_id=$(mesh_uci_get main.mesh_id)
+	j_key=$(mesh_uci_get main.mesh_key)
+	j_enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
+	j_band=$(mesh_uci_getd main.band auto)
+	j_ch=$(mesh_uci_getd main.channel '')
+	[ -n "$j_ch" ] || j_ch=$(mesh_default_channel "$j_band")
+	j_rb=$(mesh_resolve_backhaul_band "$j_band")
+	[ -n "$j_rb" ] && j_band="$j_rb"
+	j_mmac=$(mesh_primary_mac)
+	j_remain=$(mesh_pair_remain)
+	mesh_pair_joined_add "$(printf '%s' "$mac" | tr 'a-f' 'A-F')"
+	mesh_log info "配对：${mac:--} 领取了组网凭证（来源 ${peer_ip:--}）"
+	printf '{"ok":1,"mesh":{"id":"%s","key":"%s","enc":"%s","band":"%s","channel":"%s"},"master":{"mac":"%s","hostname":"%s"},"pair":{"remain":%s}}\n' \
+		"$(mesh_esc "$j_id")" "$(mesh_esc "$j_key")" "$j_enc" "$j_band" "$j_ch" \
+		"$(mesh_esc "$j_mmac")" "$(mesh_esc "$(mesh_hostname)")" "$j_remain"
+	exit 0
+fi
+
 # ---- 基本校验 ----
 # 原来三种完全不同的情况都返回同一个 not_master：没启用、没配角色、配成了子节点。
 # 排查时除了"我不是主节点吗"之外得不到任何信息 —— 真机踩到过（2026-10-02）：

@@ -1,6 +1,7 @@
 #!/bin/sh
 # meshctl - luci-app-mesh 主控制器
-# 用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging>
+# 用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging
+#                |pair-open|pair-close|pair-status|pair-join>
 . /usr/libexec/mesh/functions.sh
 
 JF=$(command -v jsonfilter || echo /usr/bin/jsonfilter)
@@ -1362,11 +1363,23 @@ cmd_sync_once() {
 
 # ================= 守护进程 =================
 cmd_daemon() {
-	local n fail
+	local n fail pexp
 	n=0; fail=0
 	mesh_log info "守护进程启动"
 	while :; do
 		rollback_check 2>/dev/null
+		# 配对窗口到期检查。放在守护进程里而不是"开窗时起一个 sleep N 的后台进程"：
+		#   ① 后台 sleep 进程会**残留** —— 连续开窗时，上一轮那个仍然活着，
+		#      到点就把新开的窗口关掉（实测踩到过，看起来像"刚开就自己关了"）；
+		#   ② 守护进程每 10 秒过一遍，进程被杀/重启都不影响，语义也更干净。
+		# 与回滚窗口（rollback_check）同一套路。expire 记的是"到期时刻"，0 = 常开。
+		if [ "$(mesh_uci_getd main.role master)" = master ]; then
+			pexp=$(cat "$(mesh_pair_expire_file)" 2>/dev/null)
+			if [ -n "$pexp" ] && [ "$pexp" != 0 ] && [ "$(date +%s)" -ge "$pexp" ] 2>/dev/null; then
+				mesh_log info "配对：窗口到期，自动关闭加入"
+				cmd_pair_close >/dev/null 2>&1
+			fi
+		fi
 		# 无线回程口 MTU 的周期收敛：只读比对，仅在确实不一致时才下发内核。
 		# 替代了原来 apply 里那个游离的 `( sleep 15; ... ) &` 后台进程 ——
 		# 无线接口 up 的时机不确定，事件驱动的 hotplug 可能扑空，这里再兜一层。
@@ -1504,6 +1517,250 @@ cmd_port_bridging() {
 	mesh_all_ports_in_lan && echo "所有内网端口与 bat0 均已并入 br-lan" || echo "部分端口或 bat0 未能并入，请检查网络配置"
 }
 
+# ================= 配对：主节点开放加入窗口 =================
+# 用法: meshctl pair-open [秒数]   （省略则用 mesh.main.pair_window，默认 600；0 = 常开）
+# 开窗 = 临时起一个配对 AP（固件固定的 SSID/密码，桥在 lan 上）+ 到点自动撤掉。
+# 子节点会通过现有的 AP 镜像机制自动跟着广播同一个配对信号 —— 这是刻意保留的行为：
+# 新节点可以连信号最好的那个节点，凭证请求经 bat0 二层域照样回到主节点。
+cmd_pair_open() {
+	local secs="${1:-}" radio
+	if [ "$(mesh_uci_getd main.enabled 0)" != 1 ]; then
+		echo "错误：本节点未启用 Mesh 组网"; return 1
+	fi
+	if [ "$(mesh_uci_get main.role)" != master ]; then
+		echo "错误：只有主节点能开放加入（本节点角色：$(mesh_uci_get main.role)）"; return 1
+	fi
+	[ -n "$secs" ] || secs=$(mesh_pair_window_default)
+	case "$secs" in ''|*[!0-9]*) secs=600;; esac
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	mkdir -p "$MESH_STATE_DIR"
+	rm -f "$(mesh_pair_joined_file)"
+	mesh_pair_ap_add || { mesh_unlock; echo "错误：创建配对 AP 失败（没有可用射频？）"; return 1; }
+	radio=$(cat "$MESH_STATE_DIR/pair-radio" 2>/dev/null)
+	# 窗口到期由守护进程 cmd_daemon 每 10 秒检查并关闭（见那里的注释：
+	# 一次性 sleep 后台进程会残留，连续开窗时误关新窗口）。
+	if [ "$secs" -gt 0 ]; then
+		echo $(($(date +%s) + secs)) > "$(mesh_pair_expire_file)"
+	else
+		echo 0 > "$(mesh_pair_expire_file)"   # 常开
+	fi
+	mesh_unlock
+	# wifi reload 放后台：实测新增一个 AP 段走的是 hostapd 软重载、0 丢包，
+	# 但耗时仍有十几秒，同步等会把 rpcd 的连接拖超时
+	nohup sh -c "wifi reload >>$MESH_LOG 2>&1" >/dev/null 2>&1 &
+	mesh_log info "配对：开放加入 ${secs}s（SSID=$(mesh_pair_ssid) @ ${radio:-?}）"
+	echo "已开放加入："
+	echo "  配对 SSID = $(mesh_pair_ssid)"
+	echo "  所在射频  = ${radio:-?}"
+	echo "  窗口时长  = ${secs} 秒（0 = 常开）"
+	echo "无线重载在后台执行，约 10~20 秒后生效；用 meshctl pair-status 查看状态。"
+	return 0
+}
+
+cmd_pair_close() {
+	if [ "$(mesh_uci_get main.role)" != master ]; then
+		echo "错误：只有主节点需要关窗（本节点角色：$(mesh_uci_get main.role)）"; return 1
+	fi
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	mesh_pair_ap_del
+	nohup sh -c "wifi reload >>$MESH_LOG 2>&1" >/dev/null 2>&1 &
+	mesh_unlock
+	mesh_log info "配对：关闭加入窗口"
+	echo "已关闭加入窗口，配对 AP 已移除。"
+	echo "子节点上镜像出去的配对信号会在下一轮同步（10 秒内）自动清除。"
+	return 0
+}
+
+cmd_pair_status() {
+	local open=0 remain joined radio
+	mesh_pair_window_open && open=1
+	remain=$(mesh_pair_remain)
+	joined=$(mesh_pair_joined_count)
+	radio=$(cat "$MESH_STATE_DIR/pair-radio" 2>/dev/null)
+	echo "role=$(mesh_uci_get main.role)"
+	echo "open=$open"
+	echo "remain=$remain"        # -1 = 常开, 0 = 未开
+	echo "joined=$joined"
+	echo "ssid=$(mesh_pair_ssid)"
+	echo "radio=${radio:--}"
+}
+
+# ================= 配对：子节点领取凭证 =================
+# 用法: meshctl pair-join [--apply]
+# 出厂/重置的子节点手里没有任何凭证（sync 的 token 就是回程密码，它进不去那道门），
+# 所以这里临时起一个 STA 连配对 AP，从免鉴权的 action=join 领回 mesh_id + 回程密码，
+# 落盘后拆掉 STA。默认**不自动 apply** —— 改网络配置是不可逆动作，交给用户显式触发。
+#
+# 窗口没开时不会立刻失败，而是轮询等待（默认 5 分钟，每 10 秒试一次）：
+# 用户可以在子节点上先按，再走去开主节点的窗，不用记"必须先主后子"。
+cmd_pair_join() {
+	local do_apply=0 role radio ssid key stasec old_ch pch
+	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch
+	[ "$1" = "--apply" ] && do_apply=1
+
+	role=$(mesh_uci_get main.role)
+	[ "$role" = client ] || { echo "错误：只有子节点需要加入网络（当前角色：${role:-未设置}）"; return 1; }
+	maxwait=$(mesh_uci_getd main.pair_wait 300)
+	case "$maxwait" in ''|*[!0-9]*) maxwait=300;; esac
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+
+	radio=$(mesh_pair_radio)
+	ssid=$(mesh_pair_ssid)
+	key=$(mesh_pair_key)
+	if [ -z "$radio" ]; then mesh_unlock; echo "错误：找不到可用射频"; return 1; fi
+	mymac=$(mesh_primary_mac)
+
+	echo "[1/4] 启用配对连接：$ssid @ $radio"
+	# ★ 先把射频对齐到配对信号的信道：同一 phy 上所有接口共享一个信道，
+	#   STA 无法独自跳频（实测不同信道时永远关联不上，见 mesh_pair_scan_channel 注释）
+	old_ch=$(uci -q get "wireless.$radio.channel" 2>/dev/null)
+	pch=$(mesh_pair_scan_channel "$radio" "$ssid" 2>/dev/null)
+	if [ -n "$pch" ] && [ "$pch" != "$old_ch" ]; then
+		echo "      配对信号在信道 $pch，把 $radio 从 ${old_ch:-auto} 临时切到 $pch"
+		uci set "wireless.$radio.channel=$pch"
+	fi
+	uci set "network.$MESH_PAIR_NET=interface"
+	uci set "network.$MESH_PAIR_NET.proto=dhcp"
+	# defaultroute=0 是必须的： STA 拿到的默认路由会顶掉回程那条（真机实测踩过，
+	# 结果是 default 变成 dev phy0-sta0，子节点整个走配对链路出网）
+	uci set "network.$MESH_PAIR_NET.defaultroute=0"
+	uci set "network.$MESH_PAIR_NET.peerdns=0"
+	uci commit network
+	stasec=$(uci add wireless wifi-iface)
+	uci set "wireless.$stasec.device=$radio"
+	uci set "wireless.$stasec.mode=sta"
+	uci set "wireless.$stasec.ssid=$ssid"
+	uci set "wireless.$stasec.encryption=psk2"
+	uci set "wireless.$stasec.key=$key"
+	uci set "wireless.$stasec.network=$MESH_PAIR_NET"
+	uci set "wireless.$stasec.ifname=$MESH_PAIR_STA_IFNAME"
+	uci set "wireless.$stasec.disabled=0"
+	uci commit wireless
+
+	echo "[2/4] 重载无线与网络（约 20 秒，配对期间回程不受影响）"
+	ubus call network reload >/dev/null 2>&1
+	wifi reload >>"$MESH_LOG" 2>&1
+
+	# 等 IP：配对 AP 桥在主节点的 lan 上，拿到地址就意味着二层/三层都通了。
+	# 预算给到 90 秒 —— 实测 wifi reload 后 STA 关联 + DHCP 往返常常要 30~60 秒，
+	# 早期版本只等 40 秒，结果明明连上了却报"连不上配对信号"。
+	# 显式 ifup 一次：新加的 interface 偶尔不会被 netifd 自动拉起（实测同样的配置
+	# 有时 3 秒就拿到地址、有时一直停在 NO_DEVICE），这里主动踢一脚。
+	sleep 3
+	ifup "$MESH_PAIR_NET" >/dev/null 2>&1
+	ip=""
+	c=0
+	while [ "$c" -lt 45 ]; do
+		# ★ jsonfilter 表达式里带连字符的键必须写成 ['ipv4-address'] 形式。
+		#   写成 @.ipv4-address[0].address 会报 "Syntax error: Invalid escape sequence"
+		#   且**静默返回空**（不加 2>/dev/null 才看得到那行报错）—— 早期版本就是栽在这里：
+		#   接口明明已经 up 了，脚本却一直以为没拿到地址。
+		ip=$(ubus call "network.interface.$MESH_PAIR_NET" status 2>/dev/null \
+			| "$JF" -e "@['ipv4-address'][0]['address']" 2>/dev/null)
+		[ -n "$ip" ] && break
+		# 每 20 秒再踢一次，覆盖"STA 关联比 netifd 晚"的情况
+		[ $((c % 10)) = 0 ] && ifup "$MESH_PAIR_NET" >/dev/null 2>&1
+		c=$((c + 1)); sleep 2
+	done
+	if [ -z "$ip" ]; then
+		lnk=$(iw dev "$MESH_PAIR_STA_IFNAME" link 2>&1 | head -n2 | tr '\n' ' ')
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_unlock
+		echo "错误：配对连接没拿到地址（已等待 90 秒）—— 请确认主节点已开放加入、且本节点在信号范围内"
+		echo "      关联状态：$lnk"
+		return 1
+	fi
+	echo "      已拿到地址 $ip"
+
+	echo "[3/4] 领取组网凭证（最多等待 $maxwait 秒）"
+	# 主节点地址候选：UCI 指定 → 本接口学到的网关 → 同网段 .1 → 192.168.1.1
+	cand=""
+	[ -n "$(mesh_uci_get main.master_addr)" ] && cand="$(mesh_uci_get main.master_addr)"
+	gw=$(ubus call "network.interface.$MESH_PAIR_NET" status 2>/dev/null \
+		| "$JF" -e '@.route[0].nexthop' 2>/dev/null)
+	[ -n "$gw" ] && cand="$cand $gw"
+	case "$ip" in *.*.*.*) cand="$cand ${ip%.*}.1";; esac
+	cand="$cand 192.168.1.1"
+
+	out=""
+	ok=""
+	while [ "$waited" -lt "$maxwait" ]; do
+		for c in $cand; do
+			out=$(curl -s -m 6 --interface "$ip" \
+				"http://$c/cgi-bin/mesh-sync?action=join&mac=$mymac" 2>/dev/null)
+			[ -n "$out" ] || continue
+			ok=$("$JF" -s "$out" -e '@.ok' 2>/dev/null)
+			[ "$ok" = "1" ] && break
+		done
+		[ "$ok" = "1" ] && break
+		# 已等到过久就提示一次，避免用户以为卡死
+		if [ "$waited" = 0 ] || [ $((waited % 60)) = 0 ]; then
+			echo "      等待主节点开放加入… 已等待 ${waited}s（请去主节点点『开放加入』）"
+		fi
+		sleep 10; waited=$((waited + 10))
+	done
+
+	if [ "$ok" != "1" ]; then
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_unlock
+		echo "错误：等待超时仍未领到凭证（主节点未开放加入，或不在同一网络内）"
+		return 1
+	fi
+
+	id=$("$JF" -s "$out" -e '@.mesh.id'  2>/dev/null)
+	k=$("$JF" -s "$out" -e '@.mesh.key' 2>/dev/null)
+	enc=$("$JF" -s "$out" -e '@.mesh.enc' 2>/dev/null)
+	band=$("$JF" -s "$out" -e '@.mesh.band' 2>/dev/null)
+	ch=$("$JF" -s "$out" -e '@.mesh.channel' 2>/dev/null)
+	[ -n "$id" ] && [ -n "$k" ] || {
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_unlock
+		echo "错误：领到的凭证不完整（id=${id:-空} key=${k:-空}）"
+		return 1
+	}
+
+	echo "[4/4] 写入凭证并拆除配对连接"
+	uci set "mesh.main.mesh_id=$id"
+	uci set "mesh.main.mesh_key=$k"
+	[ -n "$enc" ]  && uci set "mesh.main.encryption=$enc"
+	[ -n "$band" ] && uci set "mesh.main.band=$band"
+	[ -n "$ch" ]   && uci set "mesh.main.channel=$ch"
+	uci commit mesh
+	mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+	mesh_unlock
+	echo "已领取并写入："
+	echo "  Mesh ID   = $id"
+	echo "  Mesh 密码 = $k"
+	echo "  回程      = ${band:-?} / 信道 ${ch:-?}"
+	if [ "$do_apply" = 1 ]; then
+		echo "正在应用…"
+		cmd_apply
+	else
+		echo "配对连接已拆除。执行 meshctl apply 生效（或本次改用 meshctl pair-join --apply）。"
+	fi
+	return 0
+}
+
+# 拆除临时 STA 与临时网络接口（成功失败都要走，不能留下半成品）
+mesh_pair_join_cleanup() {
+	local stasec="$1" radio="$2" old_ch="$3"
+	[ -n "$stasec" ] && uci -q delete "wireless.$stasec"
+	uci -q delete "network.$MESH_PAIR_NET"
+	# 信道还原：配对时为对齐配对信号改过，用完要还原（auto/空 -> auto）
+	if [ -n "$radio" ]; then
+		if [ -n "$old_ch" ]; then
+			uci set "wireless.$radio.channel=$old_ch"
+		else
+			uci set "wireless.$radio.channel=auto"
+		fi
+	fi
+	uci commit wireless
+	uci commit network
+	ubus call network reload >/dev/null 2>&1
+	nohup sh -c "wifi reload >>$MESH_LOG 2>&1" >/dev/null 2>&1 &
+	return 0
+}
+
 # ================= 入口 =================
 case "$1" in
 	apply)            shift; cmd_apply "$@";;
@@ -1514,8 +1771,12 @@ case "$1" in
 	revert)           cmd_revert;;
 	confirm_rollback) cmd_confirm_rollback;;
 	port_bridging)    cmd_port_bridging;;
+	pair-open)        shift; cmd_pair_open "$@";;
+	pair-close)       cmd_pair_close;;
+	pair-status)      cmd_pair_status;;
+	pair-join)        shift; cmd_pair_join "$@";;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join>"
 		exit 1
 		;;
 esac
