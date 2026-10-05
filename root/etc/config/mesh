@@ -71,8 +71,8 @@ config main 'main'
 	#     新节点，用户全程不用知道。
 	# 一般情况下这两项**不用改**：出厂同固件的设备天然用同一套配对凭证。
 	# 真要改的话，全网所有节点必须改成一样的值，否则新节点连不上配对信号。
-	option pair_ssid 'PonWrt-Pair'
-	option pair_key 'ponwrt-pair'
+	option pair_ssid 'XxMesh-Pair'
+	option pair_key 'xxmesh-pair'
 	# 开窗后自动关闭的倒计时（秒）。0 = 常开（调试用，长期开着等于一直留一扇门）。
 	# 网页上点「开放加入」时可以临时选 2/5/10/30 分钟，不必改这里。
 	option pair_window '600'

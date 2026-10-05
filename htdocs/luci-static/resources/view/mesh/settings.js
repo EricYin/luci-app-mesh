@@ -161,7 +161,7 @@ return view.extend({
 		status = status || {};
 
 		m = new form.Map('mesh', _('Mesh 组网设置'),
-			_('802.11s 无线 Mesh 组网。主节点接光猫并作为配置源；子节点自动跟随主节点的无线设置，全部物理端口并入内网。'));
+			_('802.11s 无线 Mesh 组网。主节点作为上网网关（WAN 上行）并作为配置源；子节点自动跟随主节点的无线设置，全部物理端口并入内网。'));
 
 		/* ================= 一步组网 ================= */
 		s = m.section(form.NamedSection, 'main', 'main', _('一步组网'));
@@ -172,14 +172,14 @@ return view.extend({
 		o.default = o.disabled;
 
 	o = s.option(form.ListValue, 'role', _('本节点角色'));
-	o.value('master', _('主节点(接光猫 · 配置源)'));
+	o.value('master', _('主节点(上网网关 · 配置源)'));
 	o.value('client', _('子节点(全端口内网 · 跟随主节点)'));
 	o.default = 'master';
 	/* rmempty=false 是必须的，不是可选项 —— 见文件头 ensureKeyOptions 的说明：
 	   rmempty 为真时，只要下拉框停在 default 上，LuCI 保存时会把这个键从 UCI
 	   里**删除**，等于用户"什么都没改"却被抹掉了出厂默认值。 */
 	o.rmempty = false;
-		o.description = _('主节点：接光猫并作为配置源，终端 Wi-Fi 在「网络 → 无线」里设置；'
+		o.description = _('主节点：作为上网网关（WAN 上行）并作为配置源，终端 Wi-Fi 在「网络 → 无线」里设置；'
 			+ '子节点：自动采用主节点的无线设置（SSID/密码/802.11r），每 10 秒核对一次，'
 			+ '全部物理端口(WAN/LAN)都将并入内网 br-lan，并关闭本机 DHCP 服务。');
 
@@ -401,13 +401,13 @@ return view.extend({
 			+ '给得宽是刻意的：通常是先在子节点上按、再走去开主节点的窗，顺序不该成为负担。');
 
 		o = s.option(form.Value, 'pair_ssid', _('配对信号名称 (SSID)'));
-		o.placeholder = 'PonWrt-Pair';
+		o.placeholder = 'XxMesh-Pair';
 		o.datatype = 'maxlength(32)';
 		o.description = _('新节点临时连入用的信号名。与回程用的 Mesh ID 无关，最长 32 字符。');
 
 		o = s.option(form.Value, 'pair_key', _('配对密码'));
 		o.password = true;
-		o.placeholder = 'ponwrt-pair';
+		o.placeholder = 'xxmesh-pair';
 		o.datatype = 'minlength(8)';
 		o.description = _('配对信号的密码，至少 8 位。它**不是**回程密码，公开也无妨 ——'
 			+ '窗口关闭时配对信号根本不存在，这串密码只在开窗的那几分钟里有意义。'

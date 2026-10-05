@@ -168,7 +168,7 @@ function topo(d) {
 
 	if (!peers.length)
 		parts.push('<text x="%d" y="%d" text-anchor="middle" fill="#999" font-size="12">%s</text>'
-			.format(cx, cy + 70, _('暂无已连接邻居')));
+			.format(cx, cy + 70, _('暂无已连接节点')));
 
 	/* 用 div.innerHTML 承载完整 <svg> 字符串：HTML 解析器会把 svg 及其子元素放进
 	   SVG 命名空间，比 E('svg') + innerHTML 更可靠（各浏览器对 createElement('svg')
@@ -235,13 +235,13 @@ function batCell(p) {
 	]);
 }
 
-/* ---------- 邻居表 ---------- */
+/* ---------- 节点表 ---------- */
 function peersTable(d) {
 	var list = (d.peers && d.peers.list) ? d.peers.list : [];
 	var hasBat = list.some(function (p) { return p.bat && p.bat.tq != null; });
 
 	var heads = [
-		E('th', {}, _('邻居节点')),
+		E('th', {}, _('节点')),
 		E('th', {}, _('链路')),
 		E('th', {}, _('信号 / 速率')),
 		E('th', {}, _('地址'))
@@ -253,7 +253,7 @@ function peersTable(d) {
 
 	if (!list.length)
 		return E('div', {}, [
-			E('div', { 'class': 'mesh-table-empty' }, _('暂无已连接的邻居节点'))
+			E('div', { 'class': 'mesh-table-empty' }, _('暂无已连接的节点'))
 		]);
 
 	list.forEach(function (p) {
@@ -520,7 +520,7 @@ function pairSection(d) {
 	if (p.open == 1) {
 		var cards = E('div', { 'class': 'mesh-cards' }, [
 			card(_('配对信号 (SSID)'), p.ssid || '-'),
-			card(_('配对密码'), p.key || 'ponwrt-pair'),
+			card(_('配对密码'), p.key || 'xxmesh-pair'),
 			card(_('所在射频'), p.radio || '-'),
 			card(_('本轮已加入'), '%s %s'.format(p.joined || 0, _('台')))
 		]);
@@ -636,7 +636,7 @@ return view.extend({
 		var isClient = d.role === 'client';
 		var pr = d.peers || {};
 		var nConn = pr.connected || 0;
-		/* 邻居卡片：一台设备同时走无线+有线只算一个节点 */
+		/* 节点卡片：一台设备同时走无线+有线只算一个节点 */
 		var cardVal = nConn + (nConn ? ' (%s %s / %s %s)'.format(pr.wifi || 0, _('无线'), pr.eth || 0, _('有线')) : '');
 		var cards = E('div', { 'class': 'mesh-cards' }, [
 			card(_('Mesh 状态'), on ? _('已启用') : _('未启用'), on ? '#37c837' : '#999'),
@@ -644,11 +644,11 @@ return view.extend({
 			   不要显示成"未设置"以外的假值，也不要替用户猜测。 */
 			card(_('Mesh ID'), d.mesh_id
 				|| (isClient ? _('未设置（从主节点获取）') : _('未设置（应用后按 MAC 自动派生）'))),
-			card(_('已连接邻居'), cardVal, nConn > 0 ? '#37c837' : null),
+			card(_('已连接节点'), cardVal, nConn > 0 ? '#37c837' : null),
 			card(_('路径选择'), batmanText(d), (d.batman && d.batman.enabled == 1) ? '#37c837' : null),
 			card(_('本机角色'), d.role_set === 0
 				? _('未选择')
-				: (isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(接光猫 · 配置源)')),
+				: (isClient ? _('子节点(全端口内网 · 跟随主节点)') : _('主节点(上网网关 · 配置源)')),
 				d.role_set === 0 ? '#e24b4a' : null),
 			card(_('本机地址'), d.lan_ip),
 			card(_('地址获取'),
@@ -695,7 +695,7 @@ return view.extend({
 			section(_('运行状态'), cards),
 			pairSec,
 			section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),
-			section(_('邻居节点'), peersTable(d))
+			section(_('节点列表'), peersTable(d))
 		]);
 	}
 });

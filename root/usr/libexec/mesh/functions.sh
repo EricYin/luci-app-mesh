@@ -1124,8 +1124,8 @@ mesh_default_max_peers() { echo 8; }
 #   ③ 配对 AP 打 mesh_pair=1 标记：主节点 ap_json() 目前会把所有 mode=ap 段镜像
 #      给子节点（这正是"所有节点都广播配对信号"的实现方式），标记用于本地识别。
 #      注意标记**不会**随下发传过去 —— 子节点那边看到的就是一个普通 AP。
-MESH_PAIR_SSID_DEFAULT='PonWrt-Pair'
-MESH_PAIR_KEY_DEFAULT='ponwrt-pair'
+MESH_PAIR_SSID_DEFAULT='XxMesh-Pair'
+MESH_PAIR_KEY_DEFAULT='xxmesh-pair'
 MESH_PAIR_IFNAME='pair0'
 MESH_PAIR_STA_IFNAME='pairsta0'
 MESH_PAIR_NET='pair'
