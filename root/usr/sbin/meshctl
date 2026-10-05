@@ -1693,7 +1693,7 @@ cmd_pair_status() {
 # 用户可以在子节点上先按，再走去开主节点的窗，不用记"必须先主后子"。
 cmd_pair_join() {
 	local do_apply=0 role radio ssid key stasec old_ch pch
-	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch
+	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch sta_dev rpf_old
 	[ "$1" = "--apply" ] && do_apply=1
 
 	role=$(mesh_uci_get main.role)
@@ -1762,7 +1762,7 @@ cmd_pair_join() {
 	done
 	if [ -z "$ip" ]; then
 		lnk=$(iw dev "$MESH_PAIR_STA_IFNAME" link 2>&1 | head -n2 | tr '\n' ' ')
-		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "" "$rpf_old"
 		mesh_unlock
 		echo "错误：配对连接没拿到地址（已等待 90 秒）—— 请确认主节点已开放加入、且本节点在信号范围内"
 		echo "      关联状态：$lnk"
@@ -1771,6 +1771,22 @@ cmd_pair_join() {
 	echo "      已拿到地址 $ip"
 
 	echo "[3/4] 领取组网凭证（最多等待 $maxwait 秒）"
+	# ★★ 出口设备必须"问"出来，不能写死（r33）。
+	#   wifi-iface 里那句 ifname=pairsta0 只是**请求**，实际叫什么由 wifi-scripts
+	#   决定（可能是 phy0-sta0）。名字一旦对不上，下面钉路由就是
+	#   "Cannot find device" 静默失败（被 2>/dev/null 吞掉），curl 于是照旧从
+	#   br-lan 出去 —— 表现就是"配对信号连上了、地址也拿到了，却一次凭证都领不到"。
+	#   .219 连续两次卡满 300 秒就是这么来的（r32 只钉路由、设备名写死，没治到根）。
+	#   三级兜底：netifd 报的 device → l3_device → 扫 ip link 找 *staN → 旧常量。
+	sta_dev=$(ubus call "network.interface.$MESH_PAIR_NET" status 2>/dev/null \
+		| "$JF" -e '@.device' 2>/dev/null)
+	[ -n "$sta_dev" ] || sta_dev=$(ubus call "network.interface.$MESH_PAIR_NET" status 2>/dev/null \
+		| "$JF" -e '@.l3_device' 2>/dev/null)
+	[ -n "$sta_dev" ] || sta_dev=$(ip -o link show 2>/dev/null \
+		| awk -F': ' '$2 ~ /sta[0-9]+$/ {print $2; exit}')
+	[ -n "$sta_dev" ] || sta_dev="$MESH_PAIR_STA_IFNAME"
+	echo "      配对网卡：$sta_dev（$ip）"
+
 	# 主节点地址候选：UCI 指定 → 本接口学到的网关 → 同网段 .1 → 192.168.1.1
 	cand=""
 	[ -n "$(mesh_uci_get main.master_addr)" ] && cand="$(mesh_uci_get main.master_addr)"
@@ -1790,15 +1806,28 @@ cmd_pair_join() {
 	#   DHCP 租约都看得见，却一次凭证都领不到"，一直耗到 pair_wait 超时。
 	#   这里给每个候选地址钉一条走 STA 的 /32 主机路由，把出口钉死。
 	for c in $cand; do
-		ip route replace "$c" dev "$MESH_PAIR_STA_IFNAME" src "$ip" >/dev/null 2>&1
+		ip route replace "$c" dev "$sta_dev" src "$ip" >/dev/null 2>&1
 	done
+	# rp_filter（反向路径校验）在同一个坑里还会再补一刀：主节点的回包从 $sta_dev
+	# 进来，而内核算"去 192.168.1.1"的反向路径是 br-lan → 不匹配 → 整包被丢。
+	# 配对期间临时关掉（用完在 cleanup 里按原值还原）。
+	rpf_old=$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null)
+	echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
+	echo 0 > "/proc/sys/net/ipv4/conf/$sta_dev/rp_filter" 2>/dev/null
+
 	echo "      领取出口：$(ip route get "$(echo "$cand" | awk '{print $NF}')" 2>/dev/null | head -n1 | sed 's/ cache//')"
 
 	out=""
 	ok=""
 	while [ "$waited" -lt "$maxwait" ]; do
 		for c in $cand; do
-			out=$(curl -s -m 6 --interface "$ip" \
+			# ★ 直接把 socket 绑到设备上（SO_BINDTODEVICE）：它会把路由查找也
+			#   限制在这张网卡上，比"绑源地址 + 钉一条主机路由"硬得多 ——
+			#   后者只要设备名对不上就全废，前者不依赖名字之外的任何东西。
+			out=$(curl -s -m 6 --interface "$sta_dev" \
+				"http://$c/cgi-bin/mesh-sync?action=join&mac=$mymac" 2>/dev/null)
+			# 个别 curl 构建不支持绑设备名，退回绑源地址（r32 的老写法）
+			[ -n "$out" ] || out=$(curl -s -m 6 --interface "$ip" \
 				"http://$c/cgi-bin/mesh-sync?action=join&mac=$mymac" 2>/dev/null)
 			[ -n "$out" ] || continue
 			ok=$("$JF" -s "$out" -e '@.ok' 2>/dev/null)
@@ -1813,11 +1842,12 @@ cmd_pair_join() {
 	done
 
 	if [ "$ok" != "1" ]; then
-		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 		mesh_unlock
 		echo "错误：等待超时仍未领到凭证（主节点未开放加入，或不在同一网络内）"
+		echo "      本次配对网卡=$sta_dev 本机配对地址=$ip"
 		echo "      若配对信号明明连上了、地址也拿到了：多半是本机内网与配对链路撞在同一个子网"
-		echo "      （两边都是 192.168.1.0/24），报文走了错误的出口。r32 已钉主机路由；"
+		echo "      （两边都是 192.168.1.0/24），报文走了错误的出口。r33 已改成绑设备发送；"
 		echo "      临时绕开可把本机内网改成其它网段（如 192.168.9.1）再试。"
 		return 1
 	fi
@@ -1828,7 +1858,7 @@ cmd_pair_join() {
 	band=$("$JF" -s "$out" -e '@.mesh.band' 2>/dev/null)
 	ch=$("$JF" -s "$out" -e '@.mesh.channel' 2>/dev/null)
 	[ -n "$id" ] && [ -n "$k" ] || {
-		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 		mesh_unlock
 		echo "错误：领到的凭证不完整（id=${id:-空} key=${k:-空}）"
 		return 1
@@ -1841,7 +1871,7 @@ cmd_pair_join() {
 	[ -n "$band" ] && uci set "mesh.main.band=$band"
 	[ -n "$ch" ]   && uci set "mesh.main.channel=$ch"
 	uci commit mesh
-	mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
+	mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 	mesh_unlock
 	echo "已领取并写入："
 	echo "  Mesh ID   = $id"
@@ -1858,14 +1888,17 @@ cmd_pair_join() {
 
 # 拆除临时 STA 与临时网络接口（成功失败都要走，不能留下半成品）
 mesh_pair_join_cleanup() {
-	local stasec="$1" radio="$2" old_ch="$3" r
+	local stasec="$1" radio="$2" old_ch="$3" sta_dev="${4:-}" rpf_old="${5:-}" r
 	[ -n "$stasec" ] && uci -q delete "wireless.$stasec"
 	uci -q delete "network.$MESH_PAIR_NET"
+	[ -n "$sta_dev" ] || sta_dev="$MESH_PAIR_STA_IFNAME"
 	# 撤掉 [3/4] 钉的主机路由：接口马上就要消失，留着会变成永远不通的死路由。
 	# 只删不带前缀的（/32 主机路由），接口自己的子网路由留给 netifd 随接口一起撤。
-	for r in $(ip route show dev "$MESH_PAIR_STA_IFNAME" 2>/dev/null | awk '$1 !~ /\// {print $1}'); do
-		ip route del "$r" dev "$MESH_PAIR_STA_IFNAME" >/dev/null 2>&1
+	for r in $(ip route show dev "$sta_dev" 2>/dev/null | awk '$1 !~ /\// {print $1}'); do
+		ip route del "$r" dev "$sta_dev" >/dev/null 2>&1
 	done
+	# rp_filter 还原成配对前的值（[3/4] 里临时关掉的）
+	[ -n "$rpf_old" ] && echo "$rpf_old" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
 	# 信道还原：配对时为对齐配对信号改过，用完要还原（auto/空 -> auto）
 	if [ -n "$radio" ]; then
 		if [ -n "$old_ch" ]; then

@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r32`（`PKG_RELEASE` 31）
+- 当前版本：`1.0.0-r33`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r32.apk
-opkg install luci-app-mesh_1.0.0-r32_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r33.apk
+opkg install luci-app-mesh_1.0.0-r33_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -338,6 +338,17 @@ sh install.sh
   内核有两条同前缀直连路由，去 `192.168.1.1` 的报文挑了先起来的 br-lan，
   而 br-lan 那一侧根本没有通往主节点的链路。`curl --interface` 只 bind 源地址、
   **不改出口设备**，所以主节点一个包都收不到，页面表现就是一直在"等待主节点开放加入"。
-- **修法**：`[3/4]` 领取凭证前，给每个候选主节点地址钉一条走 STA 的 `/32` 主机路由
-  （`ip route replace <master> dev <sta> src <ip>`），出口钉死；cleanup 时逐条撤掉。
-  同时打印"领取出口"一行，超时错误也补上了这条排查提示。
+- **修法（r32，不够）**：给每个候选主节点地址钉一条走 STA 的 `/32` 主机路由
+  （`ip route replace <master> dev <sta> src <ip>`）。真机复测**仍然失败**——
+  因为设备名 `pairsta0` 是 wifi-iface 里的 `ifname`，只是**请求**，实际叫什么由
+  wifi-scripts 决定；名字对不上时 `ip route replace` 报 "Cannot find device"
+  又被 `2>/dev/null` 吞掉，等于什么都没做。
+- **r33（真正的修法）**：
+  1. 出口设备运行时解析：netifd `device` → `l3_device` → `ip -o link` 扫 `*staN`
+     → 旧常量兜底，并打印"配对网卡"一行；
+  2. `curl --interface <设备名>`（SO_BINDTODEVICE）—— 把路由查找也限制在这张网卡上，
+     不再依赖主机路由；
+  3. 配对期间临时关 `rp_filter`（回包从 STA 进来、反向路径算到 br-lan 会被丢），
+     cleanup 按原值还原；
+  4. 绑设备名拿不到响应时退回绑源地址（老写法），双保险。
+
