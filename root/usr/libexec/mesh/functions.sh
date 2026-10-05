@@ -1402,6 +1402,206 @@ mesh_resolve_backhaul_band() {
 	done
 }
 
+# ---------------- 按键（WPS 键时长分档）与 LED 反馈 ----------------
+# 实现方式：**不备份、不覆盖任何系统文件** —— /etc/rc.button/wps 是个分发器
+# （遍历 /etc/rc.wps/*，返回 0 即 break），我们只放一个 /etc/rc.wps/10-mesh。
+# 代价是只能在 released（松手）时被调到，$SEEN 是按住秒数，因此**按住期间没有
+# 渐进提示**，LED 只做"松手后"的结果反馈（收不到 pressed，不是不想做）。
+
+MESH_LED_DIR="${MESH_LED_DIR:-/sys/class/leds}"
+MESH_BTN_LAST="${MESH_BTN_LAST:-$MESH_TMP_DIR/button-last}"
+MESH_BTN_PENDING="${MESH_BTN_PENDING:-$MESH_TMP_DIR/button-pending-exit}"
+MESH_BTN_CANCEL="${MESH_BTN_CANCEL:-$MESH_TMP_DIR/button-cancel-exit}"
+MESH_LED_TOKEN="${MESH_LED_TOKEN:-$MESH_TMP_DIR/led-token}"
+
+mesh_button_last_file()   { echo "$MESH_BTN_LAST"; }
+mesh_button_pending_file(){ echo "$MESH_BTN_PENDING"; }
+mesh_button_cancel_file() { echo "$MESH_BTN_CANCEL"; }
+
+# 总开关：关掉时 rc.wps 脚本 exit 1 让位给系统自带的 WPS
+mesh_button_enabled() { [ "$(mesh_uci_getd main.button 1)" != "0" ]; }
+
+# 档位数值全部 UCI 可配，改数值不用重编固件。
+# 出厂默认：加入 ≤4s / 开窗 5~9s / 空档 10~13s / 退出 14~20s / >20s 忽略。
+mesh_btn_num() {
+	local v
+	v=$(mesh_uci_getd "main.$1" "$2")
+	case "$v" in ''|*[!0-9]*) v="$2";; esac
+	echo "$v"
+}
+mesh_btn_join_max() { mesh_btn_num btn_join_max 4; }
+mesh_btn_open_min() { mesh_btn_num btn_open_min 5; }
+mesh_btn_open_max() { mesh_btn_num btn_open_max 9; }
+mesh_btn_exit_min() { mesh_btn_num btn_exit_min 14; }
+mesh_btn_exit_max() { mesh_btn_num btn_exit_max 20; }
+mesh_btn_exit_grace() { mesh_btn_num btn_exit_grace 10; }
+
+# SEEN → 档位：join / open / idle(空档) / exit / none(超长忽略)
+mesh_button_classify() {
+	local seen="${1:-0}" jmax omin omax emin emax
+	case "$seen" in ''|*[!0-9]*) seen=0;; esac
+	jmax=$(mesh_btn_join_max); omin=$(mesh_btn_open_min); omax=$(mesh_btn_open_max)
+	emin=$(mesh_btn_exit_min); emax=$(mesh_btn_exit_max)
+	if [ "$seen" -le "$jmax" ]; then echo join; return; fi
+	if [ "$seen" -ge "$omin" ] && [ "$seen" -le "$omax" ]; then echo open; return; fi
+	if [ "$seen" -ge "$emin" ] && [ "$seen" -le "$emax" ]; then echo exit; return; fi
+	# 开窗档与退出档之间刻意留的空档：人手按不准整数秒，从"想开窗"滑到
+	# "退出组网"的代价太大，这一段什么都不做。
+	if [ "$seen" -gt "$jmax" ] && [ "$seen" -lt "$emin" ]; then echo idle; return; fi
+	echo none
+}
+
+# 记录本次按键结果（网页状态页据此显示"本次由按键触发"）
+mesh_button_last() {  # $1=op $2=seen $3=code $4=msg
+	mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+	{
+		echo "op=$1"
+		echo "seen=${2:-0}"
+		echo "code=${3:-0}"
+		echo "time=$(date +%s)"
+		echo "msg=$(printf '%s' "${4:-}" | tr '\n' ' ')"
+	} > "$MESH_BTN_LAST" 2>/dev/null
+}
+
+# 退出组网的反悔窗口：pending 文件存 deadline，cancel 文件是"用户按了第二下"
+mesh_button_exit_pending() {
+	local f deadline now
+	f=$(mesh_button_pending_file)
+	[ -f "$f" ] || return 1
+	deadline=$(cat "$f" 2>/dev/null); now=$(date +%s)
+	case "$deadline" in ''|*[!0-9]*) rm -f "$f"; return 1;; esac
+	[ "$now" -lt "$deadline" ] || { rm -f "$f" "$MESH_BTN_CANCEL"; return 1; }
+	return 0
+}
+mesh_button_exit_cancel() {
+	: > "$(mesh_button_cancel_file)" 2>/dev/null
+	mesh_log info "按键：取消退出组网（反悔窗口内再次按下）"
+}
+
+# ---------------- LED ----------------
+# 选灯：UCI mesh.main.button_led 指定优先，否则按 phone → wlan → power 回退
+# （这三台会选中完全空闲的 blue:phone；blue:wlan 的 trigger 是 phy0radio，
+#  闪它会盖掉真实的射频状态，所以排在后面；都没有才用第一个找到的灯）。
+mesh_led_pick() {
+	local d="${MESH_LED_DIR}" want led last=""
+	[ -d "$d" ] || return 1
+	want=$(mesh_uci_get main.button_led)
+	if [ -n "$want" ] && [ -d "$d/$want" ]; then echo "$want"; return 0; fi
+	for pat in phone wlan power; do
+		for led in "$d"/*; do
+			[ -d "$led" ] || continue
+			case "${led##*/}" in *"$pat"*) echo "${led##*/}"; return 0;; esac
+		done
+	done
+	for led in "$d"/*; do [ -d "$led" ] && last="${led##*/}"; done
+	[ -n "$led$last" ] && echo "$last"
+}
+
+# 危险操作（被拒绝 / 退出前的反悔窗口）用红灯，颜色本身就是信号
+mesh_led_pick_danger() {
+	local d="${MESH_LED_DIR}" led
+	[ -d "$d" ] || return 1
+	for led in "$d"/red*; do
+		[ -d "$led" ] || continue
+		echo "${led##*/}"; return 0
+	done
+	mesh_led_pick
+}
+
+mesh_led_orig_trigger() {  # trigger 文件里形如 "[none] timer ..."，取方括号里那个
+	local f="${MESH_LED_DIR}/$1/trigger" t=""
+	[ -r "$f" ] || return 1
+	t=$(tr ' ' '\n' < "$f" 2>/dev/null | sed -n 's/^\[\(.*\)\]$/\1/p' | head -n1)
+	[ -n "$t" ] && echo "$t"
+}
+
+mesh_led_save() {  # 记下原 trigger，动作结束要还原（只记一次，已有不覆盖）
+	local led="$1" f t
+	[ -n "$led" ] || return 1
+	f="$MESH_TMP_DIR/led-orig.$led"
+	[ -s "$f" ] && return 0
+	t=$(mesh_led_orig_trigger "$led")
+	[ -n "$t" ] || t=none
+	mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+	echo "$t" > "$f" 2>/dev/null
+}
+
+# 闪烁循环靠 token 判定自己是否"过时"：换 token = 让上一个闪烁退出。
+# 不能用 kill：后台闪烁可能由另一次按键触发，杀名字会误伤。
+mesh_led_stop() {
+	mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+	echo "$(date +%s).$$" > "$MESH_LED_TOKEN" 2>/dev/null
+}
+
+mesh_led_restore_one() {  # 把某一盏灯还原成进入前的 trigger
+	local led="$1" t
+	[ -n "$led" ] || return 0
+	t=$(cat "$MESH_TMP_DIR/led-orig.$led" 2>/dev/null)
+	[ -n "$t" ] || t=none
+	echo "$t" > "${MESH_LED_DIR}/$led/trigger" 2>/dev/null
+	rm -f "$MESH_TMP_DIR/led-orig.$led"
+	return 0
+}
+
+mesh_led_blink_bg() {  # $1=灯 $2=亮(秒) $3=灭(秒) $4=持续秒
+	local led="$1" on="$2" off="$3" dur="$4" tok end
+	[ -n "$led" ] || return 0
+	tok=$(cat "$MESH_LED_TOKEN" 2>/dev/null)
+	end=$(( $(date +%s) + ${dur:-3} ))
+	(
+		while [ "$(date +%s)" -lt "$end" ]; do
+			[ "$(cat "$MESH_LED_TOKEN" 2>/dev/null)" = "$tok" ] || exit 0
+			echo 1 > "${MESH_LED_DIR}/$led/brightness" 2>/dev/null
+			sleep "${on:-0.5}"
+			echo 0 > "${MESH_LED_DIR}/$led/brightness" 2>/dev/null
+			sleep "${off:-0.5}"
+		done
+		# 闪完自己收尾：fail/deny/warn 这类"闪几下就结束"的动作没有别人来还原，
+		# 不还原这盏灯就一直停在 trigger=none（blue:wlan 是 phy0radio，等于把
+		# 射频指示灯弄坏了）。token 变了说明已被后续动作接管，交给它处理。
+		[ "$(cat "$MESH_LED_TOKEN" 2>/dev/null)" = "$tok" ] || exit 0
+		t=$(cat "$MESH_TMP_DIR/led-orig.$led" 2>/dev/null)
+		[ -n "$t" ] || t=none
+		echo "$t" > "${MESH_LED_DIR}/$led/trigger" 2>/dev/null
+		rm -f "$MESH_TMP_DIR/led-orig.$led" "$MESH_TMP_DIR/led-current"
+	) >/dev/null 2>&1 &
+}
+
+mesh_led_act() {  # busy(执行中慢闪) ok(成功常亮10s) fail(失败急闪3s)
+	local kind="$1" led danger=0 prev
+	case "$kind" in deny|warn|exit) danger=1;; esac
+	if [ "$danger" = 1 ]; then led=$(mesh_led_pick_danger); else led=$(mesh_led_pick); fi
+	[ -n "$led" ] || return 0
+	mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+	# 换灯了（比如"执行中"用蓝灯、"被拒绝"改用红灯）：先把上一盏还原，
+	# 否则它会一直停在 trigger=none —— 没人再记得它原来是什么。
+	prev=$(cat "$MESH_TMP_DIR/led-current" 2>/dev/null)
+	[ -n "$prev" ] && [ "$prev" != "$led" ] && mesh_led_restore_one "$prev"
+	mesh_led_stop
+	echo "$led" > "$MESH_TMP_DIR/led-current" 2>/dev/null
+	mesh_led_save "$led"
+	echo none > "${MESH_LED_DIR}/$led/trigger" 2>/dev/null
+	case "$kind" in
+		busy) mesh_led_blink_bg "$led" 0.5 0.5 3600;;   # 常驻闪，由 clear 收尾
+		ok)   echo 1 > "${MESH_LED_DIR}/$led/brightness" 2>/dev/null
+		      ( sleep 10; mesh_led_clear ) >/dev/null 2>&1 & ;;
+		fail) mesh_led_blink_bg "$led" 0.15 0.15 3;;
+		deny) mesh_led_blink_bg "$led" 0.12 0.12 3;;
+		warn) mesh_led_blink_bg "$led" 0.2 0.2 "$(mesh_btn_exit_grace)";;
+		hold) echo 1 > "${MESH_LED_DIR}/$led/brightness" 2>/dev/null;;  # 开窗期间常亮
+	esac
+	return 0
+}
+
+mesh_led_clear() {  # 停闪 + 还原原 trigger（开窗的 hold 也走这里收尾）
+	local led
+	led=$(cat "$MESH_TMP_DIR/led-current" 2>/dev/null)
+	mesh_led_stop
+	mesh_led_restore_one "$led"
+	rm -f "$MESH_TMP_DIR/led-current"
+	return 0
+}
+
 # ---------------- 运行时状态 ----------------
 # 当前已启用的 mesh 接口（如 mesh0）
 mesh_mesh_ifaces() {

@@ -84,3 +84,21 @@ config main 'main'
 	# 否则早已拆走的节点会一直以「离线」挂在列表里。最短 60：太短会把正在重启
 	# 的节点删掉重排号（节点序号决定信道错开）。
 	option peer_ttl '3600'
+	# ===== 按键一键组网（WPS 键时长分档）=====
+	# 一个键按秒数分档，出厂机开箱直接按，不用先进网页选角色：
+	#   ≤4s 加入网络（设为子节点并领凭证） / 5~9s 开放加入（设为主节点并开窗）
+	#   10~13s 空档（防手抖） / 14~20s 退出组网 / >20s 忽略
+	# 装上后系统自带的 WPS 功能会被这三档完全覆盖（详见 /etc/rc.wps/10-mesh 注释）。
+	# button=0 则整个让位，按键行为恢复成系统自带 WPS。
+	option button '1'
+	# LED 反馈用哪盏灯：留空 = 自动（phone → wlan → power 取第一个存在的；
+	# 危险操作用红灯 red:wan）。想指定就填 /sys/class/leds 下的名字。
+	option button_led ''
+	# 各档的秒数边界，改这里即可，不用重新编译固件
+	option btn_join_max '4'
+	option btn_open_min '5'
+	option btn_open_max '9'
+	option btn_exit_min '14'
+	option btn_exit_max '20'
+	# 退出档的反悔窗口（秒）：松手后这段时间内再按一次键即取消
+	option btn_exit_grace '10'

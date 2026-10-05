@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mesh
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=29
+PKG_RELEASE:=30
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Xx
 
@@ -71,6 +71,11 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_BIN) $(CURDIR)/root/etc/uci-defaults/40-luci-app-mesh-roaming $(1)/etc/uci-defaults/
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) $(CURDIR)/root/etc/hotplug.d/iface/30-mesh-bat-mtu $(1)/etc/hotplug.d/iface/
+# 按键一键组网：挂在系统 WPS 分发器 /etc/rc.button/wps 下（它遍历 /etc/rc.wps/*，
+# 返回 0 即 break）。不备份也不覆盖任何系统文件，卸载时随包移除即可。
+# 为什么要抢 WPS 键、档位怎么分、以及"为什么按住期间没有 LED 提示"，见脚本内注释。
+	$(INSTALL_DIR) $(1)/etc/rc.wps
+	$(INSTALL_BIN) $(CURDIR)/root/etc/rc.wps/10-mesh $(1)/etc/rc.wps/10-mesh
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) $(CURDIR)/root/etc/config/mesh $(1)/etc/config/
 	$(INSTALL_DIR) $(1)/www/cgi-bin

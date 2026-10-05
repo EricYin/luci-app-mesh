@@ -406,6 +406,19 @@ function countdown(remain, onEnd) {
 	return span;
 }
 
+function btnOpTitle(op) {
+	switch (op) {
+		case 'join':   return _('加入网络');
+		case 'open':   return _('开放加入');
+		case 'close':  return _('关闭加入窗口');
+		case 'exit':   return _('退出组网');
+		case 'cancel': return _('取消退出组网');
+		case 'idle':   return _('空档（未执行）');
+		case 'none':   return _('超出所有档位（已忽略）');
+		default:       return op || '-';
+	}
+}
+
 function pairOpTitle(op) {
 	if (op === 'pair_open') { return _('正在开放加入…'); }
 	if (op === 'pair_close') { return _('正在关闭加入窗口…'); }
@@ -485,6 +498,9 @@ function pairSection(d) {
 	var on = (d.enabled == 1);
 	var roleSet = (d.role_set !== 0);
 	var isClient = (d.role === 'client');
+	var btLast = ((d.button || {}).last) || {};
+	var btPend = ((d.button || {}).pending_exit) || {};
+	var bt0 = d.button || {};
 
 	/* 标题由 render() 统一渲染（放进 .cbi-section 里），这里只产出区块内容：
 	   重画时只换内容、不换外壳，也不会把标题画两遍 */
@@ -492,8 +508,28 @@ function pairSection(d) {
 		E('div', { 'class': 'mesh-muted', 'style': 'margin:4px 0 10px;line-height:1.8' },
 			_('新节点不必手工填 Mesh ID 与回程密码：主节点点「开放加入」临时起一个配对信号'
 				+ '（固件固定的 SSID/密码），新节点连上来领走凭证并自动生效。'
-				+ '窗口到期自动关闭；窗口关着时配对信号根本不存在，所以固定密码本身不构成风险。'))
+				+ '窗口到期自动关闭；窗口关着时配对信号根本不存在，所以固定密码本身不构成风险。'
+				+ '也可以不进网页：直接按机身上的 WPS 键 —— 按住不超过 %s 秒加入网络，%s~%s 秒开放加入。'
+					.format((bt0.join_max || 4), (bt0.open_min || 5), (bt0.open_max || 9))))
 	]);
+
+	/* 按键（WPS 键）触发的结果。未启用时按键也能自举（按键本身就会把角色写对），
+	   所以这一块必须放在最前面，不能等到"已启用"分支里才显示。 */
+	if (btLast.op && btLast.op !== '-' && btLast.time) {
+		var btOk = (btLast.code === 0);
+		box.appendChild(E('div', {
+			'style': 'margin:0 0 10px;padding:.6em .8em;border-radius:4px;font-size:90%;background:'
+				+ (btOk ? '#e8f5e9' : '#ffebee') + ';color:' + (btOk ? '#1b5e20' : '#b71c1c')
+		}, _('本次由按键触发：') + btnOpTitle(btLast.op)
+			+ _('（按住 %s 秒）').format(btLast.seen || 0)
+			+ ' · ' + agoText(Math.max(0, (d.now || 0) - btLast.time))
+			+ (btLast.msg ? ' —— ' + btLast.msg : '')));
+	}
+	/* 退出组网的反悔窗口还在倒数：明确告诉用户现在按一下就能取消 */
+	if (btPend.active == 1) {
+		box.appendChild(E('div', { 'class': 'mesh-note red' },
+			_('退出组网待执行：还剩约 %s 秒。现在再按一下 WPS 键即可取消。').format(btPend.remain || 0)));
+	}
 
 	/* A. 还没启用 / 还没选角色：配对动作没有意义，但**不该把人支到别的页面去** ——
 	   角色与开关就在这里给按钮，点了只写配置（不应用），选完立刻回到配对流程。

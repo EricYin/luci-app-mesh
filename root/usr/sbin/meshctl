@@ -1113,6 +1113,28 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
 	pr_radio=$(cat "$MESH_STATE_DIR/pair-radio" 2>/dev/null)
 	pr_window=$(mesh_pair_window_default); case "$pr_window" in ''|*[!0-9]*) pr_window=600;; esac
 	pr_wait=$(mesh_uci_getd main.pair_wait 300); case "$pr_wait" in ''|*[!0-9]*) pr_wait=300;; esac
+	bt_on=$(mesh_button_enabled && echo true || echo false)
+	bt_led=$(mesh_led_pick 2>/dev/null)
+	bt_jmax=$(mesh_btn_join_max); bt_omin=$(mesh_btn_open_min); bt_omax=$(mesh_btn_open_max)
+	bt_emin=$(mesh_btn_exit_min); bt_emax=$(mesh_btn_exit_max); bt_grace=$(mesh_btn_exit_grace)
+	bt_op="-"; bt_seen=0; bt_code=0; bt_time=0; bt_msg=""
+	if [ -f "$MESH_BTN_LAST" ]; then
+		bt_op=$(sed -n 's/^op=//p' "$MESH_BTN_LAST" 2>/dev/null)
+		bt_seen=$(sed -n 's/^seen=//p' "$MESH_BTN_LAST" 2>/dev/null)
+		bt_code=$(sed -n 's/^code=//p' "$MESH_BTN_LAST" 2>/dev/null)
+		bt_time=$(sed -n 's/^time=//p' "$MESH_BTN_LAST" 2>/dev/null)
+		bt_msg=$(sed -n 's/^msg=//p' "$MESH_BTN_LAST" 2>/dev/null)
+	fi
+	case "$bt_seen" in ''|*[!0-9]*) bt_seen=0;; esac
+	case "$bt_code" in ''|*[!0-9]*) bt_code=0;; esac
+	case "$bt_time" in ''|*[!0-9]*) bt_time=0;; esac
+	bt_pend=0; bt_pend_left=0
+	if mesh_button_exit_pending; then
+		bt_pend=1
+		bt_pend_left=$(( $(cat "$(mesh_button_pending_file)" 2>/dev/null) - now ))
+		[ "$bt_pend_left" -lt 0 ] && bt_pend_left=0
+	fi
+
 	if [ -f "$MESH_STATE_DIR/rollback" ]; then
 		rb_active=1
 		rb_ip=$(sed -n 's/^ip=//p' "$MESH_STATE_DIR/rollback")
@@ -1172,6 +1194,7 @@ $(mesh_registry_json)
  ],
  "port_bridging": $(mesh_all_ports_in_lan && echo true || echo false),
  "pair": {"open": $pr_open, "remain": $pr_remain, "joined": ${pr_joined:-0}, "ssid": "$(mesh_esc "$(mesh_pair_ssid)")", "key": "$(mesh_esc "$(mesh_pair_key)")", "radio": "$(mesh_esc "${pr_radio:--}")", "window": $pr_window, "wait": $pr_wait, "progress": $(mesh_pair_progress_json)},
+ "button": {"enabled": $bt_on, "led": "$(mesh_esc "${bt_led:--}")", "join_max": $bt_jmax, "open_min": $bt_omin, "open_max": $bt_omax, "exit_min": $bt_emin, "exit_max": $bt_emax, "grace": $bt_grace, "last": {"op": "$(mesh_esc "${bt_op:--}")", "seen": $bt_seen, "code": $bt_code, "time": $bt_time, "msg": "$(mesh_esc "${bt_msg:-}")"}, "pending_exit": {"active": $bt_pend, "remain": $bt_pend_left}},
  "rollback": {"active": $rb_active, "ip": "$(mesh_esc "$rb_ip")", "deadline": $rb_deadline, "remain": $rb_left},
  "daemon_running": $(pgrep -f 'meshctl daemon' >/dev/null 2>&1 && echo true || echo false),
  "backup_exists": $([ -d "$MESH_BACKUP_DIR/config" ] && echo true || echo false)
@@ -1392,6 +1415,9 @@ cmd_daemon() {
 			if [ -n "$pexp" ] && [ "$pexp" != 0 ] && [ "$(date +%s)" -ge "$pexp" ] 2>/dev/null; then
 				mesh_log info "配对：窗口到期，自动关闭加入"
 				cmd_pair_close >/dev/null 2>&1
+				# 按键开窗时的"常亮"要在这里收尾：自动关窗不走 cmd_button_open，
+				# 没人去还原 LED，灯会一直亮着（原 trigger 也一直被占着）
+				mesh_led_clear
 			fi
 		fi
 		# 无线回程口 MTU 的周期收敛：只读比对，仅在确实不一致时才下发内核。
@@ -1833,6 +1859,202 @@ mesh_pair_join_cleanup() {
 	return 0
 }
 
+# ================= 按键（WPS 键时长分档） =================
+# 用法: meshctl button press <SEEN>   由 /etc/rc.wps/10-mesh 调用（分档入口）
+#       meshctl button join|open|exit  单独触发某一档（调试用）
+#       meshctl button status          读取开关、档位数值与上次结果
+# ★ 这三个动作全是"长活"：开窗要 wifi reload（十几秒）、加入最长等满 pair_wait
+#   再 apply（会换 IP 并重启网络）、退出还要先走一段反悔窗口。所以 rc.wps 里必须
+#   后台化调用，绝不能阻塞按键分发器。
+cmd_button() {
+	local sub="${1:-}"
+	shift 2>/dev/null
+	case "$sub" in
+		press)  cmd_button_press "$@";;
+		join)   cmd_button_join "$@";;
+		open)   cmd_button_open "$@";;
+		exit)   cmd_button_exit "$@";;
+		status) cmd_button_status "$@";;
+		*) echo "用法: meshctl button <press|join|open|exit|status> [参数]"; return 1;;
+	esac
+}
+
+# 本机是否已经真正组过网（启用 + 手里有凭证）。用来判断"降级/越权"类误操作：
+# 出厂机 enabled=0 或 mesh_id 为空，不算在网，允许按键改写它的角色。
+mesh_button_in_network() {
+	[ "$(mesh_uci_getd main.enabled 0)" = 1 ] || return 1
+	[ -n "$(mesh_uci_get main.mesh_id)" ] || return 1
+	return 0
+}
+
+cmd_button_press() {
+	local seen="${1:-0}" kind
+	# 反悔窗口内的任何一次按键都只当"取消退出"，不会顺带触发加入档
+	if mesh_button_exit_pending; then
+		mesh_button_exit_cancel
+		mesh_button_last cancel "$seen" 0 "已取消退出组网（反悔窗口内再次按下）"
+		return 0
+	fi
+	kind=$(mesh_button_classify "$seen")
+	mesh_log info "按键：按住 ${seen}s → ${kind}"
+	case "$kind" in
+		join) cmd_button_join "$seen";;
+		open) cmd_button_open "$seen";;
+		exit) cmd_button_exit "$seen";;
+		idle) mesh_button_last idle "$seen" 0 "空档（按住 ${seen}s）：开窗与退出之间刻意留的缓冲，未执行任何动作";;
+		none) mesh_button_last none "$seen" 0 "忽略（按住 ${seen}s 超出所有档位）";;
+	esac
+}
+
+cmd_button_join() {
+	local seen="${1:-0}" role out rc id
+	role=$(mesh_uci_get main.role)
+	# 已在网的主节点被按"加入"档：照做等于把配置源降级掉，全网同步全废，拒绝
+	if [ "$role" = master ] && mesh_button_in_network; then
+		mesh_led_act deny
+		mesh_button_last join "$seen" 1 "已拒绝：本节点是已在网的主节点，不能降级为子节点加入（要拆网请用长按退出档）"
+		mesh_log warn "按键加入被拒绝：本节点是运行中的主节点"
+		return 1
+	fi
+	mesh_led_act busy
+	if [ "$role" != client ]; then
+		out=$(cmd_set_role client 2>&1) || {
+			mesh_led_clear; mesh_led_act fail
+			mesh_button_last join "$seen" 1 "设置子节点角色失败：$(printf '%s\n' "$out" | tail -n1)"
+			return 1
+		}
+	fi
+	# --apply 是"一键"的关键：领到凭证后直接应用（子节点会换成 DHCP 获取地址）
+	out=$(cmd_pair_join --apply 2>&1); rc=$?
+	mesh_led_clear
+	if [ "$rc" = 0 ]; then
+		mesh_led_act ok
+		id=$(printf '%s\n' "$out" | sed -n 's/^  Mesh ID   = //p' | head -n1)
+		mesh_button_last join "$seen" 0 "已加入网络${id:+：Mesh ID = $id}"
+	else
+		mesh_led_act fail
+		mesh_button_last join "$seen" 1 "$(printf '%s\n' "$out" | grep -E '^错误' | tail -n1)"
+	fi
+	return "$rc"
+}
+
+cmd_button_open() {
+	local seen="${1:-0}" role out rc id
+	role=$(mesh_uci_get main.role)
+	# 已在网的子节点被按"开窗"档：联网里只允许有一个配置源，拒绝
+	if [ "$role" = client ] && mesh_button_in_network; then
+		mesh_led_act deny
+		mesh_button_last open "$seen" 1 "已拒绝：本节点是已在网的子节点，只有主节点能开放加入"
+		mesh_log warn "按键开窗被拒绝：本节点是已在网的子节点"
+		return 1
+	fi
+	mesh_led_act busy
+	if [ "$role" != master ]; then
+		out=$(cmd_set_role master 2>&1) || {
+			mesh_led_clear; mesh_led_act fail
+			mesh_button_last open "$seen" 1 "设置主节点角色失败：$(printf '%s\n' "$out" | tail -n1)"
+			return 1
+		}
+	fi
+	# 从未应用过（根本没有 mesh 接口）的主节点必须先 apply 一次：
+	# 否则本机 mesh0 都还不存在，新节点就算领到凭证也连不上来。
+	if [ -z "$(mesh_mesh_ifaces)" ]; then
+		out=$(cmd_apply 2>&1) || {
+			mesh_led_clear; mesh_led_act fail
+			mesh_button_last open "$seen" 1 "应用配置失败：$(printf '%s\n' "$out" | grep -E '^错误' | tail -n1)"
+			return 1
+		}
+	fi
+	if mesh_pair_window_open; then
+		# 窗口已开 → 再按一次就是关窗，不用干等倒计时
+		out=$(cmd_pair_close 2>&1); rc=$?
+		mesh_led_clear
+		if [ "$rc" = 0 ]; then
+			mesh_led_act ok
+			mesh_button_last close "$seen" 0 "已关闭加入窗口"
+		else
+			mesh_led_act fail
+			mesh_button_last close "$seen" 1 "$(printf '%s\n' "$out" | grep -E '^错误' | tail -n1)"
+		fi
+	else
+		out=$(cmd_pair_open 2>&1); rc=$?
+		mesh_led_clear
+		if [ "$rc" = 0 ]; then
+			mesh_led_act hold   # 窗口期间常亮，关窗（或超时）时由别处 clear
+			id=$(mesh_pair_ssid)
+			mesh_button_last open "$seen" 0 "已开放加入：配对信号 ${id}（窗口 $(mesh_pair_window_default) 秒）"
+		else
+			mesh_led_act fail
+			mesh_button_last open "$seen" 1 "$(printf '%s\n' "$out" | grep -E '^错误' | tail -n1)"
+		fi
+	fi
+	return "$rc"
+}
+
+cmd_button_exit() {
+	local seen="${1:-0}" grace i out rc
+	# 没备份 = 从没成功组过网，直接拒绝（revert 本身也会报同一句，这里提前挡掉）
+	if [ ! -d "$MESH_BACKUP_DIR/config" ]; then
+		mesh_led_act deny
+		mesh_button_last exit "$seen" 1 "本节点没有组网前备份（从未成功组网），无需退出"
+		return 1
+	fi
+	grace=$(mesh_btn_exit_grace)
+	mesh_led_act warn
+	mesh_button_last exit "$seen" 0 "退出组网待执行：${grace} 秒内再按一次 WPS 键可取消"
+	echo $(( $(date +%s) + grace )) > "$(mesh_button_pending_file)"
+	rm -f "$(mesh_button_cancel_file)"
+	i=0
+	while [ "$i" -lt "$grace" ]; do
+		sleep 1
+		if [ -f "$(mesh_button_cancel_file)" ]; then
+			rm -f "$(mesh_button_pending_file)" "$(mesh_button_cancel_file)"
+			mesh_led_clear; mesh_led_act ok
+			mesh_button_last cancel "$seen" 0 "已取消退出组网（未做任何改动）"
+			mesh_log info "按键：退出组网已取消"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	rm -f "$(mesh_button_pending_file)" "$(mesh_button_cancel_file)"
+	mesh_led_clear
+	out=$(cmd_revert 2>&1); rc=$?
+	if [ "$rc" = 0 ]; then
+		mesh_button_last exit "$seen" 0 "$(printf '%s\n' "$out" | tail -n1)"
+	else
+		mesh_led_act fail
+		mesh_button_last exit "$seen" 1 "$(printf '%s\n' "$out" | grep -E '^错误' | tail -n1)"
+	fi
+	return "$rc"
+}
+
+cmd_button_status() {
+	local f
+	echo "enabled=$(mesh_button_enabled && echo 1 || echo 0)"
+	echo "led=$(mesh_led_pick 2>/dev/null)"
+	echo "danger_led=$(mesh_led_pick_danger 2>/dev/null)"
+	echo "join_max=$(mesh_btn_join_max)"
+	echo "open_min=$(mesh_btn_open_min)"
+	echo "open_max=$(mesh_btn_open_max)"
+	echo "exit_min=$(mesh_btn_exit_min)"
+	echo "exit_max=$(mesh_btn_exit_max)"
+	echo "grace=$(mesh_btn_exit_grace)"
+	f=$(mesh_button_last_file)
+	if [ -f "$f" ]; then
+		sed -n 's/^op=/last_op=/p; s/^seen=/last_seen=/p; s/^code=/last_code=/p; s/^time=/last_time=/p; s/^msg=/last_msg=/p' "$f"
+	else
+		echo "last_op=-"; echo "last_seen=0"; echo "last_code=0"; echo "last_time=0"; echo "last_msg="
+	fi
+	if mesh_button_exit_pending; then
+		echo "pending_exit=1"
+		echo "pending_remain=$(( $(cat "$(mesh_button_pending_file)" 2>/dev/null) - $(date +%s) ))"
+	else
+		echo "pending_exit=0"
+		echo "pending_remain=0"
+	fi
+	return 0
+}
+
 # ================= 入口 =================
 case "$1" in
 	apply)            shift; cmd_apply "$@";;
@@ -1848,8 +2070,9 @@ case "$1" in
 	pair-status)      cmd_pair_status;;
 	pair-join)        shift; cmd_pair_join "$@";;
 	set-role)         shift; cmd_set_role "$@";;
+	button)           shift; cmd_button "$@";;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join|set-role>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join|set-role|button>"
 		exit 1
 		;;
 esac

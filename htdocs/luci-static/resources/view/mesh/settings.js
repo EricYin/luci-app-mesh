@@ -413,6 +413,58 @@ return view.extend({
 			+ '窗口关闭时配对信号根本不存在，这串密码只在开窗的那几分钟里有意义。'
 			+ '一般不用改；真要改，全网所有节点必须改成同一个值。');
 
+		/* ================= 按键组网（WPS 键时长分档） ================= */
+		// 一个键按"按住几秒"分档 —— 出厂机开箱直接按，不用先进网页选角色：
+		// 谁开窗谁是主节点、谁加入谁是子节点，按键顺带把角色写对。
+		// 装上本包后系统自带的 WPS 会被这三档完全覆盖（/etc/rc.wps/10-mesh 返回 0 即 break）。
+		s = m.section(form.NamedSection, 'main', 'main', _('按键组网（WPS 键）'));
+		s.addremove = false;
+
+		o = s.option(form.Flag, 'button', _('允许按键组网'));
+		o.default = '1';
+		o.description = _('关掉后 WPS 键恢复成系统自带行为（手机免密连入 / 本机连别人的 WiFi），本插件完全不介入。');
+
+		o = s.option(form.Value, 'btn_join_max', _('加入档：按住不超过 (秒)'));
+		o.placeholder = '4';
+		o.datatype = 'range(1,30)';
+		o.description = _('在这个秒数内松手 = 加入网络：设为子节点并启用，然后自动领凭证并应用。'
+			+ '已是子节点时按一下是重新同步（主节点改了 Mesh ID 或密码后，按一下就跟上）。'
+			+ '正在跑的主节点按这一档会被拒绝并闪红灯。');
+
+		o = s.option(form.Value, 'btn_open_min', _('开窗档：起始秒'));
+		o.placeholder = '5';
+		o.datatype = 'range(2,60)';
+		o.description = _('按住到这个秒数起 = 开放加入：设为主节点并启用，从未应用过时会自动应用一次，'
+			+ '然后开窗；窗口已经开着时再按一次是立即关窗。已在网的子节点按这一档会被拒绝。');
+
+		o = s.option(form.Value, 'btn_open_max', _('开窗档：结束秒'));
+		o.placeholder = '9';
+		o.datatype = 'range(2,60)';
+
+		o = s.option(form.Value, 'btn_exit_min', _('退出档：起始秒'));
+		o.placeholder = '14';
+		o.datatype = 'range(3,120)';
+		o.description = _('按住到这个秒数起 = 退出组网（还原组网前配置并重启）。本档位与开窗档之间'
+			+ '刻意留一段空档：人手按不准整数秒，从"想开窗"滑到"退出组网"的代价太大。'
+			+ '松手后还有一段反悔时间（见下），期间再按一次键即可取消。');
+
+		o = s.option(form.Value, 'btn_exit_max', _('退出档：结束秒'));
+		o.placeholder = '20';
+		o.datatype = 'range(3,120)';
+		o.description = _('超过这个秒数视为误压或卡键，什么都不做。');
+
+		o = s.option(form.Value, 'btn_exit_grace', _('退出反悔时间(秒)'));
+		o.placeholder = '10';
+		o.datatype = 'range(0,120)';
+		o.description = _('退出档松手后，先闪红灯这么久再真正执行，期间再按一次 WPS 键即取消。'
+			+ '退出组网会还原配置并重启路由器，留这个窗口是为了让误按有救回来的机会。');
+
+		o = s.option(form.Value, 'button_led', _('反馈指示灯'));
+		o.placeholder = _('留空 = 自动');
+		o.description = _('按键反馈用哪盏灯，填 /sys/class/leds 下的名字（如 blue:phone）。'
+			+ '留空 = 自动挑选：优先 phone，其次 wlan，最后 power；被拒绝或退出前的反悔期用红灯。'
+			+ '动作结束后会自动还原这盏灯原来的状态。');
+
 		/* ================= 链路控制 ================= */
 		// 这两项决定"无线链路能否建立"；链路建立之后多跳路径的优劣由 batman-adv
 		// 按 TQ(传输质量)自动判定，所以这里不提供任何选路相关的开关。

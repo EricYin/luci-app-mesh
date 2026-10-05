@@ -1,0 +1,41 @@
+#!/bin/sh
+# luci-app-mesh —— WPS 键一键组网（时长分档）
+#
+# 档位（出厂默认，网页「按键组网」里可改）：
+#   ≤4s      加入网络   设为子节点 + 启用 + 领凭证并应用（出厂机开箱就这样入网）
+#   5~9s     开放加入   设为主节点 + 启用 + 开窗；窗口已开则立即关窗
+#   10~13s   空档       什么都不做（开窗与退出之间刻意留的缓冲，防手抖按过头）
+#   14~20s   退出组网   还原组网前配置并重启（松手后还有 10 秒反悔窗口可取消）
+#   >20s     忽略       疑似误压 / 卡键
+#
+# ★ 为什么放在 /etc/rc.wps/ 而不是覆盖 /etc/rc.button/wps：
+#   rc.button/wps 是个**分发器**（`for script in /etc/rc.wps/*; do "$script" && break; done`），
+#   文件名排在最前（10-）就能最先执行，返回 0 即 break，后面的系统 WPS 脚本
+#   （40-wps_ap / 50-wps_sta）不再执行 —— 装上本包后系统自带 WPS 即失效。
+#   卸载删掉本文件即可，**不备份、不覆盖任何系统文件**。
+#   代价：分发器第一行是 `[ "$ACTION" = "pressed" ] && exit 5`，本脚本只在
+#   **松手（released）**时被调到，按住期间拿不到任何回调，因此没有
+#   "现在松手会干什么"的实时提示，LED 只做松手后的结果反馈。
+#
+# ★ 返回值语义是反的：exit 0 = 我接管了（后面的不再跑）；exit 非 0 = 让位。
+
+[ "${ACTION:-}" = "released" ] || exit 1
+[ -x /usr/sbin/meshctl ] || exit 1
+
+# 总开关关闭 → 完全让位，系统自带的 WPS 行为照旧
+[ "$(uci -q get mesh.main.button 2>/dev/null)" = "0" ] && exit 1
+
+seen="${SEEN:-0}"
+case "$seen" in ''|*[!0-9]*) seen=0;; esac
+
+# 后台化是必须的：开窗要 wifi reload（十几秒），加入最长等满 pair_wait（300 秒）
+# 再 apply（会换 IP 并重启网络），退出还要先走一段反悔窗口。同步等待会把
+# 按键分发器整个挂住，后面的脚本永远轮不到。
+mkdir -p /tmp/mesh 2>/dev/null
+if command -v setsid >/dev/null 2>&1; then
+	setsid /usr/sbin/meshctl button press "$seen" >>/tmp/mesh/button.log 2>&1 &
+else
+	/usr/sbin/meshctl button press "$seen" >>/tmp/mesh/button.log 2>&1 &
+fi
+
+exit 0

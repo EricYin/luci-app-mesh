@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r29`（`PKG_RELEASE` 29）
+- 当前版本：`1.0.0-r30`（`PKG_RELEASE` 30）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r29.apk
-opkg install luci-app-mesh_1.0.0-r29_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r30.apk
+opkg install luci-app-mesh_1.0.0-r30_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -148,6 +148,33 @@ sh install.sh
 - **防静默失败**：能力缺失（wpad / kmod-batman-adv / batctl）在状态页红框明示 + apply 强制拦截；`capabilities` 中 `batctl` 独立于内核模块判定，避免「模块在、工具缺」时界面假绿。
 - **漫游配置自愈（为什么用轮询而不是事件）**：本系列固件**不发 procd 的 `config.change` 事件**（命令行 `uci commit` 与 LuCI 的 `uci apply` 两条路径实测都不发），而 LuCI 无线页保存会**重写整段 wireless**，把 `rrm_neighbor_report` / `rrm_beacon_report` 这类它不认识的项直接冲掉。因此 `97-wifi-roaming` / `99-dawn-roaming` 采用每分钟 cron 巡检：配置未变时一轮只做一次 md5 比较即退出，检测到差异才 `uci commit` 并后台重载。两者都是**差异修复器**而非配置器——只补缺失项、不重写已正确的项，所以不会每次巡检都断一次无线。
 - **mesh 守卫**：两个脚本都以 `/etc/config/mesh` 的 `enabled` 为总开关。安装时默认 `enable`（开机自启）+ `cron_enable`（每分钟巡检），但在未启用组网的设备上（`enabled != 1`）一律静默退出——**装包本身不会改动无线配置**；卸载时 `prerm` 自动清掉 cron 条目与自启链接。
+
+## 按键一键组网（WPS 键）
+
+不用进网页：按机身 WPS 键即可完成组网。**按法即意图** —— 谁开窗谁是主节点、谁加入谁是子节点，
+按键顺带把角色写对，所以出厂机开箱直接按就行，不需要先去网页选角色。
+
+| 按法 | 出厂 / 未组网 | 子节点已在网 | 主节点已在网 |
+|---|---|---|---|
+| **≤4s** | 设为子节点 + 一键加入 ← 开箱自举 | 重新同步（重领凭证并应用） | 拒绝（红灯急闪） |
+| **5~9s** | 设为主节点 + 开窗 10 分钟 ← 开箱自举 | 拒绝 | 窗口已开则关窗，否则开窗 |
+| 10~13s | 空档（防手抖） | 空档 | 空档 |
+| **14~20s** | 无备份则拒绝 | 退出组网并重启 | 退出组网并重启 |
+| >20s | 忽略 | 忽略 | 忽略 |
+
+- **退出档带 10 秒反悔窗口**：松手后红灯急闪，期间再按一次键即取消（`mesh.main.btn_exit_grace`）。
+- **实现方式**：只放一个 `/etc/rc.wps/10-mesh` —— `/etc/rc.button/wps` 是个分发器
+  （`for script in /etc/rc.wps/*; do "$script" && break; done`），文件名排最前就能先执行，
+  返回 0 即 break。**不备份、不覆盖任何系统文件**，卸载删掉这一个文件即恢复原样。
+- **LED 反馈**：`phone → wlan → power` 自动回退（被拒绝、退出前的反悔期用红灯），
+  动作结束后自动还原这盏灯原来的 trigger。
+- **按住期间没有实时提示**：分发器只在松手（released）时回调，拿不到 `pressed`，
+  所以退出档得自己数秒 —— 这是"不接管 `rc.button/wps`"换来的零系统文件改动。
+- **副作用**：装上后系统自带 WPS 失效（短按也不再是手机免密连入）。
+  设 `mesh.main.button=0` 即完全让位，按键行为恢复原样。
+- **⚠️ 已知风险**：子节点走"加入"档会执行 apply（重建 mesh 回程并重启网络）。
+  **纯无线回程**的节点一旦回程没能重建，就没有有线兜底、会失联 —— 实测遇到过一次。
+  排障：插一根网线到主节点（有线回程立刻恢复通路），或长按 14~20 秒退出组网还原。
 
 ## 变更记录
 
@@ -266,3 +293,19 @@ sh install.sh
 
 **顺带**：`mesh_brlan_members_report` 现在会打印判定口径、上行口排除清单与缺失项，
 排障时能一眼看出到底按什么规则算的。
+
+### r30（2026-10-05）
+按键一键组网：WPS 键按时长分档，出厂机开箱直接按即可入网。
+
+- **新增 `/etc/rc.wps/10-mesh`**：挂在系统 WPS 分发器下，**不动任何系统文件**。
+  档位 ≤4s 加入 / 5~9s 开窗（已开则关窗）/ 10~13s 空档 / 14~20s 退出 / >20s 忽略，
+  全部数值可在网页「按键组网（WPS 键）」里改（`mesh.main.btn_*`）。
+- **`meshctl button press <SEEN>|join|open|exit|status`**：分档后再按角色与"是否已在网"判断。
+  出厂机未启用时按键照样生效（这是"开箱自举"的前提）；已在网主节点按加入档、
+  已在网子节点按开窗档都会被拒绝并闪红灯（前者会让全网失去配置源）。
+  主节点从未应用过（没有 mesh 接口）时会先 apply 一次再开窗，否则新节点领了凭证也连不上。
+- **退出档带 10 秒反悔窗口**：松手后红灯急闪，期间再按一次键即取消（`/tmp/mesh/button-pending-exit`）。
+- **LED**：`mesh_led_pick()` 三级回退 + 危险操作用红灯；闪烁靠 token 判定自己是否过时，
+  **闪完自动还原原 trigger**（否则 `blue:wlan` 会从 `phy0radio` 变成 `none`，等于弄坏射频指示灯）。
+- 状态页显示「本次由按键触发」（op/按住秒数/时间/结果），设置页新增按键区。
+- 守护进程自动关窗时补 `mesh_led_clear`：自动关窗不走按键路径，否则灯会一直亮着。
