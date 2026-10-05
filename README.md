@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r38`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r39`（`PKG_RELEASE` 39）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r38.apk
-opkg install luci-app-mesh_1.0.0-r38_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r39.apk
+opkg install luci-app-mesh_1.0.0-r39_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -427,6 +427,35 @@ sh install.sh
   没有任何可打断的通路，就该放行**。
 - 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
 
+### r39（2026-10-05）
+消灭 LuCI「**迁移配置**」弹窗 —— 后台点开无线页 / 接口页就弹，根源在插件自己写
+的是旧格式，不是固件的问题。按之前定的 A 方案（源头改新格式）改 5 个点：
+
+- **根因两条**：
+  1. 本工具建无线段一律用 `uci add wireless wifi-iface` → 出来的是**匿名段**
+     （`cfg0xxxxx`），LuCI 无线页扫到匿名段就弹「迁移无线配置」；
+  2. `network.batmesh` 写的是 `option ifname`（21.02 起已废弃，改为 `device`），
+     LuCI 接口页弹「迁移接口配置」。
+- **A-1 四处建段全改成具名段**（前缀 `xxmesh_`，避开与固件自带段/用户自建段撞名）：
+  `xxmesh_backhaul`（回程）、`xxmesh_ap_<radio>`（AP 镜像，同射频多个自动 `_2/_3`）、
+  `xxmesh_pair_ap`（配对 AP）、`xxmesh_pair_sta`（配对 STA，建之前先清同名残留）。
+  建段统一走 `mesh_wifi_iface_new()`：名字被占用就自动后退到 `_2/_3`，并打
+  `mesh_managed=1` 标记。**收益不止不弹窗**：段名稳定、状态文件丢了也能靠标记把
+  自己建的段找回来（以前 LuCI 一点迁移就把段名改掉，脚本从此找不到、删不掉）。
+- **A-2 + A-3**：新增 `mesh_net_syntax()` 探测固件语法 ——
+  ① `network.loopback.device`（新固件出厂配置一定有）→ `new`；
+  ② `/etc/openwrt_release` 主版本号 ≥21 → `new`，≤19 → `old`；
+  ③ `/usr/share/hostap/`（24.10 起）→ `new`；④ 都探不出 → `both`（两个都写）。
+  `batmesh` 按结果写：21.02+ 只写 `device` 并删掉 `ifname`；19.07 及更早只写
+  `ifname`；探测不出就两个都写（netifd 只读自己认识的那个，功能不受影响）。
+- **A-4 存量整理不进代码**（没有存量用户，没必要常驻）：需要时跑一次性命令，
+  见下面「部署/运维备忘」。
+- **A-5**：本文档。
+
+兼容性：具名 `wifi-iface` 段 OpenWrt 全版本（含 19.07）都支持，无代价；
+`device` 只在 21.02+ 有效，已由版本探测兜住 —— 2024/2025 的固件（23.05 / 24.10）
+零风险，19.07 及更早会自动退回 `ifname`（README 本就要求 21.02+）。
+
 ### 部署/运维备忘
 - ★ **升级不能只换 `meshctl`**：包里有 17 个文件，真机核对时发现 `.219` 的
   `meshctl`、`.219`/`.245` 的 `/www/cgi-bin/mesh-sync` 落后（只 wget 过 meshctl
@@ -434,10 +463,33 @@ sh install.sh
   - `/etc/config/mesh` **各节点本就不同**（含自己的 role / 凭证），不要覆盖。
   - `/etc/uci-defaults/40-luci-app-mesh-roaming` 在设备上 MISSING 是**正常的**，
     OpenWrt 首次启动跑完就会删掉这个文件。
-- ★ **不要在 LuCI 无线页手动保存 / 点"迁移无线配置"**：LuCI 会把匿名 section
-  改名（`@wifi-iface[3]` → `cfg063579` → `wifinet1`），按名字删除/识别的脚本会扑空
-  —— 这次残留配对 AP 反复删不掉，一半原因就在这。真要点**先备份**
-  （`cp /etc/config/wireless /root/wireless.bak-pre-migrate`），再逐台做并立刻检查
-  mesh 段是否还在。
+- ★ **关于 LuCI「迁移配置」弹窗（r39 已治本）**：r39 起本工具建的无线段全是具名段
+  （`xxmesh_*`）、接口成员按固件语法写 `device`，**不会再因为本工具的配置弹迁移**。
+  固件自带 / 用户自己建的匿名段仍会弹，那与插件无关；即便用户点了迁移把段名改掉，
+  本工具也能靠 `mesh_managed=1` 标记把自己建的段找回来（旧版本则会因此失联：
+  状态文件里的名字失效 → 每轮新建一段）。
+- **一次性整理命令**（只给"从旧版本升级上来的机器"用，新装机器不需要）：
+
+  ```sh
+  . /usr/libexec/mesh/functions.sh
+  # 1) 回程段 + 配对 AP 段：匿名段 -> 具名段
+  for p in "mesh-iface:xxmesh_backhaul" "pair-section:xxmesh_pair_ap"; do
+      f=${p%%:*}; b=${p##*:}; s=$(cat /etc/mesh-state/$f 2>/dev/null)
+      [ -n "$s" ] || continue
+      n=$(mesh_wifi_iface_rename "$s" "$b") && [ -n "$n" ] && echo "$n" > /etc/mesh-state/$f
+  done
+  # 2) 各射频的 AP 镜像段
+  for f in /etc/mesh-state/ap-created-*; do
+      [ -f "$f" ] || continue
+      r=${f##*/ap-created-}; out=""
+      for s in $(cat "$f"); do out="$out $(mesh_wifi_iface_rename "$s" "xxmesh_ap_$r")"; done
+      echo $out | tr ' ' '\n' | grep . > "$f"
+  done
+  # 3) batmesh：ifname -> device（仅 21.02+ ；19.07 及更早跳过这一步）
+  uci set network.batmesh.device=$(uci -q get network.batmesh.ifname)
+  uci -q delete network.batmesh.ifname
+  uci commit wireless; uci commit network; wifi reload
+  ```
+
 
 

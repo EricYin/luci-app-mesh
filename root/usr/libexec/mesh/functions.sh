@@ -70,6 +70,94 @@ mesh_uci_ensure_section() {
 	uci -q get "$1" >/dev/null 2>&1 || uci set "$1=$2"
 }
 
+# ---------------- network 接口成员语法：device 还是 ifname（A-3）----------------
+# OpenWrt 21.02 把 interface 段的 `option ifname` 换成了 `option device`：
+#   · 21.02 起推荐 device；ifname 仍被兼容，但 LuCI 的接口页会一直弹"迁移配置"
+#   · 19.07 及更早只认 ifname，写 device 等于没写（接口起不来）
+# 本包的 batmesh 段要表达"mesh0 是 bat0 的硬接口"，必须按目标固件的语法落盘，
+# 否则要么接口挂不上（老固件），要么后台一进接口页就弹迁移（新固件）。
+# 探测顺序（命中即返回，结果缓存在 $MESH_NET_SYNTAX 里，一次启动只探一次）：
+#   ① network.loopback.device  —— 新固件的出厂 /etc/config/network 一定带它，最可靠
+#   ② /etc/openwrt_release 的 DISTRIB_RELEASE 主版本号 —— >=21 新，<=19 老
+#   ③ /usr/share/hostap/ 存在 —— 24.10 起的布局，SNAPSHOT 上靠它定新
+#   ④ 都探不出来 -> both（两个都写）：任何固件都能用，只是新固件上仍会弹迁移。
+#      实际上 ①② 已经覆盖几乎所有固件，④ 基本走不到。
+# 返回：new / old / both
+mesh_net_syntax() {
+	local rel major
+	if [ -n "$MESH_NET_SYNTAX" ]; then
+		echo "$MESH_NET_SYNTAX"; return 0
+	fi
+	MESH_NET_SYNTAX=both
+	if [ -n "$(uci -q get network.loopback.device 2>/dev/null)" ]; then
+		MESH_NET_SYNTAX=new
+	elif [ -r /etc/openwrt_release ]; then
+		rel=$(sed -n "s/^DISTRIB_RELEASE=['\"]*\([^'\"]*\)['\"]*.*$/\1/p" \
+			/etc/openwrt_release 2>/dev/null | head -n1)
+		major=${rel%%.*}
+		case "$major" in
+			''|*[!0-9]*)
+				# SNAPSHOT / 版本号非数字：只能靠目录布局判断
+				[ -d /usr/share/hostap ] && MESH_NET_SYNTAX=new
+				;;
+			*)
+				if [ "$major" -ge 21 ]; then
+					MESH_NET_SYNTAX=new
+				elif [ "$major" -le 19 ]; then
+					MESH_NET_SYNTAX=old
+				fi
+				;;
+		esac
+	elif [ -d /usr/share/hostap ]; then
+		MESH_NET_SYNTAX=new
+	fi
+	echo "$MESH_NET_SYNTAX"
+}
+
+# ---------------- 具名 wifi-iface 段（A-1）----------------
+# ★ 为什么必须具名：`uci add wireless wifi-iface` 建出来的是**匿名段**（cfg0xxxxx），
+#   LuCI 的无线页一检测到匿名段就弹"迁移配置"（wireless.js 的 checkAnonymousSections）。
+#   本工具每次 apply / 开窗都在建段，弹窗于是变成"点开无线页必现"；更糟的是用户点了
+#   迁移，LuCI 会把段名改成 wifinetN，而状态文件里记的还是旧名，本工具从此找不到
+#   自己建的段（删不掉、改不动，每轮再建一段）。
+#   用具名段 + mesh_managed=1 标记彻底解决：名字稳定、可自检、不触发迁移。
+#   具名 wifi-iface 在 OpenWrt 全版本（含 19.07）都支持，没有兼容性代价。
+#   段名统一 xxmesh_ 前缀，避开与固件自带段 / 用户自建段撞名的可能。
+#
+# 取一个"当前没被占用"的段名：base、base_2、base_3 ……（只取名，不创建）
+mesh_wifi_iface_free_name() {
+	local base="$1" sec="$1" n=1
+	while uci -q get "wireless.$sec" >/dev/null 2>&1; do
+		n=$((n+1)); sec="${base}_$n"
+	done
+	echo "$sec"
+}
+
+# 建一个具名 wifi-iface 段并打上本工具的标记，输出段名（失败输出空）
+mesh_wifi_iface_new() {
+	local sec
+	[ -n "$1" ] || return 1
+	sec=$(mesh_wifi_iface_free_name "$1") || return 1
+	uci set "wireless.$sec=wifi-iface" 2>/dev/null || return 1
+	uci set "wireless.$sec.mesh_managed=1" 2>/dev/null
+	echo "$sec"
+}
+
+# 把已存在的段改名为 base 系列里的空闲名（已是该系列就原样返回）。
+# 用于存量整理：把旧版本留下的匿名段一次性升级成具名段。输出改名后的段名。
+mesh_wifi_iface_rename() {
+	local old="$1" base="$2" new
+	[ -n "$old" ] && [ -n "$base" ] || return 1
+	uci -q get "wireless.$old" >/dev/null 2>&1 || return 1
+	case "$old" in
+		"$base"|"$base"_[0-9]*) echo "$old"; return 0;;
+	esac
+	new=$(mesh_wifi_iface_free_name "$base") || return 1
+	uci -q rename "wireless.$old=$new" 2>/dev/null || return 1
+	uci set "wireless.$new.mesh_managed=1" 2>/dev/null
+	echo "$new"
+}
+
 # ---------------- 状态文件落盘（内容未变则不写） ----------------
 # MESH_STATE_DIR 默认在 /etc/mesh-state，属于闪存(overlay)分区；而守护进程每 10 秒
 # 都会刷新 my-index / bh-band / master-id / ap-created-* 等状态文件。若直接 "> 文件"，
@@ -732,7 +820,24 @@ mesh_batman_apply() {
 	mesh_uci_ensure_section network.batmesh interface
 	mesh_uci_set_if_changed network.batmesh.proto batadv_hardif
 	mesh_uci_set_if_changed network.batmesh.master bat0
-	mesh_uci_set_if_changed network.batmesh.ifname mesh0
+	# ★ 成员项写 device 还是 ifname 由固件版本决定（A-2 + A-3）。
+	#   21.02 起 ifname 是废弃写法，留着会让 LuCI 接口页一直弹"迁移配置"；
+	#   19.07 及更早只认 ifname，写 device 等于没写、bat0 拿不到这个硬接口。
+	#   探测不出来（both）就两个都写：netifd 只读自己认识的那个，功能不受影响。
+	case "$(mesh_net_syntax)" in
+		old)
+			mesh_uci_set_if_changed network.batmesh.ifname mesh0
+			uci -q delete network.batmesh.device 2>/dev/null
+			;;
+		new)
+			mesh_uci_set_if_changed network.batmesh.device mesh0
+			uci -q delete network.batmesh.ifname 2>/dev/null
+			;;
+		*)
+			mesh_uci_set_if_changed network.batmesh.device mesh0
+			mesh_uci_set_if_changed network.batmesh.ifname mesh0
+			;;
+	esac
 	mesh_uci_set_if_changed network.batmesh.mtu 2304
 	# 刻意不写 batmesh.hop_penalty：mesh0 是 bat0 唯一的 hardif，没有第二条链路可与
 	# 它比较，扣分只会无差别拉低所有路径的 TQ（见文件上方 hop_penalty 注释）。
@@ -1227,6 +1332,20 @@ mesh_pair_radio() {
 	return 0
 }
 
+mesh_pair_sta_purge() {
+	# 残留的配对 STA 段（上次加入被中断留下来的）先清掉，避免每次加入都多堆一段。
+	# 只动 xxmesh_pair_sta 这个我们自己命名的空间，绝不会碰用户自己的接口。
+	local sec n=0
+	for sec in $(mesh_wifi_ifaces); do
+		case "$sec" in
+			xxmesh_pair_sta|xxmesh_pair_sta_*)
+				uci -q delete "wireless.$sec" 2>/dev/null && n=$((n+1));;
+		esac
+	done
+	[ "$n" -gt 0 ] && uci commit wireless 2>/dev/null
+	return 0
+}
+
 mesh_pair_ap_add() {
 	local radio sec ssid key
 	radio=$(mesh_pair_radio)
@@ -1234,8 +1353,10 @@ mesh_pair_ap_add() {
 	ssid=$(mesh_pair_ssid)
 	key=$(mesh_pair_key)
 	sec=$(mesh_pair_ap_section 2>/dev/null) || sec=""
-	[ -n "$sec" ] || sec=$(uci add wireless wifi-iface)
+	[ -n "$sec" ] || sec=$(mesh_wifi_iface_new xxmesh_pair_ap)
 	[ -n "$sec" ] || return 1
+	# 复用存量段时也要补标记：旧版本建的段、或用户迁移过的段可能没有
+	mesh_uci_set_if_changed "wireless.$sec.mesh_managed" 1
 	uci set "wireless.$sec.device=$radio"
 	uci set "wireless.$sec.mode=ap"
 	uci set "wireless.$sec.network=lan"

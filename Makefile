@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mesh
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=38
+PKG_RELEASE:=39
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Xx
 

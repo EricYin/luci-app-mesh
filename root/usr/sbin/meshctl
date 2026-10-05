@@ -87,12 +87,17 @@ mesh_uci_apply_mesh_ifaces() {
 		uci -q get "wireless.$sec" >/dev/null 2>&1 || sec=""
 	fi
 	[ -n "$sec" ] || {
+		# 没有状态文件：优先复用本工具建的（带 mesh_managed 标记），
+		# 找不到标记段时再退而复用任意一个 mode=mesh 段
 		for s in $(mesh_wifi_ifaces); do
 			[ "$(q wireless.$s.mode)" = "mesh" ] || continue
-			sec="$s"; break
+			if [ "$(q wireless.$s.mesh_managed)" = "1" ]; then sec="$s"; break; fi
+			[ -n "$sec" ] || sec="$s"
 		done
 	}
-	[ -n "$sec" ] || sec=$(uci add wireless wifi-iface)
+	# 都没有才新建 —— 用具名段（A-1）：匿名段会让 LuCI 无线页一直弹"迁移配置"
+	[ -n "$sec" ] || sec=$(mesh_wifi_iface_new xxmesh_backhaul)
+	[ -n "$sec" ] || { echo "错误：创建无线回程段失败"; return 1; }
 	echo "$sec" > "$MESH_STATE_DIR/mesh-iface"
 	# 只保留一个无线回程口（本包只实现 mesh0 这一个）。多段同 ifname=mesh0 会让
 	# netifd/hostapd 的配置互相打架，剩下的 mesh 段一律删除。
@@ -179,7 +184,11 @@ mesh_uci_mirror_aps() {
 					tgt=$sec; break
 				done
 				if [ -z "$tgt" ]; then
-					tgt=$(uci add wireless wifi-iface)
+					# 新建段用具名段（A-1）：xxmesh_ap_<radio>、xxmesh_ap_<radio>_2 ...
+					# 注意这里不能用"复用已存在的同名段"的写法 —— 同一射频上可能有多个
+					# AP，复用会把它们全塞进同一段。取名只看"名字空不空"。
+					tgt=$(mesh_wifi_iface_new "xxmesh_ap_$radio")
+					[ -n "$tgt" ] || continue
 				fi
 				used="$used $tgt"
 			else
@@ -1770,7 +1779,14 @@ cmd_pair_join() {
 	uci set "network.$MESH_PAIR_NET.defaultroute=0"
 	uci set "network.$MESH_PAIR_NET.peerdns=0"
 	uci commit network
-	stasec=$(uci add wireless wifi-iface)
+	# 配对 STA 用具名段（A-1），建之前先清掉可能被中断留下的同名残留
+	mesh_pair_sta_purge
+	stasec=$(mesh_wifi_iface_new xxmesh_pair_sta)
+	if [ -z "$stasec" ]; then
+		mesh_unlock
+		echo "错误：创建配对连接段失败"
+		return 1
+	fi
 	uci set "wireless.$stasec.device=$radio"
 	uci set "wireless.$stasec.mode=sta"
 	uci set "wireless.$stasec.ssid=$ssid"
