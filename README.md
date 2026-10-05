@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r37`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r38`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r37.apk
-opkg install luci-app-mesh_1.0.0-r37_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r38.apk
+opkg install luci-app-mesh_1.0.0-r38_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -411,5 +411,33 @@ sh install.sh
      同样会踩）。
   3. `cmd_button_join` 在 `--apply` 返回 0 之后复查一次 `enabled`，非 1 就改判失败 ——
      以后再有类似"apply 静默走停用分支"也不会被报成成功。
+
+### r38（2026-10-05）
+修"**其实没在网，却被判定已在网，按键加入被拒**"——真机 .245：退出组网后手动
+`meshctl set-role client`，再按加入档，直接被拒，只能绕去网页点加入才成功。
+
+- 根因：`mesh_button_in_network` 只看配置（`enabled=1` + `mesh_id` 非空），
+  而 **`mesh_id` 是会残留的**（退出组网没清干净、或上次 join 领到凭证后被停用分支
+  打断）。于是"配置看着在网、链路一条都没有"的节点被判成已在网 → 加入档拒绝。
+- 修法：新增 `mesh_backhaul_up()` 看**链路实际状态**（mesh 接口有已关联邻居；
+  有线回程没有邻居可查，改用"能 ping 通主节点且主节点地址不是自己"判断），
+  把 join / open 两个档的拒绝条件从
+  `role=X && mesh_button_in_network` 改成再 `&& mesh_backhaul_up`。
+  理由本来就写在注释里 —— 拒绝是为了"别打断正在跑的回程"；**回程压根没起来时
+  没有任何可打断的通路，就该放行**。
+- 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
+
+### 部署/运维备忘
+- ★ **升级不能只换 `meshctl`**：包里有 17 个文件，真机核对时发现 `.219` 的
+  `meshctl`、`.219`/`.245` 的 `/www/cgi-bin/mesh-sync` 落后（只 wget 过 meshctl
+  那两次漏掉了）。核对办法：本地 `md5sum` 全部文件，设备上逐个 `md5sum` 比对。
+  - `/etc/config/mesh` **各节点本就不同**（含自己的 role / 凭证），不要覆盖。
+  - `/etc/uci-defaults/40-luci-app-mesh-roaming` 在设备上 MISSING 是**正常的**，
+    OpenWrt 首次启动跑完就会删掉这个文件。
+- ★ **不要在 LuCI 无线页手动保存 / 点"迁移无线配置"**：LuCI 会把匿名 section
+  改名（`@wifi-iface[3]` → `cfg063579` → `wifinet1`），按名字删除/识别的脚本会扑空
+  —— 这次残留配对 AP 反复删不掉，一半原因就在这。真要点**先备份**
+  （`cp /etc/config/wireless /root/wireless.bak-pre-migrate`），再逐台做并立刻检查
+  mesh 段是否还在。
 
 

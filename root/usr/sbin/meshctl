@@ -1744,6 +1744,9 @@ cmd_pair_join() {
 		uci set mesh.main.role=client
 		uci commit mesh
 	fi
+	# 回程还通着时提醒一句：加入要把射频切到配对信号所在信道并重建回程，
+	# 纯无线回程的节点这期间没有任何备用通路（r38）
+	mesh_backhaul_up && echo "      注意：当前回程仍在通信，加入过程会切射频并重建回程，纯无线节点可能短暂失联"
 
 	radio=$(mesh_pair_radio)
 	ssid=$(mesh_pair_ssid)
@@ -2022,6 +2025,29 @@ mesh_button_in_network() {
 	return 0
 }
 
+# 回程**实际**通不通（r38）。与上面那个"配置上在网"是两回事：
+#   mesh_button_in_network 只看 enabled=1 + 有 mesh_id，而 mesh_id 是会残留的
+#   —— 退出组网没清干净、或上一次 join 领到凭证后被停用分支打断，都会留下
+#   "配置看着在网、链路其实一条都没有"的状态。真机 .245 就是这样：
+#   执行 set-role（enabled=1）+ 残留 mesh_id → 按键加入档判定"已在网"直接拒绝，
+#   用户只能绕去网页点加入。
+# 所以凡是以"怕打断正在跑的回程"为理由的拒绝，都必须再加上这一条：
+#   回程根本没起来时，重加入没有任何可打断的通路，理应放行。
+mesh_backhaul_up() {
+	local ifn addr
+	# 无线回程：任一 mesh 接口上有关联的邻居
+	for ifn in $(mesh_mesh_ifaces 2>/dev/null); do
+		iw dev "$ifn" station dump 2>/dev/null | grep -q '^Station' && return 0
+	done
+	# 有线回程是"物理口进 br-lan"的二层桥接，没有 mesh 邻居可查，改用连通性判断。
+	addr=$(mesh_master_addr 2>/dev/null)
+	[ -n "$addr" ] || return 1
+	# 兜底地址正好是本机自己（撞号）时 ping 必然通，不能算回程通
+	mesh_ip_is_local "$addr" && return 1
+	ping -c 1 -W 2 "$addr" >/dev/null 2>&1 && return 0
+	return 1
+}
+
 cmd_button_press() {
 	local seen="${1:-0}" kind
 	# 反悔窗口内的任何一次按键都只当"取消退出"，不会顺带触发加入档
@@ -2058,11 +2084,13 @@ cmd_button_join() {
 	#   回滚窗口救回来，**纯无线回程的节点此刻是没有任何备用通路的**（.219
 	#   就是在这一步失联、最后由回滚窗口自动还原的）。所以加入档只服务"手里
 	#   没凭证的新节点"，在网节点想重新入网，先退出再按。
-	if [ "$role" = client ] && mesh_button_in_network; then
+	# ★ 加上 mesh_backhaul_up（r38）：只有回程**真的在通**才拒绝。
+	#   凭证残留但链路没起来的节点，本来就没有可打断的通路，必须放行让它重新加入。
+	if [ "$role" = client ] && mesh_button_in_network && mesh_backhaul_up; then
 		mesh_led_act deny
 		id=$(mesh_uci_get main.mesh_id)
-		mesh_button_last join "$seen" 1 "已拒绝：本节点已在网（Mesh ID=${id:-未知}），加入档只用于未入网的新节点 —— 它会切射频去连配对信号并重启网络；要重新入网请先长按 14~20 秒退出组网，再按一次"
-		mesh_log warn "按键加入被拒绝：本节点已在网（Mesh ID=${id:-未知}），避免 apply 打断无线回程"
+		mesh_button_last join "$seen" 1 "已拒绝：本节点已在网且回程正在通信（Mesh ID=${id:-未知}），加入档会切射频并重建回程；要重新入网请先长按 14~20 秒退出组网，再按一次"
+		mesh_log warn "按键加入被拒绝：本节点已在网且回程在通（Mesh ID=${id:-未知}），避免 apply 打断无线回程"
 		return 1
 	fi
 	mesh_led_act busy
@@ -2104,9 +2132,10 @@ cmd_button_open() {
 	local seen="${1:-0}" role out rc id
 	role=$(mesh_uci_get main.role)
 	# 已在网的子节点被按"开窗"档：联网里只允许有一个配置源，拒绝
-	if [ "$role" = client ] && mesh_button_in_network; then
+	# 同 join 档：回程没真的在通就别拒绝（凭证残留时放行，允许它改当主节点）
+	if [ "$role" = client ] && mesh_button_in_network && mesh_backhaul_up; then
 		mesh_led_act deny
-		mesh_button_last open "$seen" 1 "已拒绝：本节点是已在网的子节点，只有主节点能开放加入"
+		mesh_button_last open "$seen" 1 "已拒绝：本节点是已在网的子节点（回程正在通信），只有主节点能开放加入"
 		mesh_log warn "按键开窗被拒绝：本节点是已在网的子节点"
 		return 1
 	fi
