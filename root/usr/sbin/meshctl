@@ -1632,6 +1632,8 @@ cmd_pair_open() {
 	mkdir -p "$MESH_STATE_DIR"
 	rm -f "$(mesh_pair_joined_file)"
 	mesh_pair_ap_add || { mesh_unlock; echo "错误：创建配对 AP 失败（没有可用射频？）"; return 1; }
+	# 备用地址：供"内网与主节点撞号（出厂默认 192.168.1.1）"的待入网节点领凭证用
+	mesh_pair_alias_up
 	radio=$(cat "$MESH_STATE_DIR/pair-radio" 2>/dev/null)
 	# 窗口到期由守护进程 cmd_daemon 每 10 秒检查并关闭（见那里的注释：
 	# 一次性 sleep 后台进程会残留，连续开窗时误关新窗口）。
@@ -1658,6 +1660,7 @@ cmd_pair_close() {
 		echo "错误：只有主节点需要关窗（本节点角色：$(mesh_uci_get main.role)）"; return 1
 	fi
 	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	mesh_pair_alias_down
 	mesh_pair_ap_del
 	nohup sh -c "wifi reload >>$MESH_LOG 2>&1" >/dev/null 2>&1 &
 	mesh_unlock
@@ -1694,6 +1697,7 @@ cmd_pair_status() {
 cmd_pair_join() {
 	local do_apply=0 role radio ssid key stasec old_ch pch
 	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch sta_dev rpf_old
+	local collide=0 cand2="" selfips=""
 	[ "$1" = "--apply" ] && do_apply=1
 
 	role=$(mesh_uci_get main.role)
@@ -1804,13 +1808,22 @@ cmd_pair_join() {
 	#   这种情况没法从网络层救（你没法"访问"一个你自己拥有的地址），只能改本机内网，
 	#   所以这里查出来立刻报错，别让用户白等 300 秒。
 	selfips=$(ip -4 addr show 2>/dev/null | awk '$1 == "inet" { sub(/\/.*/, "", $2); print $2 }')
-	cand2=""
+	cand2=""; collide=0
 	for c in $cand; do
 		[ -n "$c" ] || continue
-		for s in $selfips; do [ "$c" = "$s" ] && continue 2; done
+		for s in $selfips; do [ "$c" = "$s" ] && { collide=1; continue 2; }; done
 		case " $cand2 " in *" $c "*) ;; *) cand2="$cand2 $c";; esac
 	done
-	cand="$cand2"
+	if [ "$collide" = 1 ]; then
+		# ★ r35：撞号时改走主节点的备用地址。它不是本机地址 → 不会被本地投递；
+		#   配上 r33 的绑设备发送 + 主机路由，就能从配对网卡正常出去。
+		#   主节点开窗期间才挂着这个地址，旧版主节点没有它 —— 那种情况下仍会超时，
+		#   超时提示里会明确说明。
+		cand="$MESH_PAIR_ALIAS $cand2"
+		echo "      本机内网与主节点撞号，改走备用地址 $MESH_PAIR_ALIAS"
+	else
+		cand="$cand2"
+	fi
 	if [ -z "$cand" ]; then
 		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 		mesh_unlock
@@ -1875,6 +1888,8 @@ cmd_pair_join() {
 		echo "      若配对信号明明连上了、地址也拿到了：多半是本机内网与配对链路撞在同一个子网"
 		echo "      （两边都是 192.168.1.0/24），报文走了错误的出口。r33 已改成绑设备发送；"
 		echo "      临时绕开可把本机内网改成其它网段（如 192.168.9.1）再试。"
+		[ "$collide" = 1 ] && echo "      本机内网与主节点同号（如都是 192.168.1.1），已改用备用地址 $MESH_PAIR_ALIAS；"
+		[ "$collide" = 1 ] && echo "      若主节点版本较旧（开窗时没挂备用地址），请先改本机内网为同网段其它地址。"
 		return 1
 	fi
 

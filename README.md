@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r34`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r35`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r34.apk
-opkg install luci-app-mesh_1.0.0-r34_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r35.apk
+opkg install luci-app-mesh_1.0.0-r35_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -362,4 +362,15 @@ sh install.sh
   所以 `[3/4]` 先把候选地址里与本机地址相同的剔掉，**全被剔光就立刻报错**并给出
   指引（改成同网段其它地址，如 `192.168.1.219`），不再让用户白等 5 分钟。
   ⚠ 同网段本身没问题（r33 已解决），撞的是"同号"不是"同段"。
+
+### r35（2026-10-05）
+让**恢复出厂的设备（内网 192.168.1.1）也能真正开箱一键组网** —— 不用先手动改 IP：
+
+- 撞号在网络层无解，但可以**换个地址敲门**：主节点开窗期间在 LAN 桥上临时挂一个
+  `/32` 别名 `192.0.2.1`（RFC 5737 TEST-NET-1，真实网络里不存在，不会被内核特殊处理），
+  关窗立刻摘掉（`mesh_pair_alias_up/down`）。
+- 待入网节点检测到撞号后，把候选地址换成这个备用地址：它不是本机地址 → 不会被本地
+  投递；再叠加 r33 的绑设备发送 + 主机路由，报文就能从配对网卡正常出去。
+- 只在检测到撞号时才走这条路，正常场景零额外开销；主节点版本较旧（没挂备用地址）
+  时仍会超时，但超时提示会说明原因。
 

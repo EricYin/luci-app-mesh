@@ -1129,6 +1129,30 @@ MESH_PAIR_KEY_DEFAULT='xxmesh-pair'
 MESH_PAIR_IFNAME='pair0'
 MESH_PAIR_STA_IFNAME='pairsta0'
 MESH_PAIR_NET='pair'
+# ★ 配对备用地址（r35）。出厂路由器内网几乎都是 192.168.1.1（或 192.168.x.1），
+#   和主节点撞号时"主节点地址"恰好是待入网节点**自己的地址** —— 发往它的报文被
+#   内核本地投递，绑设备、钉路由都送不出去（见 r34），网络层无解。
+#   换个主节点专属的备用地址就能绕开：开窗期间在 LAN 桥上临时挂这个 /32 别名，
+#   待入网节点改连它领凭证。选 192.0.2.1（RFC 5737 TEST-NET-1，真实网络里不存在），
+#   既不撞任何内网、也不会被内核当特殊地址处理；关窗立刻摘掉。
+MESH_PAIR_ALIAS='192.0.2.1'
+
+# 备用地址挂/摘。只动地址本身，不动配置；进程被杀/重启也不会残留（tmpfs 语义之外
+# 还有一个兜底：pair-status 判断窗口只看 expire 文件，别名没摘也只是多一个地址）。
+mesh_pair_alias_up() {
+	local br
+	br=$(mesh_brlan_device 2>/dev/null)
+	[ -n "$br" ] || return 1
+	ip addr add "$MESH_PAIR_ALIAS/32" dev "$br" 2>/dev/null
+	return 0
+}
+mesh_pair_alias_down() {
+	local br
+	br=$(mesh_brlan_device 2>/dev/null)
+	[ -n "$br" ] || return 1
+	ip addr del "$MESH_PAIR_ALIAS/32" dev "$br" 2>/dev/null
+	return 0
+}
 
 mesh_pair_ssid() { mesh_uci_getd main.pair_ssid "$MESH_PAIR_SSID_DEFAULT"; }
 mesh_pair_key()  { mesh_uci_getd main.pair_key  "$MESH_PAIR_KEY_DEFAULT"; }
