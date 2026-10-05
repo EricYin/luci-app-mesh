@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r33`（`PKG_RELEASE` 33）
+- 当前版本：`1.0.0-r34`（`PKG_RELEASE` 33）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r33.apk
-opkg install luci-app-mesh_1.0.0-r33_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r34.apk
+opkg install luci-app-mesh_1.0.0-r34_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -351,4 +351,15 @@ sh install.sh
   3. 配对期间临时关 `rp_filter`（回包从 STA 进来、反向路径算到 br-lan 会被丢），
      cleanup 按原值还原；
   4. 绑设备名拿不到响应时退回绑源地址（老写法），双保险。
+
+### r34（2026-10-05）
+**待入网节点的内网地址不能和主节点同号**（出厂路由器默认 `192.168.1.1`，一撞一个准）：
+
+- 该地址一旦是本机自己拥有的，发往它的报文被内核**本地投递**（local 路由表优先于
+  main 表，连 SO_BINDTODEVICE 都压不过），curl 实际打到了自己的 uhttpd 拿回
+  `not_master`，然后干等 300 秒超时 —— 主节点那边一点痕迹都没有，极难排查。
+- 这事没法从网络层救（你没法"访问"一个你自己拥有的地址），只能改本机内网。
+  所以 `[3/4]` 先把候选地址里与本机地址相同的剔掉，**全被剔光就立刻报错**并给出
+  指引（改成同网段其它地址，如 `192.168.1.219`），不再让用户白等 5 分钟。
+  ⚠ 同网段本身没问题（r33 已解决），撞的是"同号"不是"同段"。
 

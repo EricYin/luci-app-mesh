@@ -1796,6 +1796,32 @@ cmd_pair_join() {
 	case "$ip" in *.*.*.*) cand="$cand ${ip%.*}.1";; esac
 	cand="$cand 192.168.1.1"
 
+	# ★ 候选地址不能是本机自己的地址（r34）。
+	#   出厂路由器的内网默认常是 192.168.1.1，和主节点撞号 —— 这时 192.168.1.1 是
+	#   **本机地址**，发往它的报文会被内核本地投递（local 表优先级高于 main 表，
+	#   连 SO_BINDTODEVICE 也压不过），curl 实际打到了自己的 uhttpd，回 not_master，
+	#   然后干等到 pair_wait 超时、主节点那边一点痕迹都没有。
+	#   这种情况没法从网络层救（你没法"访问"一个你自己拥有的地址），只能改本机内网，
+	#   所以这里查出来立刻报错，别让用户白等 300 秒。
+	selfips=$(ip -4 addr show 2>/dev/null | awk '$1 == "inet" { sub(/\/.*/, "", $2); print $2 }')
+	cand2=""
+	for c in $cand; do
+		[ -n "$c" ] || continue
+		for s in $selfips; do [ "$c" = "$s" ] && continue 2; done
+		case " $cand2 " in *" $c "*) ;; *) cand2="$cand2 $c";; esac
+	done
+	cand="$cand2"
+	if [ -z "$cand" ]; then
+		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
+		mesh_unlock
+		echo "错误：本机内网地址跟主节点撞号了（本机 $(echo $selfips | tr '\n' ' ')）"
+		echo "      主节点地址是本机自己拥有的地址时，报文会被内核直接本地投递，"
+		echo "      绑设备、钉路由都送不出去 —— 只能改本机内网。"
+		echo "      请把本机内网改成**同网段但不与主节点相同**的地址（如 192.168.1.219）再试；"
+		echo "      加入成功后内网会自动改成 DHCP，这个地址就不再是障碍了。"
+		return 1
+	fi
+
 	# ★ 同网段路由陷阱（r32，真机 .219 踩到的就是这个）：
 	#   待入网的节点自己是个独立路由器（内网 192.168.1.219/24），配对 STA 又从主节点
 	#   那边拿到 192.168.1.132/24 —— **同一个子网同时出现在两个接口上**。内核于是有
