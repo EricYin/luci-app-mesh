@@ -1780,6 +1780,20 @@ cmd_pair_join() {
 	case "$ip" in *.*.*.*) cand="$cand ${ip%.*}.1";; esac
 	cand="$cand 192.168.1.1"
 
+	# ★ 同网段路由陷阱（r32，真机 .219 踩到的就是这个）：
+	#   待入网的节点自己是个独立路由器（内网 192.168.1.219/24），配对 STA 又从主节点
+	#   那边拿到 192.168.1.132/24 —— **同一个子网同时出现在两个接口上**。内核于是有
+	#   两条同前缀的直连路由，到 192.168.1.1 的报文挑先起来的那条（基本是 br-lan），
+	#   而 br-lan 那一侧根本没有通往主节点的链路。
+	#   curl 的 --interface 只 bind 源地址、**不改出口设备**，所以报文还是从 br-lan
+	#   发出去，主节点一个都收不到 —— 表现就是"配对信号连上了、地址也拿到了、
+	#   DHCP 租约都看得见，却一次凭证都领不到"，一直耗到 pair_wait 超时。
+	#   这里给每个候选地址钉一条走 STA 的 /32 主机路由，把出口钉死。
+	for c in $cand; do
+		ip route replace "$c" dev "$MESH_PAIR_STA_IFNAME" src "$ip" >/dev/null 2>&1
+	done
+	echo "      领取出口：$(ip route get "$(echo "$cand" | awk '{print $NF}')" 2>/dev/null | head -n1 | sed 's/ cache//')"
+
 	out=""
 	ok=""
 	while [ "$waited" -lt "$maxwait" ]; do
@@ -1802,6 +1816,9 @@ cmd_pair_join() {
 		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch"
 		mesh_unlock
 		echo "错误：等待超时仍未领到凭证（主节点未开放加入，或不在同一网络内）"
+		echo "      若配对信号明明连上了、地址也拿到了：多半是本机内网与配对链路撞在同一个子网"
+		echo "      （两边都是 192.168.1.0/24），报文走了错误的出口。r32 已钉主机路由；"
+		echo "      临时绕开可把本机内网改成其它网段（如 192.168.9.1）再试。"
 		return 1
 	fi
 
@@ -1841,9 +1858,14 @@ cmd_pair_join() {
 
 # 拆除临时 STA 与临时网络接口（成功失败都要走，不能留下半成品）
 mesh_pair_join_cleanup() {
-	local stasec="$1" radio="$2" old_ch="$3"
+	local stasec="$1" radio="$2" old_ch="$3" r
 	[ -n "$stasec" ] && uci -q delete "wireless.$stasec"
 	uci -q delete "network.$MESH_PAIR_NET"
+	# 撤掉 [3/4] 钉的主机路由：接口马上就要消失，留着会变成永远不通的死路由。
+	# 只删不带前缀的（/32 主机路由），接口自己的子网路由留给 netifd 随接口一起撤。
+	for r in $(ip route show dev "$MESH_PAIR_STA_IFNAME" 2>/dev/null | awk '$1 !~ /\// {print $1}'); do
+		ip route del "$r" dev "$MESH_PAIR_STA_IFNAME" >/dev/null 2>&1
+	done
 	# 信道还原：配对时为对齐配对信号改过，用完要还原（auto/空 -> auto）
 	if [ -n "$radio" ]; then
 		if [ -n "$old_ch" ]; then

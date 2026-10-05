@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r31`（`PKG_RELEASE` 31）
+- 当前版本：`1.0.0-r32`（`PKG_RELEASE` 31）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r31.apk
-opkg install luci-app-mesh_1.0.0-r31_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r32.apk
+opkg install luci-app-mesh_1.0.0-r32_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -329,3 +329,15 @@ sh install.sh
   加入档会先切射频连配对信号、再 apply 重建网络，正在跑的无线回程会被打断；
   这不是理论风险 —— 那台纯无线回程的 .219 就是这么被打离线、最后由回滚窗口
   自动还原的。提示语里直接给出正确路径：先长按 14~20 秒退出组网，再按一次。
+
+### r32（2026-10-05）
+修"配对信号连上了、地址也拿到了，却永远领不到凭证"（真机 .219，耗满 300 秒超时）：
+
+- **同网段路由陷阱**：待入网的节点自己是个独立路由器（内网 `192.168.1.219/24`），
+  配对 STA 又从主节点拿到 `192.168.1.132/24` —— **同一个子网出现在两个接口上**，
+  内核有两条同前缀直连路由，去 `192.168.1.1` 的报文挑了先起来的 br-lan，
+  而 br-lan 那一侧根本没有通往主节点的链路。`curl --interface` 只 bind 源地址、
+  **不改出口设备**，所以主节点一个包都收不到，页面表现就是一直在"等待主节点开放加入"。
+- **修法**：`[3/4]` 领取凭证前，给每个候选主节点地址钉一条走 STA 的 `/32` 主机路由
+  （`ip route replace <master> dev <sta> src <ip>`），出口钉死；cleanup 时逐条撤掉。
+  同时打印"领取出口"一行，超时错误也补上了这条排查提示。
