@@ -71,15 +71,34 @@ mesh_first_ap_on_radio() {
 # ================= Mesh 回程接口 =================
 # $1 radio $2 channel $3 enc $4 key $5 mesh_id $6 rssi $7 maxp $8 fwd $9 hwmp_root
 mesh_uci_apply_mesh_ifaces() {
-	local sec
+	local sec s
+	# 选"要用的那一段"的优先级：
+	#   ① 状态文件里记的名字（本工具上次创建的，一定是我们自己的）
+	#   ② 已有的任意 mode=mesh 段（状态文件丢了/被清过时复用它，而不是再建一段）
+	#   ③ 都没有才新建
+	# ★ 踩过的坑：原来只在状态文件有效时复用，其它情况一律 uci add。一旦状态文件
+	#   丢失（清过配置、刷机保留配置、手工改过 wireless），每 apply 一次就多出一段
+	#   mode=mesh —— 真机出现过两段都叫 mesh0、mesh_id 还不一样（旧 OpenWrtMesh +
+	#   新 XxMesh-xxx），排查时极具误导性。
+	sec=""
 	if [ -f "$MESH_STATE_DIR/mesh-iface" ]; then
 		sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
 		uci -q get "wireless.$sec" >/dev/null 2>&1 || sec=""
 	fi
 	[ -n "$sec" ] || {
-		sec=$(uci add wireless wifi-iface)
-		echo "$sec" > "$MESH_STATE_DIR/mesh-iface"
+		for s in $(mesh_wifi_ifaces); do
+			[ "$(q wireless.$s.mode)" = "mesh" ] || continue
+			sec="$s"; break
+		done
 	}
+	[ -n "$sec" ] || sec=$(uci add wireless wifi-iface)
+	echo "$sec" > "$MESH_STATE_DIR/mesh-iface"
+	# 只保留一个无线回程口（本包只实现 mesh0 这一个）。多段同 ifname=mesh0 会让
+	# netifd/hostapd 的配置互相打架，剩下的 mesh 段一律删除。
+	for s in $(mesh_wifi_ifaces); do
+		[ "$s" = "$sec" ] && continue
+		[ "$(q wireless.$s.mode)" = "mesh" ] && uci -q delete "wireless.$s"
+	done
 	uci set wireless.$sec.device="$1"
 	uci set wireless.$sec.mode=mesh
 	uci set wireless.$sec.mesh_id="$5"
@@ -368,8 +387,32 @@ cmd_apply() {
 		fi
 		return 1
 	fi
+	# 主节点的 id / 密码**为空**时，自动生成一次并写回 UCI。
+	# 写回的意义：值一旦落盘就长期固定，之后每次 apply 都是同一个网络，
+	# 也避免"配置里是空的、状态页却显示派生值"这种表里不一。
+	# ★ 判定只看"是否为空"，不看具体值：用户手工设的任何 id / 密码都原样保留，
+	#   绝不因为它是弱密码就被悄悄改掉（要换请自己点"随机生成"或清空后保存）。
+	#   所以出厂配置 /etc/config/mesh 里这两项必须留空（不能写死 OpenWrtMesh），
+	#   否则新刷机永远走不到派生逻辑。
+	# 仅限主节点：子节点必须与主节点用同一个 id 和密码才能建链，各自随机生成会直接失联。
+	if [ "$role" = master ]; then
+		if [ -z "$id" ]; then
+			id=$(mesh_default_mesh_id)
+			[ -n "$id" ] && { uci set mesh.main.mesh_id="$id"; echo "已自动生成 Mesh ID: $id"; }
+		fi
+		if [ "$enc" != none ] && [ -z "$key" ]; then
+			key=$(mesh_gen_key)
+			[ -n "$key" ] && { uci set mesh.main.mesh_key="$key"; echo "已自动生成回程密码: $key"; }
+		fi
+	fi
 	if [ -z "$id" ]; then
-		echo "错误：Mesh ID 不能为空"; return 1
+		# 主节点走到这里说明 MAC 派生失败（拿不到主 MAC）；子节点则是"还没领到凭证"
+		if [ "$role" = client ]; then
+			echo "错误：子节点没有 Mesh ID —— 填与主节点完全相同的值（主节点组网设置页可复制），后续版本可用配对窗口自动领取"
+		else
+			echo "错误：Mesh ID 不能为空，且本机读不到主 MAC（无法自动派生），请手工填写"
+		fi
+		return 1
 	fi
 	if [ "${#id}" -gt 32 ]; then
 		echo "错误：Mesh ID 最长 32 字符"; return 1
@@ -910,7 +953,9 @@ cmd_status() {
 	role=$(mesh_uci_get main.role)
 	[ -n "$role" ] || role_set=0
 	enabled=$(mesh_uci_getd main.enabled 0)
-	id=$(mesh_uci_getd main.mesh_id OpenWrtMesh)
+	# 留空就是"尚未生成"，如实上报（前端会显示"未设置，应用后自动派生"）。
+	# 不要兜底成 OpenWrtMesh：那会让人以为自己正在用这个全网同名的默认 id。
+	id=$(mesh_uci_getd main.mesh_id '')
 	# 与 cmd_apply 用同一套解析器取默认值，避免"状态页显示 A、下发却是 B"
 	enc=$(mesh_uci_getd main.encryption "$(mesh_default_encryption)")
 	country=$(mesh_uci_getd main.country "$(mesh_default_country)")

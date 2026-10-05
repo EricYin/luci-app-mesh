@@ -393,7 +393,10 @@ return view.extend({
 		var cardVal = nConn + (nConn ? ' (%s %s / %s %s)'.format(pr.wifi || 0, _('无线'), pr.eth || 0, _('有线')) : '');
 		var cards = E('div', { 'class': 'mesh-cards' }, [
 			card(_('Mesh 状态'), on ? _('已启用') : _('未启用'), on ? '#37c837' : '#999'),
-			card(_('Mesh ID'), d.mesh_id),
+			/* Mesh ID 为空 = 还没生成过（出厂默认留空）。这里如实说明，
+			   不要显示成"未设置"以外的假值，也不要替用户猜测。 */
+			card(_('Mesh ID'), d.mesh_id
+				|| (isClient ? _('未设置（从主节点获取）') : _('未设置（应用后按 MAC 自动派生）'))),
 			card(_('已连接邻居'), cardVal, nConn > 0 ? '#37c837' : null),
 			card(_('路径选择'), batmanText(d), (d.batman && d.batman.enabled == 1) ? '#37c837' : null),
 			card(_('本机角色'), d.role_set === 0

@@ -1061,6 +1061,37 @@ mesh_default_country() {
 	echo CN
 }
 
+# Mesh 名称：主节点**未设置**（UCI 为空）时，用本机 MAC 后 6 位派生，
+# 形如 XxMesh-143D90（MAC 68:B7:6B:14:3D:90 → 取 143D90，去冒号大写）。
+#
+# ★ 判定只看"是否为空"（meshctl apply），不认任何魔法值：用户手工填的 id 一律原样保留。
+#   所以出厂配置 /etc/config/mesh 里必须写 option mesh_id ''（留空），
+#   写死成 OpenWrtMesh 的话新刷机永远走不到这里。
+#
+# 这么做有两个理由：
+#   ① 802.11s 是**按 mesh_id 匹配**才建立 peer 的。全网同固件默认都叫 OpenWrtMesh，
+#      邻居的同款设备会在同一信道上反复尝试 SAE 握手然后失败 —— 既干扰空口又刷日志。
+#      id 一错开，对方压根不再尝试。注意只改密码改不掉这个：握手照样会发生。
+#   ② MAC 出厂固化 —— 主节点恢复出厂后重新算出来还是同一个 id，不会把已组网的子节点甩掉。
+# 只用**主节点**的 MAC：子节点必须与主节点用同一个 id 才能建链，各自派生会导致两端不一致
+# （子节点应当从主节点领取，见配对流程；现阶段由人工或脚本保证一致）。
+mesh_default_mesh_id() {
+	local m
+	m=$(mesh_primary_mac 2>/dev/null | tr -d ':\r\n' | tr 'a-f' 'A-F')
+	[ "${#m}" -ge 6 ] || return 0
+	printf 'XxMesh-%s\n' "${m#${m%??????}}"
+}
+
+# 回程密码：**为空**时生成 16 位随机串（enc=none 时不需要密码，不生成）。
+# 字符集收敛到 [A-Za-z0-9]：这个串同时充当同步 token 拼进 URL 查询参数，
+# 含 & # + % 空格 等保留字符会把请求截断（真机踩过，见 mesh_fetch_master 注释）。
+mesh_gen_key() {
+	local k
+	k=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\r\n+/=' | head -c 16)
+	[ -n "$k" ] || k=$(awk 'BEGIN{srand();printf "%016d", rand()*10000000000000000}')
+	printf '%s\n' "$k"
+}
+
 # RSSI 接入门限（dBm）：弱于此值的邻居不建立链路。
 # -80 是覆盖与质量的折中；链路建立之后路径优劣由 batman-adv 按 TQ 判定，
 # 这个门限只负责"要不要连"，不参与选路，所以不需要用户按场景调。

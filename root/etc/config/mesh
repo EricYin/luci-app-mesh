@@ -3,7 +3,14 @@ package mesh
 config main 'main'
 	option enabled '0'
 	option role 'master'
-	option mesh_id 'OpenWrtMesh'
+	# ★ 这两项出厂**必须留空**，不能写死默认值：
+	#   · mesh_id 留空 → 主节点首次应用时按本机 MAC 派生 XxMesh-XXXXXX（见
+	#     mesh_default_mesh_id）。写死成 OpenWrtMesh 的话，全网同固件都叫同一个名字，
+	#     邻居的同款设备会在同信道上反复尝试 SAE 握手（空口干扰 + 刷日志）。
+	#   · mesh_key 留空 → 主节点首次应用时生成 16 位随机串。
+	#   判定条件只看"是否为空"（meshctl apply），所以用户手工填的任何值都会被原样保留，
+	#   不会因为它是弱密码就被悄悄改掉。子节点不要填，从主节点领（现阶段人工保证一致）。
+	option mesh_id ''
 	option mesh_key ''
 	option encryption 'sae'
 	option band '5g'

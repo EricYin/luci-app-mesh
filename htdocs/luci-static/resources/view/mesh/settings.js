@@ -184,16 +184,102 @@ return view.extend({
 			+ '全部物理端口(WAN/LAN)都将并入内网 br-lan，并关闭本机 DHCP 服务。');
 
 		o = s.option(form.Value, 'mesh_id', _('Mesh 名称 (Mesh ID)'));
-		o.placeholder = 'OpenWrtMesh';
+		o.placeholder = 'XxMesh-143D90';
 		o.datatype = 'maxlength(32)';
-		o.description = _('同一网络内所有节点必须一致，最长 32 字符。');
+		o.description = _('同一网络内所有节点必须一致，最长 32 字符。主节点留空时按本机 MAC 自动生成（XxMesh-后 6 位），生成一次后长期固定；这样不会和邻居的同款固件重名。');
 
 		o = s.option(form.Value, 'mesh_key', _('Mesh 回程密码'));
 		o.password = true;
 		o.datatype = 'minlength(8)';
 		o.placeholder = _('至少 8 位');
 		o.rmempty = false;
-		o.description = _('至少 8 位，使用 WPA3-SAE 加密，所有节点必须一致。子节点还用它作为同步令牌。');
+		o.description = _('至少 8 位，使用 WPA3-SAE 加密，所有节点必须一致。子节点还用它作为同步令牌。主节点留空时自动生成 16 位随机密码。可以自己改，但改完所有节点都要一致。');
+
+	/* 回程密码的三个小工具：随机生成 / 明文切换 / 复制。
+	   原来只有一个 password 框，看不见也复制不了，手工添加节点时很不方便。
+	   这里不写 UCI（DummyValue），只操作上面那个输入框的 DOM。
+
+	   ★ 真机踩坑（2026-10-05）：按钮能显示、点了却完全没反应、控制台也没有请求。
+	     根因是 LuCI 的密码框是**两层结构**（ui.js 的 UITextfield）：
+	         外层 <div id="cbid.mesh.main.mesh_key">          ← 容器
+	         里面 <input id="widget.cbid.mesh.main.mesh_key">  ← 真正的输入框
+	     而 form.js 里 renderFrame() 用的正是外层那个 id。于是
+	     getElementById('cbid.mesh.main.mesh_key') 拿到的是**div**，
+	     给它赋 .value / .type 不会有任何可见变化 —— 表现就是"点了没反应"。
+	     查找顺序必须是：widget. 前缀的 input → 外层容器里的 input → 按 class 兜底。 */
+	o = s.option(form.DummyValue, '_key_tools', _('密码工具'));
+	o.render = function () {
+		var findInput = function () {
+			var el = document.getElementById('widget.cbid.mesh.main.mesh_key');
+			if (el && el.tagName === 'INPUT') return el;
+			var frame = document.getElementById('cbid.mesh.main.mesh_key');
+			if (frame) {
+				el = frame.querySelector('input');
+				if (el) return el;
+			}
+			return document.querySelector('input.cbi-input-password') ||
+				document.querySelector('input[id$="mesh_key"]');
+		};
+		var randKey = function (n) {
+			var cs = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+			var a = new Uint8Array(n), s = '', i;
+			if (window.crypto && window.crypto.getRandomValues) {
+				window.crypto.getRandomValues(a);
+			} else {
+				for (i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
+			}
+			for (i = 0; i < n; i++) s += cs.charAt(a[i] % cs.length);
+			return s;
+		};
+
+		/* type="button" 必须显式写：button 在 <form> 里默认是 submit，
+		   不写就会触发 LuCI 的保存动作（用户看到的就是"点了没反应还弹保存"）。 */
+		var btnGen = E('button', { 'class': 'cbi-button cbi-button-apply', 'type': 'button' }, _('随机生成'));
+		btnGen.addEventListener('click', function (ev) {
+			ev.preventDefault();
+			ev.stopPropagation();
+			var inp = findInput();
+			if (!inp) { ui.addNotification(null, E('p', {}, _('未找到密码输入框，请刷新页面（Ctrl+F5）后重试')), 'warning'); return; }
+			inp.type = 'text';
+			inp.value = randKey(16);
+			btnShow.textContent = _('隐藏');
+			/* 让 LuCI 感知到值变了，否则保存时可能按"未改动"处理 */
+			inp.dispatchEvent(new Event('change', { bubbles: true }));
+		});
+
+		var btnShow = E('button', { 'class': 'cbi-button cbi-button-neutral', 'type': 'button' }, _('显示'));
+		btnShow.addEventListener('click', function (ev) {
+			ev.preventDefault();
+			ev.stopPropagation();
+			var inp = findInput();
+			if (!inp) { ui.addNotification(null, E('p', {}, _('未找到密码输入框，请刷新页面（Ctrl+F5）后重试')), 'warning'); return; }
+			inp.type = (inp.type === 'password') ? 'text' : 'password';
+			btnShow.textContent = (inp.type === 'password') ? _('显示') : _('隐藏');
+		});
+
+		var btnCopy = E('button', { 'class': 'cbi-button cbi-button-neutral', 'type': 'button' }, _('复制'));
+		btnCopy.addEventListener('click', function (ev) {
+			ev.preventDefault();
+			ev.stopPropagation();
+			var inp = findInput();
+			if (!inp) { ui.addNotification(null, E('p', {}, _('未找到密码输入框，请刷新页面（Ctrl+F5）后重试')), 'warning'); return; }
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				navigator.clipboard.writeText(inp.value);
+			} else {
+				inp.select();
+				document.execCommand('copy');
+			}
+			btnCopy.textContent = _('已复制');
+			setTimeout(function () { btnCopy.textContent = _('复制'); }, 1500);
+		});
+
+		/* 自己拼出 cbi-value / cbi-value-title / cbi-value-field 这三层：
+		   直接返回一个裸 div 会丢掉 LuCI 的行容器，和上下几行对不齐。 */
+		return E('div', { 'class': 'cbi-value' }, [
+			E('label', { 'class': 'cbi-value-title' }, _('密码工具')),
+			E('div', { 'class': 'cbi-value-field' }, [ btnGen, ' ', btnShow, ' ', btnCopy ])
+		]);
+	};
 
 		o = s.option(form.ListValue, 'encryption', _('Mesh 回程加密'));
 		o.value('sae', _('WPA3-SAE(推荐, 802.11s 强制要求)'));
