@@ -114,3 +114,25 @@
 .mesh-topo-legend { text-align: center; margin-top: 6px; }
 .mesh-topo-legend span { display: inline-flex; align-items: center; margin-right: 16px; font-size: 12px; color: #666; }
 .mesh-topo-legend i { display: inline-block; width: 22px; height: 0; margin-right: 6px; }
+
+/* 软件版本区块（诊断与维护页）：两行 label/value，只读展示 */
+.mesh-ver-box { padding: 2px 0; }
+.mesh-ver-row {
+	display: flex;
+	align-items: baseline;
+	padding: 6px 0;
+	border-bottom: 1px dashed #e6e6e6;
+}
+.mesh-ver-row:last-child { border-bottom: none; }
+.mesh-ver-label {
+	flex: 0 0 96px;
+	color: #666;
+	font-size: 13px;
+}
+.mesh-ver-value {
+	flex: 1 1 auto;
+	font-family: monospace;
+	font-size: 13px;
+	color: #333;
+	word-break: break-all;
+}

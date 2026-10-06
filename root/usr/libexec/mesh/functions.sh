@@ -1234,13 +1234,25 @@ MESH_PAIR_KEY_DEFAULT='xxmesh-pair'
 MESH_PAIR_IFNAME='pair0'
 MESH_PAIR_STA_IFNAME='pairsta0'
 MESH_PAIR_NET='pair'
-# ★ 配对备用地址（r35）。出厂路由器内网几乎都是 192.168.1.1（或 192.168.x.1），
-#   和主节点撞号时"主节点地址"恰好是待入网节点**自己的地址** —— 发往它的报文被
-#   内核本地投递，绑设备、钉路由都送不出去（见 r34），网络层无解。
+# ★ 配对备用地址（r35 引入；r45 换私网段）。
+#   出厂路由器内网几乎都是 192.168.1.1（或 192.168.x.1），和主节点撞号时"主节点地址"
+#   恰好是待入网节点**自己的地址** —— 发往它的报文被内核本地投递，绑设备、钉路由都送
+#   不出去（见 r34），网络层无解。
 #   换个主节点专属的备用地址就能绕开：开窗期间在 LAN 桥上临时挂这个 /32 别名，
-#   待入网节点改连它领凭证。选 192.0.2.1（RFC 5737 TEST-NET-1，真实网络里不存在），
-#   既不撞任何内网、也不会被内核当特殊地址处理；关窗立刻摘掉。
-MESH_PAIR_ALIAS='192.0.2.1'
+#   待入网节点改连它领凭证。
+#
+#   ★★ r45（2026-10-06）必须用 RFC1918 私网地址，不能用 192.0.2.1：
+#   r35 原先选 192.0.2.1（RFC 5737 TEST-NET-1）本意是"真实网络里不存在、不撞任何内网"，
+#   但主节点默认开着 uhttpd.main.rfc1918_filter=1（防 DNS rebinding），它的判定是
+#   **"源 IP 属 RFC1918 私网 + 目的地址不是私网 → 拒绝"**：
+#       待入网节点源 192.168.1.158（私网） → 目的 192.0.2.1（被 uhttpd 当 public）→ 403
+#   uhttpd 原话："Rejected request from RFC1918 IP to public server address"
+#   结果：子节点配对 STA 正常关联、DHCP 也拿到地址了，但领凭证请求被 403 挡在门外，
+#   每 10 秒重试到 pair_wait 超时 —— 只要子节点内网与主节点撞号（恢复出厂必撞）就必现。
+#   注意这与固件版本无关：r39/r44 用同一份 192.0.2.1 都会复现（已实机对照验证）。
+#   换成 RFC1918 私网地址后是"私网→私网"，uhttpd 不拦，且依然不撞常见家用内网。
+#   选 10.255.255.1：属 10.0.0.0/8（RFC1918），家用设备极少使用，单挂 /32 不引入路由。
+MESH_PAIR_ALIAS='10.255.255.1'
 
 # 备用地址挂/摘。只动地址本身，不动配置；进程被杀/重启也不会残留（tmpfs 语义之外
 # 还有一个兜底：pair-status 判断窗口只看 expire 文件，别名没摘也只是多一个地址）。
@@ -1838,6 +1850,17 @@ mesh_mesh_iface_macs() {
 mesh_hostname() { uci -q get system.@system[0].hostname 2>/dev/null || echo "openwrt"; }
 mesh_board()    { cat /tmp/sysinfo/board_name 2>/dev/null || echo "unknown"; }
 mesh_fwver()    { . /etc/openwrt_release 2>/dev/null; echo "${DISTRIB_DESCRIPTION:-OpenWrt}"; }
+
+# 本插件自身的版本（不是固件版本）。取自随包落盘的 /usr/libexec/mesh/version ——
+# 包数据库里的版本会撒谎（真机上 apk 可能记的是随固件编进来的旧版），这个文件
+# 随每次安装/升级被覆盖，永远等于真实落地的文件版本（见 Makefile 里的注释）。
+# 文件缺失（老版本未随包发放）时回退到 unknown，前端照常显示，不断链。
+mesh_plugin_ver() {
+	local v
+	v=$(cat /usr/libexec/mesh/version 2>/dev/null | tr -d ' \t\r\n')
+	[ -n "$v" ] || v=unknown
+	echo "$v"
+}
 
 mesh_route_dev() { ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\) .*/\1/p' | head -n1; }
 

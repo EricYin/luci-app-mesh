@@ -184,6 +184,24 @@ return view.extend({
 			tips
 		]);
 
+		/* ---------- 软件版本 ---------- */
+		/* 只读展示，数据来自后端 meshctl status 的 fwver / plugin_ver 字段。
+		   分两行：插件版本（本包自身）+ 固件版本（宿主 OpenWrt 发行版描述）。
+		   plugin_ver 取 /usr/libexec/mesh/version，比包数据库更可信（见后端注释）。 */
+		function verRow(label, value) {
+			return E('div', { 'class': 'mesh-ver-row' }, [
+				E('span', { 'class': 'mesh-ver-label' }, label),
+				E('span', { 'class': 'mesh-ver-value' }, value || _('未知'))
+			]);
+		}
+
+		var verSec = section(_('软件版本'), [
+			E('div', { 'class': 'mesh-ver-box' }, [
+				verRow(_('插件版本'), d.plugin_ver),
+				verRow(_('固件版本'), d.fwver)
+			])
+		]);
+
 		/* ---------- 日志 ---------- */
 		var logBox = E('pre', { 'class': 'mesh-log', 'id': 'mesh-log-box' }, _('加载中…'));
 		var chkSyslog = E('input', { type: 'checkbox' });
@@ -266,6 +284,7 @@ return view.extend({
 		return E('div', {}, [
 			section(_('射频能力'), radiosTable(d)),
 			maintSec,
+			verSec,
 			logSec
 		]);
 	}

@@ -1189,6 +1189,7 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
  "hostname": "$(mesh_esc "$(mesh_hostname)")",
  "model": "$(mesh_esc "$(mesh_board)")",
  "fwver": "$(mesh_esc "$(mesh_fwver)")",
+ "plugin_ver": "$(mesh_esc "$(mesh_plugin_ver)")",
  "lan_ip": "$(mesh_esc "$lanip")",
  "lan_proto": "$(mesh_esc "$lanproto")",
  "mac": "$(mesh_esc "$(mesh_primary_mac)")",
@@ -1915,6 +1916,10 @@ cmd_pair_join() {
 		#   配上 r33 的绑设备发送 + 主机路由，就能从配对网卡正常出去。
 		#   主节点开窗期间才挂着这个地址，旧版主节点没有它 —— 那种情况下仍会超时，
 		#   超时提示里会明确说明。
+		# ★ r45：备用地址必须落在 RFC1918 私网段（见 functions.sh 的 MESH_PAIR_ALIAS）。
+		#   若用非私网地址（旧版是 192.0.2.1），主节点 uhttpd 的 rfc1918_filter=1 会以
+		#   "RFC1918 源 → public 目的"为由回 403 —— 子节点明明连上了配对 AP、也拿到了
+		#   地址，却一次凭证都领不到。换成私网地址后是"私网→私网"，不再被拦。
 		cand="$MESH_PAIR_ALIAS $cand2"
 		echo "      本机内网与主节点撞号，改走备用地址 $MESH_PAIR_ALIAS"
 	else
