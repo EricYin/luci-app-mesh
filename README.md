@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r40`（`PKG_RELEASE` 40）
+- 当前版本：`1.0.0-r41`（`PKG_RELEASE` 41）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r40.apk
-opkg install luci-app-mesh_1.0.0-r40_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r41.apk
+opkg install luci-app-mesh_1.0.0-r41_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -426,6 +426,30 @@ sh install.sh
   理由本来就写在注释里 —— 拒绝是为了"别打断正在跑的回程"；**回程压根没起来时
   没有任何可打断的通路，就该放行**。
 - 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
+
+### r41（2026-10-06）
+备份机制的三处小改 + 维护页新增「刷新备份」按钮和日志区。
+
+- **`mesh_backup_once` 只在"未入网"时才重建还原点**（原来是有备份就永不刷新）。
+  真机 .219 的备份停在两天前，那时退出组网会把用户后来改的 WiFi 名称密码、防火墙、
+  DHCP 全退回去。判据：已有备份**且** `main.enabled=1`（在网）才保留；未入网就重建。
+  未入网时配置天然干净，重建不会把组网状态固化进去。
+- **`mesh_do_revert` 清洗 role**：残留 `client` 的后果最严重 —— 这台机器下次想当
+  主节点时，apply 会直接走子节点分支（删 wan 接口、WAN 口并进 br-lan、LAN 改 DHCP），
+  而它本该是出口，且**静默发生不报错**。代价只是下次组网要在状态页点一下选角色。
+- **`mesh_do_revert` 清理还原回来的 mesh 段**：备份可能是在"已开过窗"状态下建的，
+  整份拷回会让配对 AP 段复活（公开密码长期广播）。按**内容**认定清理（mode=mesh、
+  配对 AP 特征），不认段名，兼容 r39 之前的匿名段。network 侧不用清 —— 实测三台
+  备份都不含 bat0/batmesh。
+- **新增 `meshctl backup-refresh` / `mesh_backup_refresh()`**：以当前配置为底重建
+  还原点并剔除组网相关内容。三步保证安全：先复制到临时目录净化（失败绝不动真实
+  备份）、覆盖前留存 `/etc/mesh-backup.prev`、闪存不足 256KB 直接放弃。
+  ⚠ 全程只用 `uci delete` / `del_list`，**绝不 `uci set` 任何 ipaddr**（这台固件是
+  `list ipaddr 'x/24'` 写法，`uci set` 会写掉 /24 前缀导致整机失联 —— 血的教训）。
+- **新增 `meshctl log [行数] [--syslog]`** 与维护页日志区：200 行、可勾选附带
+  logread、刷新/复制/下载（复制下载纯前端，无需后端改动与额外权限）。
+  rpcd 白名单已加 `backup-refresh`；`log` 因需带参数单独走分支。
+- 维护页显示备份创建时间；还原按钮的确认文案改掉过期的"路由器将重启"。
 
 ### r40（2026-10-06）
 修「**启用主节点 = PON 断网**」——光口上行机型上，一启用组网外网就全断，PON 状态

@@ -2692,7 +2692,14 @@ mesh_brlan_members_report() {
 
 # ---------------- 备份 / 还原 ----------------
 mesh_backup_once() {
-	[ -d "$MESH_BACKUP_DIR/config" ] && return 0
+	# ★ "有备份就不刷新"会让还原点停在很久以前（r41）。
+	#   真机 .219 的备份就停在两天前 —— 那时退出组网，会把用户后来改的 WiFi 名称
+	#   密码、防火墙、DHCP 全部退回去。改成：**未入网时就重建**，在网时才保留。
+	#   未入网 = 配置天然干净（没有 mesh 回程段 / 配对 AP / bat0），这时重建绝不会
+	#   把组网状态固化进备份；在网时想刷新请用 mesh_backup_refresh（它先净化再写）。
+	[ -d "$MESH_BACKUP_DIR/config" ] && [ "$(mesh_uci_getd main.enabled 0)" = "1" ] && return 0
+	# 未入网（或还没有备份）：重建。先清空旧目录，避免留下上次多出来的文件。
+	rm -rf "$MESH_BACKUP_DIR/config"
 	mkdir -p "$MESH_BACKUP_DIR/config"
 	local f
 	# mesh 也备份：用户在组网前调过的按键档位、TTL、配对参数都在这里，
@@ -2721,11 +2728,32 @@ mesh_do_revert() {
 	#   留下残影的，用户以为是"没退干净"）。所以先还原（保住用户自己调过的
 	#   档位 / TTL / 配对参数），再把凭证类字段清空，让本机回到"从未入网"的状态。
 	uci set mesh.main.enabled=0
-	uci set mesh.main.status_text='已还原组网前配置'
+	uci set mesh.main.status_text='已还原组网前配置（请先选择本节点角色）'
 	uci set mesh.main.mesh_id=''
 	uci set mesh.main.mesh_key=''
 	uci set mesh.main.master_addr=''
+	# ★ role 也要清（r41）。残留 client 的后果最严重：下次这台机器想当主节点时，
+	#   apply 会直接走子节点分支 —— 删掉 wan 接口、把 WAN 口并进 br-lan、LAN 改 DHCP，
+	#   而它本该是出口。这是静默发生的，不报错。清空的代价只是下次组网要多点一下
+	#   选角色（状态页就能选），比踩坑划算。
+	uci set mesh.main.role=''
 	uci commit mesh
+	# ★ 备份可能是在"已经组上网 / 已经开过窗"的状态下建的（老版本建备份时没做净化），
+	#   整份拷回来会把 mesh 回程段和配对 AP 段一起带回来 —— 配对 AP 会重新长期广播
+	#   （公开密码、桥进内网）。所以还原后按**内容**再清一遍：只认 mode=mesh 和
+	#   配对 AP 的特征，不认段名，这样 r39 之前的匿名段 / wifinetN 也照样能清掉。
+	#   网络侧不用清：实测三台的 network 备份都不含 bat0 / batmesh，整份覆盖回去
+	#   本来就是干净的。
+	#   注意顺序：这里的删除必须在下面的 wifi reload 之前完成。
+	local sec victims=""
+	for sec in $(mesh_wifi_ifaces); do
+		[ "$(uci -q get "wireless.$sec.mode" 2>/dev/null)" = "mesh" ] && victims="$victims $sec"
+	done
+	victims="$victims $(mesh_pair_ap_sections 2>/dev/null)"
+	for sec in $victims; do
+		uci -q delete "wireless.$sec" 2>/dev/null
+	done
+	[ -n "$victims" ] && uci commit wireless
 	rm -rf "$MESH_STATE_DIR"
 	rm -f "$MESH_TMP_DIR"/lastok "$MESH_TMP_DIR"/lastfail "$MESH_TMP_DIR"/failreason "$MESH_TMP_DIR"/registry.tsv
 	mesh_log info "已还原组网前配置（备份于 $(cat "$MESH_BACKUP_DIR/created" 2>/dev/null)）"
@@ -2766,6 +2794,79 @@ mesh_net_revert_apply() {
 	fi
 	mesh_log warn "还原后管理地址仍不可达，兜底重启路由器"
 	reboot
+	return 0
+}
+
+# 手动刷新备份（r41）：以**当前配置**为底，剔除组网相关内容后覆盖"组网前备份"。
+# 与 mesh_backup_once 的分工：那个只在未入网时才建 / 重建，在网时一律不动；
+# 这个由用户在维护页主动触发，解决"长期在网 → 还原点停在很久以前"的问题。
+# ★ 安全设计：
+#   ① 先复制到临时目录净化，净化失败也绝不会动到真实备份；
+#   ② 覆盖前把旧备份留一份到 /etc/mesh-backup.prev，刷新后可退回；
+#   ③ 净化的对象不只是"现在正在用的组网配置"，还包括老版本建备份时夹带进来的
+#      残留（匿名段 / wifinetN），所以一律按**内容**认定，不认段名前缀。
+# ⚠ 红线：全程只用 uci delete / del_list，**绝不 uci set 任何 ipaddr** ——
+#   这台固件是 list ipaddr 'x/24' 写法，uci set 会写掉 /24 前缀导致整机失联。
+mesh_backup_refresh() {
+	local tmp="$MESH_TMP_DIR/backup-refresh"
+	local f sec victims="" idx n avail
+	mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+	rm -rf "$tmp"; mkdir -p "$tmp"
+	# 闪存余量检查：实测单份备份 24KB，这里要求至少留 256KB
+	avail=$(df -k /etc 2>/dev/null | awk 'NR==2 {print $4}')
+	if [ -n "$avail" ] && [ "$avail" -lt 256 ]; then
+		mesh_log warn "闪存剩余不足 256KB，放弃刷新备份"
+		rm -rf "$tmp"
+		return 1
+	fi
+	for f in wireless network dhcp firewall mesh; do
+		[ -f "/etc/config/$f" ] && cp -a "/etc/config/$f" "$tmp/$f"
+	done
+	# ---- 在临时副本上净化（uci -c 指向副本，真实配置全程未被触碰）----
+	# ① wireless：删 mesh 回程段
+	for sec in $(uci -c "$tmp" -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -c "$tmp" -q get "wireless.$sec.mode" 2>/dev/null)" = "mesh" ] && victims="$victims $sec"
+	done
+	# ② wireless：删配对 AP 段（副本段名与真实配置一致，直接用认出来的名字）
+	for sec in $(mesh_pair_ap_sections 2>/dev/null); do
+		victims="$victims $sec"
+	done
+	for sec in $victims; do
+		uci -c "$tmp" -q delete "wireless.$sec" 2>/dev/null
+	done
+	uci -c "$tmp" commit wireless 2>/dev/null
+	# ③ network：删 bat0 / batmesh 接口，并把 bat0 从 br-lan 的桥成员里摘掉
+	uci -c "$tmp" -q delete network.bat0 2>/dev/null
+	uci -c "$tmp" -q delete network.batmesh 2>/dev/null
+	n=$(uci -c "$tmp" -q show network 2>/dev/null | grep -c '=device')
+	idx=0
+	while [ "$idx" -lt "${n:-0}" ]; do
+		[ "$(uci -c "$tmp" -q get "network.@device[$idx].name" 2>/dev/null)" = "br-lan" ] &&
+			uci -c "$tmp" -q del_list "network.@device[$idx].ports"='bat0' 2>/dev/null
+		idx=$((idx+1))
+	done
+	uci -c "$tmp" commit network 2>/dev/null
+	# ④ mesh：只清凭证与角色，保留按键档位 / TTL / 配对参数 / 信道等个人设置
+	if [ -f "$tmp/mesh" ]; then
+		uci -c "$tmp" -q set mesh.main.enabled=0
+		uci -c "$tmp" -q set mesh.main.role=''
+		uci -c "$tmp" -q set mesh.main.mesh_id=''
+		uci -c "$tmp" -q set mesh.main.mesh_key=''
+		uci -c "$tmp" -q set mesh.main.master_addr=''
+		uci -c "$tmp" -q set mesh.main.status_text=''
+		uci -c "$tmp" commit mesh 2>/dev/null
+	fi
+	# ---- 覆盖 ----
+	rm -rf "$MESH_BACKUP_DIR.prev"
+	[ -d "$MESH_BACKUP_DIR" ] && cp -a "$MESH_BACKUP_DIR" "$MESH_BACKUP_DIR.prev"
+	rm -rf "$MESH_BACKUP_DIR"
+	mkdir -p "$MESH_BACKUP_DIR/config"
+	for f in wireless network dhcp firewall mesh; do
+		[ -f "$tmp/$f" ] && cp -a "$tmp/$f" "$MESH_BACKUP_DIR/config/$f"
+	done
+	date '+%Y-%m-%d %H:%M:%S' > "$MESH_BACKUP_DIR/created"
+	rm -rf "$tmp"
+	mesh_log info "已刷新组网前配置备份（已剔除组网相关配置；旧备份留存于 $MESH_BACKUP_DIR.prev）"
 	return 0
 }
 

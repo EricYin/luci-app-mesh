@@ -135,7 +135,13 @@ case "$1" in
 						*) out='用法：arg 必须是 master 或 client'; code=1;;
 					esac
 					;;
-				diag|sync|revert|port_bridging|confirm_rollback)
+				log)
+					# 同步执行（tail 一个内存里的小文本，毫秒级）
+					# arg = "行数"（默认 200）或 "行数 --syslog"（额外附 logread 内容）
+					out=$("$MESHCTL" log $arg 2>&1)
+					code=$?
+					;;
+				diag|sync|revert|port_bridging|confirm_rollback|backup-refresh)
 						out=$("$MESHCTL" "$cmd" 2>&1)
 						code=$?
 						;;

@@ -1,7 +1,7 @@
 #!/bin/sh
 # meshctl - luci-app-mesh 主控制器
 # 用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging
-#                |pair-open|pair-close|pair-status|pair-join>
+#                |backup-refresh|log|pair-open|pair-close|pair-status|pair-join>
 . /usr/libexec/mesh/functions.sh
 
 JF=$(command -v jsonfilter || echo /usr/bin/jsonfilter)
@@ -1223,7 +1223,8 @@ $(mesh_registry_json)
  "button": {"enabled": $bt_on, "led": "$(mesh_esc "${bt_led:--}")", "join_max": $bt_jmax, "open_min": $bt_omin, "open_max": $bt_omax, "exit_min": $bt_emin, "exit_max": $bt_emax, "grace": $bt_grace, "last": {"op": "$(mesh_esc "${bt_op:--}")", "seen": $bt_seen, "code": $bt_code, "time": $bt_time, "msg": "$(mesh_esc "${bt_msg:-}")"}, "pending_exit": {"active": $bt_pend, "remain": $bt_pend_left}},
  "rollback": {"active": $rb_active, "ip": "$(mesh_esc "$rb_ip")", "deadline": $rb_deadline, "remain": $rb_left},
  "daemon_running": $(pgrep -f 'meshctl daemon' >/dev/null 2>&1 && echo true || echo false),
- "backup_exists": $([ -d "$MESH_BACKUP_DIR/config" ] && echo true || echo false)
+ "backup_exists": $([ -d "$MESH_BACKUP_DIR/config" ] && echo true || echo false),
+ "backup_created": "$(mesh_esc "$(cat "$MESH_BACKUP_DIR/created" 2>/dev/null)")"
 }
 EOF
 }
@@ -1573,6 +1574,43 @@ cmd_diag() {
 cmd_revert() {
 	mesh_do_revert || { echo "错误：未找到组网前备份"; return 1; }
 	echo "已还原组网前配置，正在重新加载网络/无线（无需重启）。"
+	echo "提示：还原后需要重新选择本节点角色（主节点 / 子节点）再应用。"
+}
+
+# ================= 刷新组网前备份（维护页按钮） =================
+# 用法: meshctl backup-refresh
+# 以当前配置为底重建还原点，并剔除组网相关内容（mesh 回程段 / 配对 AP 段 /
+# bat0 / batmesh / 组网凭证 / 角色）。保留 WiFi 名称密码、LAN 地址、端口分配、
+# 防火墙、DHCP、按键档位等个人设置。旧备份会先留一份到 /etc/mesh-backup.prev。
+cmd_backup_refresh() {
+	mesh_lock || { echo "错误：另一个组网操作正在进行（配置锁被占用），请稍后重试"; return 1; }
+	mesh_backup_refresh
+	local rc=$?
+	mesh_unlock
+	[ "$rc" = 0 ] && echo "已刷新组网前备份（剔除组网相关配置，旧备份留存于 /etc/mesh-backup.prev）"
+	return $rc
+}
+
+# ================= 查看日志（维护页日志区） =================
+# 用法: meshctl log [行数] [--syslog]
+#   --syslog 时额外附上 logread 里本插件相关的记录（内存日志重启即失，syslog 更早）。
+cmd_log() {
+	local n=200 sys=0 arg
+	for arg in "$@"; do
+		case "$arg" in
+			--syslog) sys=1;;
+			[0-9]*)   n="$arg";;
+		esac
+	done
+	[ -f "$MESH_LOG" ] || { echo "（暂无日志记录）"; return 0; }
+	echo "=== 插件日志 $MESH_LOG（最近 $n 行） ==="
+	tail -n "$n" "$MESH_LOG" 2>/dev/null
+	if [ "$sys" = 1 ]; then
+		echo
+		echo "=== 系统日志（logread，最近 $n 行中与本插件相关的内容） ==="
+		logread 2>/dev/null | grep -iE 'mesh|batman|bat0|mesh0|wpa_supplicant.*mesh' | tail -n "$n"
+	fi
+	return 0
 }
 
 cmd_confirm_rollback() {
@@ -2272,6 +2310,8 @@ case "$1" in
 	revert)           cmd_revert;;
 	confirm_rollback) cmd_confirm_rollback;;
 	port_bridging)    cmd_port_bridging;;
+	backup-refresh)   shift; cmd_backup_refresh "$@";;
+	log)              shift; cmd_log "$@";;
 	pair-open)        shift; cmd_pair_open "$@";;
 	pair-close)       cmd_pair_close;;
 	pair-status)      cmd_pair_status;;
@@ -2279,7 +2319,7 @@ case "$1" in
 	set-role)         shift; cmd_set_role "$@";;
 	button)           shift; cmd_button "$@";;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|pair-open|pair-close|pair-status|pair-join|set-role|button>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|backup-refresh|log|pair-open|pair-close|pair-status|pair-join|set-role|button>"
 		exit 1
 		;;
 esac
