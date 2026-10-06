@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-mesh
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=43
+PKG_RELEASE:=44
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=Xx
 
@@ -48,8 +48,17 @@ endef
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(CURDIR)/root/usr/sbin/meshctl $(1)/usr/sbin/
+# 在线安装/升级/卸载脚本：随包落地后，设备上直接 `mesh-install upgrade` 即可升级，
+# 不必每次都去 GitHub 重新取脚本本身。它不依赖本包其余部分，可独立运行。
+	$(INSTALL_BIN) $(CURDIR)/mesh-install.sh $(1)/usr/sbin/mesh-install
 	$(INSTALL_DIR) $(1)/usr/libexec/mesh
 	$(INSTALL_DATA) $(CURDIR)/root/usr/libexec/mesh/functions.sh $(1)/usr/libexec/mesh/
+# 版本号落盘文件：mesh-install.sh 靠它判断"实际装了哪一版"。
+# 为什么需要它：包数据库里的版本会撒谎 —— 真机上 apk 记的是随固件编进来的
+# 1.0.0-r23，而实际文件早被手动覆盖成 r43，于是"要不要升级"根本判不准。
+# 该文件随每次安装/升级被覆盖，永远等于当前落地文件的版本。
+# ⚠ 必须与 MANIFEST 同步：新增随包文件时两边都要改（CI 有校验 job）。
+	$(INSTALL_DATA) $(CURDIR)/root/usr/libexec/mesh/version $(1)/usr/libexec/mesh/
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) $(CURDIR)/root/usr/libexec/rpcd/mesh $(1)/usr/libexec/rpcd/mesh
 	$(INSTALL_DIR) $(1)/etc/init.d

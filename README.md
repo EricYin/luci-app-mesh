@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r43`（`PKG_RELEASE` 43）
+- 当前版本：`1.0.0-r44`（`PKG_RELEASE` 44）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -45,7 +45,12 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 ```
 luci-app-mesh/
 ├── Makefile                                  # OpenWrt feed 打包（依赖 / conffiles / postinst）
-├── install.sh                                # 免编译直装脚本（复制到设备上 sh install.sh）
+├── MANIFEST                                  # ★ 文件清单单一真相源（源路径|目标路径|权限）
+├── install.sh                                # 免编译直装（按 MANIFEST 安装）
+├── mesh-install.sh                           # ★ 在线安装/升级/卸载（GitHub Release 或本地包）
+├── .github/
+│   ├── workflows/release.yml                 #   CI：24.10 SDK→ipk ‖ 25.12 SDK→apk
+│   └── scripts/check-manifest.sh             #   校验 MANIFEST / Makefile / 内置清单一致
 ├── htdocs/luci-static/resources/view/mesh/   # LuCI JS 界面
 │   ├── overview.js                           #   组网状态
 │   ├── settings.js                           #   组网设置
@@ -58,13 +63,19 @@ luci-app-mesh/
     ├── etc/init.d/99-dawn-roaming            # 漫游自检：校正 dawn 广播地址 / umdns 绑定
     ├── etc/hotplug.d/iface/30-mesh-bat-mtu   # 接口 up 时事件驱动补 bat0 hardif MTU
     ├── etc/nginx/conf.d/mesh-sync.locations  # Kwrt 等 nginx+uwsgi 固件专用（uhttpd 忽略）
-    ├── usr/sbin/meshctl                      # 核心命令行，8 个子命令
+    ├── usr/sbin/meshctl                      # 核心命令行
+    ├── usr/sbin/mesh-install                 # 随包落地的在线安装脚本（= mesh-install.sh）
     ├── usr/libexec/mesh/functions.sh         # 全部组网函数库（apply / revert / 同步 / 探测…）
+    ├── usr/libexec/mesh/version              # ★ 真实已装版本号
     ├── usr/libexec/rpcd/mesh                 # ubus 插件：LuCI JS ↔ meshctl 的桥 + 命令白名单
     ├── usr/share/luci/menu.d/luci-app-mesh.json
     ├── usr/share/rpcd/acl.d/luci-app-mesh.json
     └── www/cgi-bin/mesh-sync                 # 主节点配置下发端点（CGI，返回 JSON）
 ```
+
+> **为什么有 `MANIFEST`**：Makefile 的 `Package/install` 段与 `install.sh` 曾经是两份各自维护的清单，结果 `install.sh` 长期漏装 3 个文件（`rc.wps/10-mesh` 按键组网、`uci-defaults/40-...`、nginx conf）—— 走直装的机器上"按键一键组网"根本不存在。现在 `install.sh` 只认 `MANIFEST`，CI 里 `check-manifest.sh` 会把它与 Makefile、以及 `mesh-install.sh` 的内置清单三方比对，不一致直接红。
+>
+> **为什么有 `version` 文件**：包数据库的版本会撒谎 —— 真机上 apk 记的是随固件编进来的 `1.0.0-r23`，实际文件早被手动覆盖到 r43+，"要不要升级"因此判不准。该文件随每次安装/升级被覆盖，永远等于真实落地版本。
 
 `meshctl` 子命令：`apply`（应用组网，前后台各一段）、`status`（状态 JSON）、`diag`（诊断输出）、`sync`（手动同步一次）、`daemon`（守护循环）、`revert`（还原组网前配置）、`confirm_rollback`（保留新管理地址）、`port_bridging`（端口并入内网·手动）。
 
@@ -110,14 +121,54 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r43.apk
-opkg install luci-app-mesh_1.0.0-r43_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r44.apk
+opkg install luci-app-mesh_1.0.0-r44_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
 ```
 
 装完浏览器打开 `http://<设备IP>/cgi-bin/luci/` → **网络 → Mesh 组网**；菜单没出现就 Ctrl+F5 强刷（必要时重启 uhttpd）。
+
+### 方式三：在线安装 / 升级 / 卸载（`mesh-install.sh`）
+
+装过一次之后脚本会随包落到 `/usr/sbin/mesh-install`，之后直接 `mesh-install upgrade` 即可，不用再去 GitHub 取脚本。
+
+```sh
+# 首次：取脚本
+curl -fsSL -o /tmp/mesh-install.sh \
+  https://raw.githubusercontent.com/xxosdev/luci-app-mesh/main/mesh-install.sh
+sh /tmp/mesh-install.sh install
+
+# 升级（默认保留配置）
+mesh-install upgrade                       # 取最新
+mesh-install upgrade --ver=1.0.0-r44       # 指定版本
+mesh-install upgrade --no-keep-config      # 不保留：配置回到出厂默认值
+
+# 卸载（默认保留配置，卸载后自动拷回）
+mesh-install uninstall
+mesh-install uninstall --no-keep-config    # 连配置/还原点一起清
+mesh-install uninstall --revert            # 卸载前先退出组网（推荐在网机器用）
+
+# 离线 / 内网：本地包、源码压缩包或项目目录
+mesh-install install --from=/tmp/luci-app-mesh-1.0.0-r44.apk
+mesh-install upgrade --from=/tmp/luci-app-mesh-src.tar.gz
+mesh-install upgrade --from=/tmp/luci-app-mesh/        # 解压后的项目目录
+
+# 看本机状态（版本 / 包管理器 / 文件落地 / 组网 / 还原点）
+mesh-install info
+```
+
+**通道策略**：`pkg` 优先 —— 按本机包管理器下载 `luci-app-mesh.apk`（25.12+）或 `luci-app-mesh.ipk`（24.10-）交给包管理器安装；**依赖解析失败或无软件源时自动兜底**到 `src`（下载源码 `tar.gz`，解包后按 MANIFEST 逐项复制）。想强制走源码通道加 `--src`。
+
+| 动作 | 保留配置（默认） | 不保留配置（`--no-keep-config`） |
+|---|---|---|
+| 升级 | conffile 机制自动保留；若产生 `/etc/config/mesh.apk-new`（或 `-opkg`）会提示 | 装前删除 `/etc/config/mesh`、`/etc/mesh-backup`、`/etc/mesh-state`，装完即出厂值（`enabled=0`、凭证为空） |
+| 卸载 | 配置/还原点/状态先存到 `/etc/mesh-config.keep/`，卸载后拷回 | 全部删除，回到从未装过的状态 |
+
+补充选项：`--mirror=<前缀>`（GitHub 不通时走镜像，如 `https://ghfast.top/`）、`--channel=main`（拉主分支源码包）、`--force`（同版本也重装）、`--yes`（非交互，询问取默认值）。
+
+> ⚠ **卸载为什么要"补扫残留"**：本机包数据库里登记的版本可能是随固件编进来的旧版（真机上实测 apk 记 `1.0.0-r23`，实际文件是 r43+），`apk del` 会按**旧清单**删文件，r30 之后新增的（如 `/etc/rc.wps/10-mesh`）它根本不认识。脚本在包管理器删完后会按内置清单再扫一遍，`mesh-install info` 也会在两者不一致时告警。
 
 ---
 
@@ -426,6 +477,52 @@ sh install.sh
   理由本来就写在注释里 —— 拒绝是为了"别打断正在跑的回程"；**回程压根没起来时
   没有任何可打断的通路，就该放行**。
 - 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
+
+### r44（2026-10-06）★ 单一文件清单 + 在线安装/升级/卸载 + CI 编译
+
+新增在线运维能力与两条根因修复，不含组网逻辑改动。
+
+**① 新增 `MANIFEST` 作为文件清单单一真相源**
+- 此前 Makefile 的 `Package/install` 段与 `install.sh` 是两份各自维护的清单，
+  结果 `install.sh` **长期漏装 3 个文件**：`etc/rc.wps/10-mesh`（r30 按键一键组网）、
+  `etc/uci-defaults/40-luci-app-mesh-roaming`（r23 预装补偿）、
+  `etc/nginx/conf.d/mesh-sync.locations`。走直装的机器上按键组网根本不存在。
+- 现在 `install.sh` 只按 MANIFEST 安装；CI 的 `check-manifest.sh` 把
+  **MANIFEST / Makefile install 段 / mesh-install.sh 内置清单三方比对**，不一致直接红。
+
+**② `install.sh` 不再用 `install` 命令**
+- 目标固件的 busybox **没有编进 `install` 这个小程序**（三台实测
+  `command -v install` 全空），原写法在这些机器上直接 `install: not found`。
+  改用 `mkdir -p` + `cp` + `chmod`。
+- 覆盖前先 `/etc/init.d/mesh stop`：`/usr/sbin/meshctl` 带 shebang，内核以 execve
+  执行它，进程在跑时覆盖会 **ETXTBSY**。
+
+**③ 新增 `/usr/libexec/mesh/version`**
+- 包数据库的版本会撒谎（真机 apk 记 `1.0.0-r23`，实际文件 r43+），
+  "要不要升级"因此判不准。该文件随每次安装/升级覆盖，永远等于真实落地版本。
+
+**④ 新增 `mesh-install.sh`（随包落地为 `/usr/sbin/mesh-install`）**
+- `install / upgrade / uninstall / info` 四个子命令，细节见上面「方式三」。
+- 通道：pkg（apk/ipk）优先，依赖解析失败或无源自动兜底 src（源码 tar.gz）；
+  也支持 `--from` 指定本地包/压缩包/目录。
+- 升级默认保留配置；卸载默认保留（存 `/etc/mesh-config.keep/` 后拷回）、
+  在网时询问是否先退出组网、包管理器删完再按内置清单补扫残留。
+- 下载走 GitHub Release 固定名 URL，`--mirror` 可换镜像，下载后校 sha256（不一致即放弃）。
+
+**⑤ 新增 GitHub Actions（`.github/workflows/release.yml`）**
+- 两条并行 SDK：`build-ipk`（24.10.4 SDK，`CONFIG_USE_APK=n`）与
+  `build-apk`（25.12 SDK，`CONFIG_USE_APK=y`）—— **包格式由 SDK 决定，不是开关**，
+  同一个 SDK 出不了两种格式。
+- 本包 `LUCI_PKGARCH:=all`，一套 x86/64 SDK 覆盖全部设备架构，无需多架构矩阵。
+- 产物：版本名 + **固定名副本**（脚本可用 `latest/download/luci-app-mesh.apk`
+  稳定取包）+ 源码包 + `sha256sums.txt`；tag 与 Makefile 版本不一致时 CI 直接报错。
+
+**真机验证（192.168.1.245，src 通道完整闭环）**
+- `info` 正确报出"文件版本 r43 / 数据库版本 r23 不一致"并告警。
+- 安装：19 个文件写入 + `/etc/config/mesh` 按现有配置保留 → `info` 20 存在 / 0 缺失。
+- 卸载：4 份配置存入 `/etc/mesh-config.keep/`，`apk del` 后又**补删了 4 个旧清单
+  不认识的残留文件**，配置自动拷回，`enabled=1 / role=client / mesh_id` 全部保留。
+- 重装恢复：20/0，`mesh0` 对端 2 个，守护进程与 97/99 的 cron 条目均恢复。
 
 ### r43（2026-10-06）★ 真根因
 修 `rpc.declare` 的 `expect` 用法错误 —— 日志区拿不到内容、按钮提示变占位文案、

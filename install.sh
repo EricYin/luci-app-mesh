@@ -1,47 +1,50 @@
 #!/bin/sh
 # luci-app-mesh 免编译安装脚本（直接复制到运行中的 OpenWrt）
 # 用法: 在 OpenWrt 上执行  sh install.sh
+#
+# ★ 文件清单改为读 MANIFEST（单一真相源），不再在脚本里逐个写死。
+#   此前脚本与 Makefile 各维护一份清单，本脚本长期漏装 3 个文件
+#   （rc.wps/10-mesh 按键组网、uci-defaults/40-...、nginx conf），
+#   走直装的机器上"按键一键组网"根本不存在。细节见 MANIFEST 顶部注释。
+#
+# 注：在线安装 / 升级 / 卸载请用 mesh-install.sh；本脚本只负责"把目录里的
+#     文件按清单装好"，mesh-install.sh 的源码通道也是解包后调用本脚本。
 set -e
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$SRC/MANIFEST" ] || { echo "错误：请在项目目录中运行（缺少 MANIFEST）"; exit 1; }
 [ -f "$SRC/root/usr/sbin/meshctl" ] || { echo "错误：请在项目目录中运行"; exit 1; }
 
-echo "==> 安装后端"
-install -d /usr/libexec/mesh
-install -m 755 "$SRC/root/usr/sbin/meshctl" /usr/sbin/meshctl
-install -m 644 "$SRC/root/usr/libexec/mesh/functions.sh" /usr/libexec/mesh/functions.sh
-install -m 755 "$SRC/root/etc/init.d/mesh" /etc/init.d/mesh
-echo "==> 安装 hotplug（batman-adv hardif MTU 事件驱动兜底）"
-install -d /etc/hotplug.d/iface
-install -m 755 "$SRC/root/etc/hotplug.d/iface/30-mesh-bat-mtu" /etc/hotplug.d/iface/30-mesh-bat-mtu
-install -d /www/cgi-bin
-install -m 755 "$SRC/root/www/cgi-bin/mesh-sync" /www/cgi-bin/mesh-sync
-
-echo "==> 安装无线漫游自检脚本（97 补 802.11k/v/r · 99 校正 dawn/umdns）"
-install -m 755 "$SRC/root/etc/init.d/97-wifi-roaming" /etc/init.d/97-wifi-roaming
-install -m 755 "$SRC/root/etc/init.d/99-dawn-roaming" /etc/init.d/99-dawn-roaming
-
-echo "==> 安装 rpcd 插件（LuCI JS 界面通过 ubus 调用 meshctl）"
-install -d /usr/libexec/rpcd
-install -m 755 "$SRC/root/usr/libexec/rpcd/mesh" /usr/libexec/rpcd/mesh
-install -d /usr/share/rpcd/acl.d
-install -m 644 "$SRC/root/usr/share/rpcd/acl.d/luci-app-mesh.json" /usr/share/rpcd/acl.d/luci-app-mesh.json
-
-echo "==> 安装配置（不覆盖已有）"
-if [ -f /etc/config/mesh ]; then
-	echo "    /etc/config/mesh 已存在，保留现有配置"
-else
-	install -m 644 "$SRC/root/etc/config/mesh" /etc/config/mesh
+echo "==> 按 MANIFEST 安装文件"
+# ★ 先停守护进程：/usr/sbin/meshctl 带 shebang，内核以 execve 方式执行它，
+#   进程在跑时覆盖该文件会 ETXTBSY（Text file busy）。装完在末尾 restart。
+if [ -x /etc/init.d/mesh ]; then
+	/etc/init.d/mesh stop >/dev/null 2>&1 || true
 fi
-
-echo "==> 安装 LuCI 界面（JavaScript 版）"
-install -d /usr/share/luci/menu.d
-install -m 644 "$SRC/root/usr/share/luci/menu.d/luci-app-mesh.json" /usr/share/luci/menu.d/luci-app-mesh.json
-install -d /www/luci-static/resources/view/mesh
-for f in overview settings tools; do
-	install -m 644 "$SRC/htdocs/luci-static/resources/view/mesh/$f.js" /www/luci-static/resources/view/mesh/$f.js
-done
-install -m 644 "$SRC/htdocs/luci-static/resources/view/mesh/mesh.css" /www/luci-static/resources/view/mesh/mesh.css
+INSTALLED=0
+SKIPPED=0
+# IFS='|' 逐字段读：源路径 | 目标路径 | 权限
+while IFS='|' read -r src dst mode; do
+	case "$src" in
+		''|'#'*) continue ;;
+	esac
+	[ -n "$dst" ] && [ -n "$mode" ] || continue
+	# /etc/config/mesh 是活配置：已存在就必须保留（升级语义由包管理器/卸载脚本负责）
+	if [ "$dst" = "/etc/config/mesh" ] && [ -f /etc/config/mesh ]; then
+		echo "    $dst 已存在，保留现有配置"
+		SKIPPED=$((SKIPPED + 1))
+		continue
+	fi
+	[ -f "$SRC/$src" ] || { echo "错误：MANIFEST 里声明的文件不存在: $src"; exit 1; }
+	# ★ 不用 install 命令：目标固件的 busybox 没编进 install 这个小程序
+	#   （三台实测 `command -v install` 全部为空），必须用 cp + chmod 代替。
+	#   原写法 install -d/-m 在这些机器上会直接 "install: not found"。
+	mkdir -p "$(dirname "$dst")"
+	cp -f "$SRC/$src" "$dst" || { echo "错误：写入失败 $dst"; exit 1; }
+	chmod "$mode" "$dst"
+	INSTALLED=$((INSTALLED + 1))
+done < "$SRC/MANIFEST"
+echo "    已安装 $INSTALLED 个文件（跳过 $SKIPPED 个）"
 
 echo "==> 清理旧版 Lua 界面（若存在）"
 rm -f /usr/lib/lua/luci/controller/mesh.lua /usr/lib/lua/luci/view/mesh/*.htm \

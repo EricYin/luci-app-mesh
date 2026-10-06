@@ -1,0 +1,174 @@
+name: Build packages
+
+# 触发：打 tag（正式发布）或手动运行（不发 Release，只出产物）
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '发布为 GitHub Release（手动运行时勾选）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- 清单闸门
+  # install.sh 曾因"两份清单各自维护"长期漏装 3 个文件。这里在编译前就把
+  # MANIFEST / Makefile / mesh-install.sh 三处清单比对一遍，不一致直接红。
+  check:
+    name: 文件清单一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 MANIFEST 与 Makefile、内置清单一致
+        run: sh .github/scripts/check-manifest.sh
+
+  # ---------------------------------------------------------------- 编译
+  # ★ 包格式由 SDK 的 CONFIG_USE_APK 决定，不是开关：
+  #   24.10 SDK 只能出 ipk，25.12 SDK 只能出 apk —— 所以是两条并行 SDK，
+  #   不是同一 SDK 输出两种格式。
+  # ★ 本包 LUCI_PKGARCH:=all（架构无关），一套 x86/64 SDK 覆盖全部设备架构，
+  #   不需要多架构矩阵。
+  build:
+    name: 编译 ${{ matrix.format }}
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: ipk
+            sdk_dir: releases/24.10.4
+          - format: apk
+            sdk_dir: releases/25.12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本号
+        id: ver
+        run: |
+          V=$(sed -n 's/^PKG_VERSION:=//p' Makefile)
+          R=$(sed -n 's/^PKG_RELEASE:=//p' Makefile)
+          [ -n "$V" ] && [ -n "$R" ] || { echo "无法从 Makefile 解析版本号"; exit 1; }
+          echo "version=$V-r$R" >> "$GITHUB_OUTPUT"
+          echo "版本号: $V-r$R"
+
+      - name: 定位 SDK 下载地址
+        id: sdk
+        env:
+          SDK_DIR: ${{ matrix.sdk_dir }}
+        run: |
+          base="https://downloads.openwrt.org/$SDK_DIR/targets/x86/64"
+          file=$(curl -fsSL "$base/" | grep -o 'openwrt-sdk-[^"<>]*\.tar\.zst' | head -1 || true)
+          if [ -z "$file" ]; then
+            echo "::warning::$SDK_DIR 下没有 SDK，回退到 snapshot"
+            base="https://downloads.openwrt.org/snapshots/targets/x86/64"
+            file=$(curl -fsSL "$base/" | grep -o 'openwrt-sdk-[^"<>]*\.tar\.zst' | head -1 || true)
+          fi
+          [ -n "$file" ] || { echo "找不到 SDK"; exit 1; }
+          echo "url=$base/$file" >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      - name: 缓存 SDK
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/sdk.tar.zst
+          key: sdk-${{ matrix.format }}-${{ steps.sdk.outputs.file }}
+
+      - name: 下载 SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: curl -fsSL -o sdk.tar.zst "${{ steps.sdk.outputs.url }}"
+
+      - name: 准备构建环境
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd rsync
+          tar -I zstd -xf sdk.tar.zst
+
+      - name: 拉 luci feed（luci.mk 的出处）
+        run: |
+          cd openwrt-sdk-*
+          ./scripts/feeds update luci
+          ./scripts/feeds install luci
+
+      - name: 放入源码并编译
+        run: |
+          cd openwrt-sdk-*
+          mkdir -p package/luci-app-mesh
+          # 排除 .git 与 SDK 自身，避免把几百 MB 垃圾拷进包目录
+          rsync -a --exclude '.git' --exclude 'sdk.tar.zst' --exclude 'openwrt-sdk-*' \
+                "$GITHUB_WORKSPACE"/ package/luci-app-mesh/
+          make package/luci-app-mesh/compile V=s
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find bin -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} out/ \;
+          # 固定名副本：mesh-install.sh 用 .../releases/latest/download/<固定名>
+          # 这种稳定 URL 取包，不必事先知道版本号
+          # 注意：GitHub 的 run 默认走 `bash -e`，裸 `[ -f x ] && cp` 在匹配不到时
+          # 会让整个 step 失败 —— 必须写成 if
+          for f in out/*"${{ steps.ver.outputs.version }}"*.ipk; do
+            if [ -f "$f" ]; then cp "$f" out/luci-app-mesh.ipk; fi
+          done
+          for f in out/*"${{ steps.ver.outputs.version }}"*.apk; do
+            if [ -f "$f" ]; then cp "$f" out/luci-app-mesh.apk; fi
+          done
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.format }}
+          path: out/*
+
+  # ---------------------------------------------------------------- 发布
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析版本号并校验 tag
+        id: ver
+        run: |
+          V=$(sed -n 's/^PKG_VERSION:=//p' Makefile)
+          R=$(sed -n 's/^PKG_RELEASE:=//p' Makefile)
+          echo "version=$V-r$R" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            if [ "$TAG" != "v$V-r$R" ]; then
+              echo "::error::tag $TAG 与 Makefile 的 $V-r$R 不一致（打 tag 前先改 PKG_RELEASE）"
+              exit 1
+            fi
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 打源码包并生成校验值
+        run: |
+          git archive --format=tar.gz --prefix=luci-app-mesh/ \
+              -o dist/luci-app-mesh-src.tar.gz HEAD
+          cp dist/luci-app-mesh-src.tar.gz dist/luci-app-mesh-src-${{ steps.ver.outputs.version }}.tar.gz
+          cd dist
+          sha256sum * > sha256sums.txt
+          ls -l
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: luci-app-mesh v${{ steps.ver.outputs.version }}
+          files: dist/*
+          generate_release_notes: true

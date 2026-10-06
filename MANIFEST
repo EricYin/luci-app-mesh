@@ -1,0 +1,45 @@
+# luci-app-mesh 文件清单（单一真相源）
+#
+# 格式：  <仓库内源路径>|<设备目标绝对路径>|<权限>
+#   · 权限只写 755（可执行）或 644（数据）
+#   · 行首 # 为注释；空行忽略；不支持行内注释
+#
+# ★ 为什么要这份文件：
+#   Makefile 的 Package/install 段与 install.sh 曾经是两份各自维护的清单，
+#   结果 install.sh 长期漏装 3 个文件（etc/rc.wps/10-mesh 按键组网、
+#   etc/uci-defaults/40-luci-app-mesh-roaming、etc/nginx/conf.d/mesh-sync.locations）
+#   —— 走直装的机器上"按键一键组网"根本不存在，且改文件必漏。
+#   现在 install.sh 只认这份清单；CI 里 check-manifest.sh 会拿它跟
+#   Makefile 的 install 段逐项比对，不一致直接红。
+#
+# 新增/删除随包文件时：本文件 + Makefile 的 Package/install 段 **必须同时改**。
+
+# ---- 核心后端 ----
+root/usr/sbin/meshctl|/usr/sbin/meshctl|755
+mesh-install.sh|/usr/sbin/mesh-install|755
+root/usr/libexec/mesh/functions.sh|/usr/libexec/mesh/functions.sh|644
+root/usr/libexec/mesh/version|/usr/libexec/mesh/version|644
+root/usr/libexec/rpcd/mesh|/usr/libexec/rpcd/mesh|755
+
+# ---- 服务与自愈 ----
+root/etc/init.d/mesh|/etc/init.d/mesh|755
+root/etc/init.d/97-wifi-roaming|/etc/init.d/97-wifi-roaming|755
+root/etc/init.d/99-dawn-roaming|/etc/init.d/99-dawn-roaming|755
+root/etc/uci-defaults/40-luci-app-mesh-roaming|/etc/uci-defaults/40-luci-app-mesh-roaming|755
+root/etc/hotplug.d/iface/30-mesh-bat-mtu|/etc/hotplug.d/iface/30-mesh-bat-mtu|755
+root/etc/rc.wps/10-mesh|/etc/rc.wps/10-mesh|755
+
+# ---- 配置（conffile：升级保留、卸载随包删除）----
+root/etc/config/mesh|/etc/config/mesh|644
+
+# ---- 配置同步端点 ----
+root/www/cgi-bin/mesh-sync|/www/cgi-bin/mesh-sync|755
+root/etc/nginx/conf.d/mesh-sync.locations|/etc/nginx/conf.d/mesh-sync.locations|644
+
+# ---- LuCI 界面与权限 ----
+root/usr/share/luci/menu.d/luci-app-mesh.json|/usr/share/luci/menu.d/luci-app-mesh.json|644
+root/usr/share/rpcd/acl.d/luci-app-mesh.json|/usr/share/rpcd/acl.d/luci-app-mesh.json|644
+htdocs/luci-static/resources/view/mesh/overview.js|/www/luci-static/resources/view/mesh/overview.js|644
+htdocs/luci-static/resources/view/mesh/settings.js|/www/luci-static/resources/view/mesh/settings.js|644
+htdocs/luci-static/resources/view/mesh/tools.js|/www/luci-static/resources/view/mesh/tools.js|644
+htdocs/luci-static/resources/view/mesh/mesh.css|/www/luci-static/resources/view/mesh/mesh.css|644
