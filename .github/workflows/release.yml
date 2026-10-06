@@ -90,25 +90,58 @@ jobs:
           sudo apt-get install -y -qq zstd rsync
           tar -I zstd -xf sdk.tar.zst
 
-      - name: 拉 luci feed（luci.mk 的出处）
+      - name: 拉 feeds
         run: |
           cd openwrt-sdk-*
-          ./scripts/feeds update luci
-          ./scripts/feeds install luci
+          # ★ 不能只装 luci：LUCI_DEPENDS 里的 batctl / dawn / umdns 在 packages
+          #   feed，luci-proto-batman-adv 在 routing feed。只装 luci 的话依赖
+          #   不满足，defconfig 会把 CONFIG_PACKAGE_luci-app-mesh 整行丢掉，
+          #   后面编译什么也不做，bin 里一个包都没有（失败得很安静）。
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
-      - name: 放入源码并编译
+      - name: 放入源码
         run: |
           cd openwrt-sdk-*
           mkdir -p package/luci-app-mesh
           # 排除 .git 与 SDK 自身，避免把几百 MB 垃圾拷进包目录
           rsync -a --exclude '.git' --exclude 'sdk.tar.zst' --exclude 'openwrt-sdk-*' \
                 "$GITHUB_WORKSPACE"/ package/luci-app-mesh/
+
+      - name: 生成 .config 并编译
+        run: |
+          cd openwrt-sdk-*
+          # ★ 顺序不能反：CONFIG_PACKAGE_ 符号来自 tmp/.packageinfo，
+          #   而它是 make 扫描 package/ 目录生成的 —— 源码必须先放进
+          #   package/luci-app-mesh，再 defconfig，否则写进去的行会被当
+          #   作未知符号丢掉，编译目标什么事都不做。
+          # ★ SDK 包里没有 .config。toplevel.mk 的 `.config` 规则在文件缺失时
+          #   会去执行 `make menuconfig`，而 CI 没有 tty，必然报
+          #   "Error opening terminal: unknown" 然后整个 make 挂掉 ——
+          #   这正是第一次跑挂掉的原因（日志末尾 menuconfig: Error 1）。
+          #   所以必须先手工造一份 .config，让 toplevel.mk 认为它已存在。
+          make defconfig
+          # 选中本包；LUCI_PKGARCH:=all 所以不需要选 target/arch
+          printf 'CONFIG_PACKAGE_luci-app-mesh=m\n' >> .config
+          # 再跑一次：把 LUCI_DEPENDS 声明的依赖展开进 .config
+          make defconfig
+          grep -q 'CONFIG_PACKAGE_luci-app-mesh' .config \
+            || echo "::warning::defconfig 没保留本包符号，多半是 LUCI_DEPENDS 有依赖在本 SDK 的 feeds 里找不到"
+
           make package/luci-app-mesh/compile V=s
 
       - name: 收集产物
         run: |
+          # ★ 每个 run 都是独立 shell，工作目录会重置回 workspace 根，
+          #   而产物在 SDK 目录里的 bin/ —— 这里必须自己指定路径。
+          SDK=$(ls -d openwrt-sdk-*)
           mkdir -p out
-          find bin -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} out/ \;
+          find "$SDK/bin" -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} out/ \;
+          # 空产物要显式报错，否则会静默上传一个空 artifact 还显示绿
+          if ! ls out/*.${{ matrix.format }} >/dev/null 2>&1; then
+            echo "::error::没有产出任何 ${{ matrix.format }}，往上翻 defconfig 的依赖警告 / compile 日志"
+            exit 1
+          fi
           # 固定名副本：mesh-install.sh 用 .../releases/latest/download/<固定名>
           # 这种稳定 URL 取包，不必事先知道版本号
           # 注意：GitHub 的 run 默认走 `bash -e`，裸 `[ -f x ] && cp` 在匹配不到时
