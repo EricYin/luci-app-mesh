@@ -2323,6 +2323,105 @@ mesh_wan_devices() {
 	echo "$devs" | tr -s ' '
 }
 
+# ---------------- 光口上行检测 + network 改动的生效方式 ----------------
+# 存在光口（PON/EPON/GPON）上行时，**不能**用 `/etc/init.d/network restart` 落地
+# network 改动。原因（2026-10-06 真机实测）：
+#   /etc/init.d/network 的 stop_service() 是 `wifi down` + `ifdown -a` + 重启 netifd，
+#   关的是**全部**接口，光口也不例外。pon0 被 down/up 后 airoha-xpon 驱动会重启
+#   注册状态机（dmesg: "XG-PON RX started, irq=53, ONU-ID=1023 (invalid)"），
+#   而驱动明确要求"carrier 直到 O5 才 up" —— 注册完成前 wan(pon0) 拿不到地址，
+#   表现为外网全断、PON 状态页「线路停止」。用户反馈的"启用主节点就断网"就是它。
+#   对照实验：`ubus call network reload` 后 dmesg 无任何 PON 事件、路由不变 ——
+#   reload 只重建"配置有变化"的接口，不会去碰 pon0。
+# 判据两条：UCI 里上行接口的设备名以 pon/gpon/xpon/epon 开头；或系统里存在这类 netdev
+# （有的机型压根没建 wan 接口，但光口 netdev 一定在）。
+mesh_has_pon_uplink() {
+	local d
+	for d in $(mesh_wan_devices); do
+		case "$d" in pon*|gpon*|xpon*|epon*) return 0;; esac
+	done
+	[ -n "$(ls -d /sys/class/net/pon* /sys/class/net/gpon* /sys/class/net/epon* 2>/dev/null)" ] && return 0
+	return 1
+}
+
+# 光口是不是"真的在用"：从没 carrier up 过（carrier_up_count=0）说明这台根本没走
+# PON 上行（比如插的是普通网线），后面那些为光口准备的兜底动作就不必做。
+mesh_pon_ever_up() {
+	local d
+	for d in /sys/class/net/pon*; do
+		[ -e "$d" ] || continue
+		case "$(cat "$d/carrier_up_count" 2>/dev/null)" in
+			''|0) continue;;
+			*) return 0;;
+		esac
+	done
+	return 1
+}
+
+# network 改动落盘并生效：能增量 reload 就 reload，必要时才 restart。
+#   $1 = 场景标签（只用于日志）  $2 = 角色（client 恒 restart，见下）
+# 为什么子节点不跟着改 reload：子节点要删上行接口、把 WAN 物理口从别的桥摘出来再
+# 并进 br-lan，这类"设备归属变更"正是当初选 restart 的原因；而且子节点不需要上行。
+mesh_net_commit() {
+	local tag="${1:-apply}" role="${2:-}"
+	[ -n "$(uci changes network)" ] || return 0
+	uci commit network
+	if [ "$(mesh_uci_getd main.net_restart 0)" != "1" ] \
+	   && [ "$role" != client ] && mesh_has_pon_uplink; then
+		ubus call network reload >/dev/null 2>&1
+		sleep 3
+		if mesh_net_state_ok; then
+			mesh_log info "$tag：network 改动以 reload 生效（检测到光口上行，避免 restart 打断 PON 注册）"
+			return 0
+		fi
+		mesh_log warn "$tag：reload 后关键接口未就绪，降级为 network restart"
+	fi
+	/etc/init.d/network restart >>"$MESH_LOG" 2>&1
+	sleep 3
+	mesh_omci_recover
+	return 0
+}
+
+# reload 到底生效没有：br-lan 必须有地址（否则本机已不可管理）；开了 batman-adv
+# 时 bat0 还必须真的挂进 br-lan（只在 UCI 里有、运行时没挂上 = 二层域不通）。
+mesh_net_state_ok() {
+	ip -4 addr show dev br-lan 2>/dev/null | grep -q 'inet ' || return 1
+	if [ "$(mesh_uci_getd main.enabled 0)" = "1" ] && [ "$(mesh_uci_getd main.batman 1)" = "1" ]; then
+		[ -e /sys/class/net/br-lan/brif/bat0 ] || return 1
+	fi
+	return 0
+}
+
+# ★★ 注意区分两件事，名字里都有 "pon"，别混：
+#   ① **重启 pon0 接口**（ip link set pon0 down/up、ifdown -a）→ airoha-xpon 驱动
+#      重启注册状态机，要重做 SerDes 初始化 + O1~O5 注册 —— 这是**断网元凶**，本包
+#      现在绝不在有光口时做（改走 reload，见 mesh_net_commit）。
+#   ② **重启 airoha-pond 进程**（下面这件事）→ 它只是用户态 OMCI 代理，重启它
+#      **不会**动 pon0 接口、不会触发驱动重新初始化，只是让 OMCI 状态机重跑一遍。
+#      这是**救 PON** 的动作，不是断 PON。
+# 只在"确实被迫走了 restart"（reload 没生效 / 子节点 / 强制开关）之后才考虑：
+#   airoha-pond 由 procd 独立管理，只配了 respawn 与 file /etc/config/pon，
+#   **没有 watch network.interface** —— netifd 重启不会带着它重启，它的注册状态机
+#   可能就卡在 pon0 被 down 那一刻（用户只能重启整台设备才恢复）。
+# 三道门槛，缺一不做：有光口 / 这台真的在用 PON 上行（carrier 曾 up 过）/
+# 等 15 秒后 carrier 仍未恢复。走 reload 的正常路径根本到不了这里。
+mesh_omci_recover() {
+	mesh_has_pon_uplink || return 0
+	mesh_pon_ever_up || return 0
+	[ -x /etc/init.d/airoha-pond ] || return 0
+	local d i
+	for i in 1 2 3; do
+		for d in /sys/class/net/pon*; do
+			[ -e "$d" ] || continue
+			[ "$(cat "$d/carrier" 2>/dev/null)" = "1" ] && return 0
+		done
+		sleep 5
+	done
+	/etc/init.d/airoha-pond restart >/dev/null 2>&1
+	mesh_log warn "被迫 network restart 后 PON 未自行恢复，已重启 OMCI 代理进程 airoha-pond（未动 pon0 接口）"
+	return 0
+}
+
 # br-lan 里"有载波的物理成员" —— apply 前打基线、apply 后验存活。
 # 只取物理口的原因：无线 AP 口的 carrier 会随终端关联状态变化，bat0 这类虚拟口
 # 根本没有 carrier 文件，把它们算进基线会误判（校验时刚好没终端在线 → 误以为写坏）。
@@ -2629,13 +2728,44 @@ mesh_do_revert() {
 	uci commit mesh
 	rm -rf "$MESH_STATE_DIR"
 	rm -f "$MESH_TMP_DIR"/lastok "$MESH_TMP_DIR"/lastfail "$MESH_TMP_DIR"/failreason "$MESH_TMP_DIR"/registry.tsv
-	mesh_log info "已还原组网前配置（备份于 $(cat "$MESH_BACKUP_DIR/created" 2>/dev/null)），即将重启路由器"
+	mesh_log info "已还原组网前配置（备份于 $(cat "$MESH_BACKUP_DIR/created" 2>/dev/null)）"
 	# 备份已完成使命：删掉它。既回收闪存，也让下次 apply 重新备份"当时的组网前配置"。
 	# 否则 revert → 再 apply 时用的仍是当初那份（可能已过时的）备份，还原点会错位。
 	rm -rf "$MESH_BACKUP_DIR"
-	# 还原完成后整机关断重启：以组网前配置重新初始化无线/网络/防火墙，比逐个 restart 更彻底。
-	# 后台延迟 2 秒再重启，先让本进程把成功结果返回前端，避免 rpcd 调用因连接中断而误报失败。
-	( sleep 2; sync; reboot ) &
+	# ★ 还原后的生效方式：以前是**无条件整机 reboot**，理由是"比逐个 restart 更彻底"。
+	#   但光口机型整机重启的代价太大 —— 要重做 SerDes 初始化 + O1~O5 注册，几十秒到
+	#   几分钟没有上行；而触发回滚的只是"管理地址没回来"，绝大多数情况重载配置就够了。
+	#   改成逐项重载 + 校验：地址真回来了就不重启，确认起不来才兜底 reboot。
+	#   后台延迟 2 秒执行，先让本进程把成功结果返回前端，避免 rpcd 调用因连接中断
+	#   而误报失败（这与原来 reboot 的后台化是同一个理由）。
+	( sleep 2; sync; mesh_net_revert_apply ) &
+	return 0
+}
+
+# 还原后让配置生效：network 走增量 reload（不碰光口），无线 / 防火墙 / DHCP 逐个重载，
+# 最后校验管理地址是否回来 —— 只有确实没起来才兜底重启路由器。
+mesh_net_revert_apply() {
+	local i want hit=0
+	ubus call network reload >/dev/null 2>&1
+	[ -x /sbin/wifi ] && wifi reload >/dev/null 2>&1
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	# 最多等 30 秒：br-lan 要重新收敛（STP forward_delay + DHCP 往返都要时间）
+	for i in 1 2 3 4 5 6; do
+		sleep 5
+		want=$(uci -q get network.lan.ipaddr 2>/dev/null); want=${want%%/*}
+		if [ -n "$want" ]; then
+			ip -4 addr show dev br-lan 2>/dev/null | grep -q "inet $want/" && { hit=1; break; }
+		else
+			ip -4 addr show dev br-lan 2>/dev/null | grep -q 'inet ' && { hit=1; break; }
+		fi
+	done
+	if [ "$hit" = 1 ]; then
+		mesh_log info "还原后管理地址已恢复，未重启路由器"
+		return 0
+	fi
+	mesh_log warn "还原后管理地址仍不可达，兜底重启路由器"
+	reboot
 	return 0
 }
 

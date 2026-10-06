@@ -374,14 +374,13 @@ cmd_apply() {
 		mesh_batman_remove
 		uci set mesh.main.status_text='组网已停用'
 		uci commit mesh
-		if [ -n "$(uci changes wireless)" ]; then
-			uci commit wireless
-			wifi reload >/dev/null 2>&1 &
-		fi
-		if [ -n "$(uci changes network)" ]; then
-			uci commit network
-			/etc/init.d/network restart >/dev/null 2>&1 &
-		fi
+	if [ -n "$(uci changes wireless)" ]; then
+		uci commit wireless
+		wifi reload >/dev/null 2>&1 &
+	fi
+	# 后台执行：restart 场景会中断承载本次应答的连接（光口机型走 reload 则不会，
+	# 但统一放后台最省心）。生效方式同样由 mesh_net_commit 判定。
+	( mesh_net_commit "停用" ) >/dev/null 2>&1 &
 		mesh_unlock
 		echo "完成。"
 		return 0
@@ -639,10 +638,13 @@ cmd_apply() {
 	[ -n "$(uci changes dhcp)" ] && dhcp_chg=1
 	uci set mesh.main.status_text="已应用（$role）"
 	uci commit mesh
-	[ "$net_chg" = 1 ] && uci commit network
 	[ "$wl_chg" = 1 ] && uci commit wireless
 	[ "$dhcp_chg" = 1 ] && uci commit dhcp
-	[ "$net_chg" = 1 ] && { /etc/init.d/network restart >>"$MESH_LOG" 2>&1; sleep 3; }
+	# network 的"提交 + 生效"统一交给 mesh_net_commit：它内部按有没有光口上行决定
+	# 用 ubus reload（不动 pon0，PON 不会重新注册）还是 /etc/init.d/network restart。
+	# 以前这里无条件 restart —— 而 restart 的 ifdown -a 会把 pon0 一起 down 掉，
+	# 光口机型上就是"启用主节点 = 断网 + PON 状态页线路停止"。
+	[ "$net_chg" = 1 ] && mesh_net_commit "apply($role)" "$role"
 	[ "$wl_chg" = 1 ] && wifi reload >>"$MESH_LOG" 2>&1
 	# 热重载在 "AP 与 mesh0 共用同一 radio" 的设备上可能把 AP 留在 disabled（见
 	# mesh_wifi_ensure_aps_up 注释）——apply 后同样要校验并兜底，否则"改一次密码
@@ -1570,7 +1572,7 @@ cmd_diag() {
 # ================= 还原 / 清除 =================
 cmd_revert() {
 	mesh_do_revert || { echo "错误：未找到组网前备份"; return 1; }
-	echo "已还原组网前配置，路由器即将重启。"
+	echo "已还原组网前配置，正在重新加载网络/无线（无需重启）。"
 }
 
 cmd_confirm_rollback() {
@@ -1582,10 +1584,8 @@ cmd_confirm_rollback() {
 # ================= 端口并入（手动触发） =================
 cmd_port_bridging() {
 	mesh_ports_into_brlan
-	if [ -n "$(uci changes network)" ]; then
-		uci commit network
-		/etc/init.d/network restart >/dev/null 2>&1
-	fi
+	# 与 apply 同一出口：有光口时走 reload，不会把 pon0 一起 down 掉
+	mesh_net_commit "端口并入" "$(mesh_uci_get main.role)"
 	if [ "$(mesh_uci_get main.role)" = master ]; then
 		# 主节点不适用"全部物理端口并入内网"（它要保留上行口），只校验 bat0
 		if mesh_all_ports_in_lan; then

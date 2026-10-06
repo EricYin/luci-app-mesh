@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r39`（`PKG_RELEASE` 39）
+- 当前版本：`1.0.0-r40`（`PKG_RELEASE` 40）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r39.apk
-opkg install luci-app-mesh_1.0.0-r39_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r40.apk
+opkg install luci-app-mesh_1.0.0-r40_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -426,6 +426,37 @@ sh install.sh
   理由本来就写在注释里 —— 拒绝是为了"别打断正在跑的回程"；**回程压根没起来时
   没有任何可打断的通路，就该放行**。
 - 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
+
+### r40（2026-10-06）
+修「**启用主节点 = PON 断网**」——光口上行机型上，一启用组网外网就全断，PON 状态
+页显示「线路停止」。
+
+- **根因**：apply 收尾无条件跑 `/etc/init.d/network restart`，而它的 `stop_service()`
+  是 `wifi down` + **`ifdown -a`**（关闭**全部**接口）+ 重启 netifd —— **pon0 光口也
+  在里头**。pon0 被 down/up 后 airoha-xpon 驱动重启注册状态机（真机实测 dmesg：
+  `XG-PON RX started, irq=53, ONU-ID=1023 (invalid)`），而驱动要求「carrier 直到 O5
+  才 up」，注册完成前 wan(pon0) 拿不到地址 → 外网全断、状态页「线路停止」。
+  对照实验：`ubus call network reload` 后 dmesg 无任何 PON 事件、路由不变。
+- **排除的嫌疑**：不是「把光口并进内网」。实测 `mesh_wan_devices` 把 pon0 正确识别为
+  上行口，`mesh_lan_ports` 排除它，br-lan 成员里没有 pon0（物理端口枚举只扫
+  `lan*/wan*/eth*`，pon0 不匹配）。
+- **改法**：新增 `mesh_net_commit()` 作为 network 改动**唯一出口**，按判据选择生效方式
+  —— 有光口（`pon*/gpon*/xpon*/epon*`，或 UCI 上行设备名匹配）**且角色不是 client**
+  → `ubus call network reload`；否则保持 `network restart`
+  （子节点要删上行接口、改端口归属，reload 处理不干净）。
+  落点 4 处：apply、停用、诊断页「端口并入」按钮（开窗/加入本来就是 reload，不动）。
+- **安全网**：reload 后校验 `br-lan` 有地址且 `bat0` 真在 `/sys/class/net/br-lan/brif`，
+  不满足自动降级 restart，不会「配置改了但没生效」。
+- **回退开关**：`uci set mesh.main.net_restart=1; uci commit mesh` 立刻回到旧行为。
+- **OMCI 兜底** `mesh_omci_recover()`：只在「确实被迫走了 restart」时才可能触发，
+  且要过三道门槛（有光口 / 该口 carrier 曾 up 过 / 等 15 秒仍未恢复），重启的是
+  **airoha-pond 进程**（用户态 OMCI 代理），**不是 pon0 接口**，不会触发驱动重新
+  初始化 —— 它是「救 PON」而非「断 PON」。依据：pond 的 procd 只配了 respawn 与
+  `file /etc/config/pon`，**没有 watch network.interface**，netifd 重启带不动它。
+- **还原不再无条件 reboot**：`mesh_do_revert` 原为 `( sleep 2; sync; reboot )`，
+  整机关断重启对光口机型代价太大（SerDes + O1~O5 重来）。改为逐项重载
+  （network reload + wifi reload + firewall/dnsmasq）+ 校验管理地址，
+  只有确认起不来才兜底 reboot。
 
 ### r39（2026-10-05）
 消灭 LuCI「**迁移配置**」弹窗 —— 后台点开无线页 / 接口页就弹，根源在插件自己写
