@@ -13,7 +13,11 @@ var callMeshExec = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd' ],
-	expect: { stdout: '' }
+	/* ★ expect is NOT a default-value filler: LuCI walks its keys and RESOLVES
+	   ret = ret[key] (first key only, then break). So `expect:{stdout:''}`
+	   makes the call resolve the stdout STRING, not {code,stdout} — and any
+	   caller doing res.stdout gets undefined forever. Use {} for the full object. */
+	expect: { }
 });
 
 function ensureCss() {
@@ -38,8 +42,15 @@ var callMeshExecArg = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd', 'arg' ],
-	expect: { stdout: '' }
+	expect: { }   /* see callMeshExec: {} = full {code,stdout} object */
 });
+
+/* Accept both shapes: string (older/newer LuCI may resolve expect[0] directly)
+   or the {code,stdout} object. Never lose the payload silently. */
+function pickStdout(res) {
+	if (typeof res === 'string') { return res; }
+	return (res && res.stdout) ? res.stdout : '';
+}
 
 function runCmd(cmd) {
 	return callMeshExec(cmd).then(function (res) {
@@ -50,13 +61,19 @@ function runCmd(cmd) {
 	});
 }
 
-/* 带附加参数的调用（目前只有 log 用：arg = "行数" 或 "行数 --syslog"） */
+/* 带附加参数的调用（目前只有 log 用：arg = "行数" 或 "行数 --syslog"）
+   ★ 返回结构化结果而不是"失败就给空串"：早期版本把调用失败静默成 ''，界面只能显示
+     「暂无日志记录」，看不出到底是日志真为空、还是 RPC 根本没成功 —— 排查时极坑。
+     现在 ok=false 时界面会把错误原因直接写出来。 */
 function runCmdArg(cmd, arg) {
 	return callMeshExecArg(cmd, arg).then(function (res) {
-		return (res && res.stdout) ? res.stdout : '';
+		return {
+			ok: true,
+			text: pickStdout(res),
+			code: (res && typeof res === 'object') ? res.code : undefined
+		};
 	}, function (e) {
-		ui.addNotification(null, E('p', {}, _('操作失败：%s').format(e)), 'danger');
-		return null;
+		return { ok: false, err: String((e && e.message) ? e.message : e) };
 	});
 }
 
@@ -168,15 +185,40 @@ return view.extend({
 		]);
 
 		/* ---------- 日志 ---------- */
-		var logBox = E('pre', { 'class': 'mesh-log' }, _('加载中…'));
+		var logBox = E('pre', { 'class': 'mesh-log', 'id': 'mesh-log-box' }, _('加载中…'));
 		var chkSyslog = E('input', { type: 'checkbox' });
 		chkSyslog.addEventListener('change', loadLog);
 
+		/* ★ 永远写"当前页面上"的那个日志框。
+		   本页面 15 秒轮询重渲染一次，render() 每次都会新建一个 pre；
+		   直接用闭包里的 logBox，异步返回时很可能写进一个已经被替换掉、
+		   不再属于文档的节点 —— 表现就是"接口明明有返回，页面却没变化"。
+		   所以这里按 id 重新查，并取最后一个（= 最新一次渲染的）。 */
+		function logBoxEl() {
+			var all = document.querySelectorAll('#mesh-log-box');
+			return (all && all.length) ? all[all.length - 1] : logBox;
+		}
+
+		function setLog(txt) {
+			logBoxEl().textContent = txt;
+		}
+
 		function loadLog() {
-			logBox.textContent = _('加载中…');
+			setLog(_('加载中…'));
 			var arg = chkSyslog.checked ? '200 --syslog' : '200';
-			return runCmdArg('log', arg).then(function (t) {
-				logBox.textContent = t || _('（暂无日志记录）');
+			return runCmdArg('log', arg).then(function (r) {
+				if (!r.ok) {
+					console.error('[mesh] 读取日志失败:', r.err);
+					setLog(_('读取日志失败：%s').format(r.err));
+					return;
+				}
+				var t = String(r.text || '').replace(/\s+$/, '');
+				if (t) {
+					setLog(t);
+					return;
+				}
+				console.warn('[mesh] 日志为空，后端返回:', r);
+				setLog(_('（日志为空或文件不存在：/tmp/mesh/mesh.log）'));
 			});
 		}
 
@@ -186,7 +228,7 @@ return view.extend({
 		var btnLogCopy = E('button', { 'class': 'btn' }, _('复制'));
 		btnLogCopy.addEventListener('click', function () {
 			var ta = E('textarea', { style: 'position:absolute;left:-9999px' });
-			ta.value = logBox.textContent;
+			ta.value = logBoxEl().textContent;
 			document.body.appendChild(ta);
 			ta.select();
 			var ok = false;
@@ -198,7 +240,7 @@ return view.extend({
 
 		var btnLogDownload = E('button', { 'class': 'btn' }, _('下载'));
 		btnLogDownload.addEventListener('click', function () {
-			var blob = new Blob([logBox.textContent], { type: 'text/plain;charset=utf-8' });
+			var blob = new Blob([logBoxEl().textContent], { type: 'text/plain;charset=utf-8' });
 			var url = URL.createObjectURL(blob);
 			var a = E('a', { href: url, download: 'mesh-log.txt' });
 			document.body.appendChild(a);

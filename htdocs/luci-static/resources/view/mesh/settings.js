@@ -9,7 +9,10 @@ var callMeshExec = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd' ],
-	expect: { stdout: '' }
+	/* ★ expect resolves ret = ret[firstKey] (see tools.js): {stdout:''} would
+	   hand back the raw string and res.stdout would be undefined — which made
+	   the "last apply result" block hide itself forever (parsed as code=2). */
+	expect: { }
 });
 
 var callMeshStatus = rpc.declare({
@@ -83,7 +86,7 @@ var callMeshLastApply = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd' ],
-	expect: { stdout: '', code: 0 }
+	expect: { }   /* see callMeshExec: {} = full {code,stdout} object */
 });
 
 /* 解析 last_apply 的 "key=value" 多行输出 */

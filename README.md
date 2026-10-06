@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r41`（`PKG_RELEASE` 41）
+- 当前版本：`1.0.0-r43`（`PKG_RELEASE` 43）
 - 适用：OpenWrt 21.02+（opkg）/ OpenWrt 25.12+（apk）；已实测斐讯 K2P（mt7621 / mt76）
 - 许可：Apache-2.0
 
@@ -110,8 +110,8 @@ apk add luci-proto-batman-adv         # 或 opkg install luci-proto-batman-adv
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r41.apk
-opkg install luci-app-mesh_1.0.0-r41_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r43.apk
+opkg install luci-app-mesh_1.0.0-r43_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（自动复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -426,6 +426,45 @@ sh install.sh
   理由本来就写在注释里 —— 拒绝是为了"别打断正在跑的回程"；**回程压根没起来时
   没有任何可打断的通路，就该放行**。
 - 另外 `cmd_pair_join` 开头在回程仍通时多打一行风险提示（会切射频 + 重建回程）。
+
+### r43（2026-10-06）★ 真根因
+修 `rpc.declare` 的 `expect` 用法错误 —— 日志区拿不到内容、按钮提示变占位文案、
+「上次应用结果」永久隐藏，都是同一个原因。
+
+- **LuCI 的 `expect` 不是"缺省值填充"，而是按字段取值**（`rpc.js` 原文）：
+  ```js
+  if(req.expect){for(const key in req.expect){if(ret!=null&&key!='')
+      ret=ret[key];if(ret==null||type.call(ret)!=type.call(req.expect[key]))
+      ret=req.expect[key];break;}}
+  ```
+  即：**取 `expect` 的第一个 key，把返回值替换成 `ret[key]`，然后 `break`**。
+  所以 `expect: { stdout: '' }` 会让调用直接 resolve **`stdout` 字符串**，
+  而不是 `{code, stdout}` 对象 —— 调用方再写 `res.stdout` 恒为 `undefined`。
+- 写法统一改成 **`expect: { }`**（没有 key → 不做替换 → 返回完整对象）。
+  受影响 6 处：`tools.js`×2、`overview.js`×2（exec / pair）、`settings.js`×2（exec / last_apply）。
+- 实测影响（node 复现 LuCI 逻辑 + 真实响应）：
+  | 写法 | declare 返回 | 取到 |
+  |---|---|---|
+  | `expect:{stdout:''}` + `res.stdout` | string | **0 字符** |
+  | `expect:{}` + `res.stdout` | object | 109 字符 ✅ |
+  | `last_apply` 修复前 | — | 解析成 `code=2` → 整块 `display:none` |
+  | `last_apply` 修复后 | — | `code=0` → 正常显示 ✅ |
+  → 也就是说：**设置页「上次应用结果」此前一直是失效的（永远隐藏）**，不是"没有记录"。
+- `tools.js` 另加 `pickStdout(res)`：字符串 / 对象两种形状都认，避免以后再被同类问题坑。
+
+### r42（2026-10-06）
+修维护页日志区「接口有返回，页面却一直显示暂无日志记录」。
+
+- **根因不在后端**：实测 HTTP JSON-RPC（`mesh` / `exec` `cmd=log`）返回 `code=0`、
+  751 字符 stdout，链路完好；问题在于前端把「没取到」和「日志为空」显示成同一句。
+- **`runCmdArg` 不再把失败静默成空串**：原来 RPC 失败只弹一条通知、返回 `null`，
+  界面拿到空值就写「暂无日志记录」，和"确实没日志"长得一模一样，排查极其费劲。
+  现在返回 `{ok,text,code,err}`：失败把错误原因**直接写进日志框**（同时 console.error），
+  空日志单独显示「日志为空或文件不存在：/tmp/mesh/mesh.log」。
+- **写入时按 id 重新定位日志框**：本页 15 秒轮询重渲染一次，每次 render 都会新建一个
+  `<pre>`；闭包里那个 `logBox` 在异步返回时可能已经不属于文档，写进去页面毫无变化
+  —— 表现就是"接口有返回、页面不动"。改成 `document.querySelectorAll('#mesh-log-box')`
+  取最后一个（= 当前页面上的那个），「复制 / 下载」按钮同样改走这个定位。
 
 ### r41（2026-10-06）
 备份机制的三处小改 + 维护页新增「刷新备份」按钮和日志区。

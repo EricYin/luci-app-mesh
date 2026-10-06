@@ -14,7 +14,9 @@ var callMeshExec = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd' ],
-	expect: { stdout: '' }
+	/* ★ expect resolves ret = ret[firstKey] (see tools.js): {stdout:''} would
+	   hand back the raw string and res.stdout would be undefined. Use {}. */
+	expect: { }
 });
 
 /* ---------- 小工具 ---------- */
@@ -363,7 +365,7 @@ var callMeshPair = rpc.declare({
 	object: 'mesh',
 	method: 'exec',
 	params: [ 'cmd', 'arg' ],
-	expect: { stdout: '', code: 0 }
+	expect: { }   /* see callMeshExec: {} = full {code,stdout} object */
 });
 
 /* 倒计时用的本地定时器与"忙时快轮询"定时器。
