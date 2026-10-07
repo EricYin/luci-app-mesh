@@ -1120,17 +1120,21 @@ cmd_status() {
 
 	local caps_json radios_json
 	radios_json=$(
-		local first=1 radio band pch rch ht
+		local first=1 radio band pch rch ht htl
 		for radio in $(mesh_radios); do
 			band=$(mesh_radio_band "$radio")
 			ht=$(q wireless.$radio.htmode); ht=${ht:-HT20}
 			pch=$(q wireless.$radio.channel); pch=${pch:-auto}
 			rch=$(mesh_running_channel "$radio")
 			case "$rch" in ''|*[!0-9]*) rch=0;; esac
+			# 本机该射频支持的 htmode 列表：供「WiFi 快速设置」页按真实能力出下拉，
+			# 避免写进不支持的带宽导致热重载 -122 把 AP 留在 disabled。
+			htl=$(mesh_radio_htmodelist "$radio")
 			[ "$first" = 1 ] || printf ',\n'
 			first=0
-		printf ' {"radio":"%s","phy":"%s","band":"%s","channel":"%s","real":%s,"htmode":"%s"}' \
-			"$radio" "$(mesh_radio_phy "$radio")" "$band" "$pch" "$rch" "$ht"
+		printf ' {"radio":"%s","phy":"%s","band":"%s","channel":"%s","real":%s,"htmode":"%s","htlist":%s}' \
+			"$radio" "$(mesh_radio_phy "$radio")" "$band" "$pch" "$rch" "$ht" \
+			"$(mesh_strlist_to_json "$htl")"
 	done
 )
 
@@ -2399,6 +2403,17 @@ cmd_button_status() {
 	return 0
 }
 
+# ================= WiFi 快速设置：保存后的无线自愈 =================
+# 「WiFi 快速设置」页保存只走 uci.apply()（触发一次 wifi reload），不经过
+# apply / sync 这两条自带兜底的路径。而热重载在"AP 与 mesh0 共用同一 radio"的
+# 设备上（mt76 系）可能返回 netifd: Not supported (-122)，把 AP 打成 down 之后
+# **不再自恢复** —— 表现就是"改了个 WiFi 名，某个频段的信号直接消失"。
+# 这里补一次校验：mesh_wifi_ensure_aps_up 内部只读 sysfs、只在真的坏掉时才对该
+# radio 冷重启（wifi down/up），正常情况零开销。前端在 uci.apply() 之后异步调用。
+cmd_wifi_ensure() {
+	mesh_wifi_ensure_aps_up
+}
+
 # ================= 入口 =================
 case "$1" in
 	apply)            shift; cmd_apply "$@";;
@@ -2417,8 +2432,9 @@ case "$1" in
 	pair-join)        shift; cmd_pair_join "$@";;
 	set-role)         shift; cmd_set_role "$@";;
 	button)           shift; cmd_button "$@";;
+	wifi_ensure)      cmd_wifi_ensure;;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|backup-refresh|log|pair-open|pair-close|pair-status|pair-join|set-role|button>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|backup-refresh|log|pair-open|pair-close|pair-status|pair-join|set-role|button|wifi_ensure>"
 		exit 1
 		;;
 esac

@@ -142,3 +142,6 @@
    是不可逆的破坏性操作，视觉上必须与上方的加入/开放按钮拉开距离。 */
 .mesh-exit-box { margin-top: 14px; }
 .mesh-exit-sep { border-top: 1px dashed #ddd; margin-bottom: 10px; }
+
+/* 「WiFi 快速设置」页：每个频段的小标题（2.4 GHz / 5 GHz）。不设颜色，跟随主题。 */
+.mesh-band-title { margin: 14px 0 2px; font-size: 13px; }

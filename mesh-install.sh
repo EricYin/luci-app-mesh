@@ -62,6 +62,7 @@ BUILTIN_MANIFEST='
 /www/luci-static/resources/view/mesh/overview.js
 /www/luci-static/resources/view/mesh/settings.js
 /www/luci-static/resources/view/mesh/tools.js
+/www/luci-static/resources/view/mesh/wifi.js
 /www/luci-static/resources/view/mesh/mesh.css
 '
 

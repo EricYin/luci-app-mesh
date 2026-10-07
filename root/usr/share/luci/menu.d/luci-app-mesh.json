@@ -1,4 +1,9 @@
 {
+	"admin/network/wifi-quick": {
+		"title": "WiFi 快速设置",
+		"order": 15,
+		"action": { "type": "view", "path": "mesh/wifi" }
+	},
 	"admin/network/mesh": {
 		"title": "Mesh 组网",
 		"order": 20,

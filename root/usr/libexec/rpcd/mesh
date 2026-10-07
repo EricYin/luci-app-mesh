@@ -145,6 +145,16 @@ case "$1" in
 						out=$("$MESHCTL" "$cmd" 2>&1)
 						code=$?
 						;;
+				wifi_ensure)
+					# 「WiFi 快速设置」页保存后调用：热重载可能把某个频段的 AP 留在
+					# disabled（mt76 上 Not supported -122），这里补一次校验+冷重启兜底
+					# （见 meshctl cmd_wifi_ensure）。内含 8 秒等待，后台执行、立即返回 ——
+					# 纯兜底、无需回报结果，异常会由 mesh_log 记进 mesh 日志。
+					mkdir -p /tmp/mesh
+					( "$MESHCTL" wifi_ensure >/dev/null 2>&1 ) &
+					out='已触发无线自愈检查'
+					code=0
+					;;
 					*)
 						out='错误：不支持的命令'
 						code=1

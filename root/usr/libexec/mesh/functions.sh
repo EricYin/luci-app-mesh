@@ -427,6 +427,19 @@ mesh_list_to_json() {
 	printf '[%s]' "$out"
 }
 
+# 空格分隔的字符串列表 -> JSON 数组（保留原样，不做数字过滤）
+#   与 mesh_list_to_json 的区别：那个只收数字（信道用），这个收任意串
+#   （"WiFi 快速设置"页要用它下发本机射频支持的 htmode 列表，如 HT20/HE40/VHT80）。
+mesh_strlist_to_json() {
+	local out="" x
+	for x in $1; do
+		[ -n "$x" ] || continue
+		[ -n "$out" ] && out="$out,"
+		out="$out\"$(mesh_esc "$x")\""
+	done
+	printf '[%s]' "$out"
+}
+
 # 本机 LAN 管理地址（优先 UCI，其次运行时）
 mesh_lan_ip() {
 	local a

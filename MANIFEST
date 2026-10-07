@@ -42,4 +42,5 @@ root/usr/share/rpcd/acl.d/luci-app-mesh.json|/usr/share/rpcd/acl.d/luci-app-mesh
 htdocs/luci-static/resources/view/mesh/overview.js|/www/luci-static/resources/view/mesh/overview.js|644
 htdocs/luci-static/resources/view/mesh/settings.js|/www/luci-static/resources/view/mesh/settings.js|644
 htdocs/luci-static/resources/view/mesh/tools.js|/www/luci-static/resources/view/mesh/tools.js|644
+htdocs/luci-static/resources/view/mesh/wifi.js|/www/luci-static/resources/view/mesh/wifi.js|644
 htdocs/luci-static/resources/view/mesh/mesh.css|/www/luci-static/resources/view/mesh/mesh.css|644
