@@ -1273,6 +1273,16 @@ mesh_pair_alias_down() {
 
 mesh_pair_ssid() { mesh_uci_getd main.pair_ssid "$MESH_PAIR_SSID_DEFAULT"; }
 mesh_pair_key()  { mesh_uci_getd main.pair_key  "$MESH_PAIR_KEY_DEFAULT"; }
+# 配对信号是否隐藏（不广播 SSID）。默认 1=隐藏：
+#   · 配对端 mesh_pair_scan_channel 走的是定向扫描(iw scan ssid)，照样能发现隐藏网络，
+#     所以隐藏不影响配对流程；
+#   · 好处是附近设备在 WiFi 列表里看不到 XxMesh-Pair，减少好奇尝试与日志噪音。
+# 设 0 = 普通广播（老行为）。非法值一律当 1（默认隐藏）。
+mesh_pair_hidden() {
+	local v
+	v=$(mesh_uci_getd main.pair_hidden 1)
+	case "$v" in 0|1) echo "$v";; *) echo 1;; esac
+}
 # 窗口默认时长（秒）；0 = 常开
 mesh_pair_window_default() { mesh_uci_getd main.pair_window 600; }
 mesh_pair_expire_file() { echo "$MESH_STATE_DIR/pair-expire"; }
@@ -1359,11 +1369,12 @@ mesh_pair_sta_purge() {
 }
 
 mesh_pair_ap_add() {
-	local radio sec ssid key
+	local radio sec ssid key hidden
 	radio=$(mesh_pair_radio)
 	[ -n "$radio" ] || return 1
 	ssid=$(mesh_pair_ssid)
 	key=$(mesh_pair_key)
+	hidden=$(mesh_pair_hidden)
 	sec=$(mesh_pair_ap_section 2>/dev/null) || sec=""
 	[ -n "$sec" ] || sec=$(mesh_wifi_iface_new xxmesh_pair_ap)
 	[ -n "$sec" ] || return 1
@@ -1377,6 +1388,9 @@ mesh_pair_ap_add() {
 	uci set "wireless.$sec.encryption=psk2"
 	uci set "wireless.$sec.key=$key"
 	uci set "wireless.$sec.disabled=0"
+	# 隐藏配对信号（默认）：只让知道 SSID 的配对端用定向扫描找到它。
+	# 配对 STA 侧对应地要带 scan_ssid=1，见 meshctl cmd_pair_join。
+	uci set "wireless.$sec.hidden=$hidden"
 	uci set "wireless.$sec.mesh_pair=1"
 	uci commit wireless
 	mkdir -p "$MESH_STATE_DIR"

@@ -154,8 +154,12 @@ mesh_uci_remove_mesh_ifaces() {
 #   2) 所有赋值一律走 mset（值相同就不写）—— uci set 即便写入相同的值也会留下变更记录。
 mesh_uci_mirror_aps() {
 	local idx="$1" bh_band="$2" radio band sec tgt n db dssid denc dkey r w mdid nasid rad rch rht real cht
-	local pool="" used=""
+	local pool="" used="" pair_ssid pair_key pair_hidden
 	mkdir -p "$MESH_STATE_DIR"
+	# 配对信号的隐藏跟随：本机配对凭证 + 隐藏开关（循环外取一次，避免每个 AP 都读 UCI）
+	pair_ssid=$(mesh_pair_ssid)
+	pair_key=$(mesh_pair_key)
+	pair_hidden=$(mesh_pair_hidden)
 	for radio in $(mesh_radios); do
 		band=$(mesh_radio_band "$radio")
 		# 收集上一轮由本工具在该 radio 上创建、且仍然存在的 AP 段，供本轮复用
@@ -228,6 +232,18 @@ mesh_uci_mirror_aps() {
 				mdel wireless.$tgt.ft_psk_generate_local
 			fi
 			mset wireless.$tgt.disabled="$ddis"
+			# 配对 AP（SSID+密码命中本机配对凭证）→ 隐藏跟随 pair_hidden。
+			# ★ 只对"工具自建段"写 hidden（mesh_managed=1）：
+			#   第 1 个 AP 会复用原生/用户段（mesh_first_ap_on_radio），若往那种段写
+			#   hidden，关窗后没人清 → 会把用户自己的 AP 永久隐藏。原生段跳过即根治。
+			# 非配对 AP 的工具段则清掉 hidden（这些段归本工具管，不会残留）。
+			if [ "$(q wireless.$tgt.mesh_managed)" = "1" ]; then
+				if [ -n "$dkey" ] && [ "$dssid" = "$pair_ssid" ] && [ "$dkey" = "$pair_key" ]; then
+					mset wireless.$tgt.hidden="$pair_hidden"
+				else
+					mdel wireless.$tgt.hidden
+				fi
+			fi
 			n=$((n+1))
 		done <<EOF
 $APS_buf
@@ -1865,6 +1881,11 @@ cmd_pair_join() {
 	uci set "wireless.$stasec.key=$key"
 	uci set "wireless.$stasec.network=$MESH_PAIR_NET"
 	uci set "wireless.$stasec.ifname=$MESH_PAIR_STA_IFNAME"
+	# ★ scan_ssid=1 是隐藏配对信号的必需项：配对 AP 默认 hidden=1（不广播 SSID），
+	#   wpa_supplicant 若不主动发带 SSID 的 probe request，只能被动听 beacon，
+	#   而隐藏网络的 beacon 里 SSID 是空的 → 永远关联不上。
+	#   加了它走主动扫描；对非隐藏的配对信号也无害，故恒定设置。
+	uci set "wireless.$stasec.scan_ssid=1"
 	uci set "wireless.$stasec.disabled=0"
 	uci commit wireless
 
