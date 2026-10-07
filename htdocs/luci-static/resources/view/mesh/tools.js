@@ -133,9 +133,9 @@ return view.extend({
 
 		/* 维护 */
 		var bkTime = (d && d.backup_created) ? d.backup_created : '';
-		var btnRevert = E('button', { 'class': 'btn cbi-button-negative' }, _('还原组网前配置'));
+		var btnRevert = E('button', { 'class': 'btn cbi-button-negative' }, _('退出组网-还原组网前配置'));
 		btnRevert.addEventListener('click', function () {
-			var msg = _('确定要还原到组网前的配置吗？');
+			var msg = _('确定要退出组网并还原到组网前的配置吗？');
 			if (bkTime)
 				msg += '\n\n' + _('备份创建于：%s').format(bkTime);
 			msg += '\n\n' + _('该时刻之后修改的 WiFi 名称密码、防火墙、DHCP 都会丢失；')
@@ -143,7 +143,7 @@ return view.extend({
 				+ '\n' + _('配置会重新加载使生效，通常无需重启路由器。');
 			if (!confirm(msg)) return;
 			runCmd('revert').then(function (text) {
-				ui.addNotification(null, E('p', {}, text || _('已还原组网前配置')), 'success');
+				ui.addNotification(null, E('p', {}, text || _('已退出组网并还原组网前配置')), 'success');
 			});
 		});
 
@@ -174,7 +174,7 @@ return view.extend({
 
 		var tips = E('div', { 'class': 'mesh-muted' }, [
 			E('div', {}, bkState),
-			E('div', {}, '· ' + _('「还原组网前配置」会恢复该备份，适合组网失败或想回到普通路由模式时使用。')),
+			E('div', {}, '· ' + _('「退出组网-还原组网前配置」会恢复该备份并清除 Mesh 凭证，适合组网失败或想回到普通路由模式时使用（与「组网状态」页配对区块的「退出组网」是同一个操作）。')),
 			E('div', {}, '· ' + _('「刷新备份」用当前配置重建还原点（剔除组网相关配置），适合组网很久以后更新还原点。')),
 			E('div', {}, '· ' + _('「端口并入内网」把所有物理端口(WAN/LAN)加入 br-lan，子节点应用配置时也会自动执行。'))
 		]);

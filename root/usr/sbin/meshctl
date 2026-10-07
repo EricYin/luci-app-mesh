@@ -998,6 +998,13 @@ cmd_status() {
 	# batman-adv 恒为启用，802.11s 的二层转发随之让位（与 cmd_apply 一致）
 	[ "$(mesh_uci_getd main.batman 1)" = "1" ] && fwd=0
 	now=$(date +%s)
+	# ★ 配置是否"已经落地成接口"（r46）。只看配置读不出这个区别：enabled=1 + role=master
+	#   可以在**完全没 apply 过**的状态下存在（「成为主节点」按钮以前就是这样），此时
+	#   mesh0/bat0 根本不存在，新节点领了凭证也连不上。判据用 mesh_mesh_ifaces：
+	#   有 mesh 回程接口 = 已应用；没有 = 只写了配置。r45 之前 apply 全靠用户手动点，
+	#   状态页显示不出这个中间态，问题只能靠翻日志发现（真机 2026-10-07 即如此）。
+	mesh_applied=0
+	[ -n "$(mesh_mesh_ifaces 2>/dev/null)" ] && mesh_applied=1
 
 	local st
 	# 先清一遍过期行再建表：否则「最后一台子节点掉线后再无上报」时，那条幽灵行
@@ -1176,6 +1183,7 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
  "role": "$(mesh_esc "$role")",
  "role_set": $role_set,
  "mesh_id": "$(mesh_esc "$id")",
+ "applied": $mesh_applied,
  "encryption": "$(mesh_esc "$enc")",
  "country": "$(mesh_esc "$country")",
  "band": "$(mesh_esc "$band")",
@@ -1639,13 +1647,21 @@ cmd_port_bridging() {
 
 # ================= 一步选角色（状态页直接选主/子节点） =================
 # 用法: meshctl set-role master|client
-# 只写 UCI 并 commit，**绝不应用**。理由：子节点此时手里还没有凭证，
-# 立刻 apply 必然报「子节点没有 Mesh ID」—— 那是预期内的失败，不该在用户
-# 刚点完按钮就弹出来。所以这里只落配置，剩下的动作交给界面上的下一步按钮。
-# 主节点例外处理：空的 mesh_id / 回程密码在这里就派生好并写回，因为「开放加入」
-# 要靠它们给新节点发凭证（派生只改 UCI，不动网络，与 apply 走同一套解析器）。
+#
+# ★ 主节点：写完 UCI **直接 apply**（r46）—— 这是"一键成为主节点"的关键。
+#   主节点的 mesh_id / 回程密码就在本函数里当场派生（见下方 1657-1673），apply
+#   所需的一切此时都已就绪，不存在任何预期内的失败。以前只写配置不应用，结果
+#   用户点了「成为主节点」→ 点「开放加入」→ 配对 AP 正常起来、新节点也真的领走了
+#   凭证，但**本机 mesh0/bat0 从未被创建过**，新节点拿着凭证无处可连。界面上却显示
+#   "本轮已加入 1 台"，看起来一切正常 —— 真机 2026-10-07 就是这样卡住的。
+#   对比 WPS 按键路径：cmd_button_open 2209-2217 行早就补了这个 apply 兜底，
+#   唯独网页这条路径漏了，所以按键比网页更"一键"。现在两边对齐。
+#
+# ★ 子节点：仍然**只写 UCI 不应用**（保持原设计）。它此刻手里还没有凭证，立刻
+#   apply 必然撞「子节点没有 Mesh ID」—— 那是预期内的失败，不该在用户刚点完按钮
+#   就弹出来。真正的 apply 由随后的「一键加入」(cmd_pair_join --apply) 完成。
 cmd_set_role() {
-	local role="${1:-}" id key enc
+	local role="${1:-}" id key enc rc
 	case "$role" in
 		master|client) ;;
 		*) echo "用法: meshctl set-role master|client"; return 1;;
@@ -1675,14 +1691,29 @@ cmd_set_role() {
 	# 切成子节点 = 本机不再发凭证，残留的配对 AP 要立刻从配置里扫掉
 	# （真正的撤广播由随后的 apply / wifi reload 完成）
 	[ "$role" != master ] && mesh_pair_ap_purge
+	# ★ 必须先解锁再 apply：cmd_apply 自己会抢同一把锁，握着锁去调它必然死锁
+	#   （_lock_take 只重试 5 秒，届时会以"另一个组网操作正在进行"失败，
+	#   而实际上占用者就是自己）。解锁后到 apply 拿到锁之间有极短的窗口，
+	#   但此刻 mesh 配置已 commit 且角色唯一，拿不到锁也只是这次 apply 失败、
+	#   提示用户重试，不会写出半成品配置。
 	mesh_unlock
 	mesh_log info "角色设置：${role}（enabled=1，未应用）"
+
 	if [ "$role" = master ]; then
-		echo "已设为主节点并启用组网（未应用配置）：现在可以点「开放加入」；"
-		echo "想让 mesh0/bat0 立刻跑起来，到组网设置页点一次「保存并应用」。"
+		# ★ 主节点：直接应用。apply 会做 wifi reload + network reload，
+		#   网络会短暂中断（光口机型走 reload 不 restart，不会掉光注册）。
+		echo "已设为主节点并启用组网，正在应用配置（网络会短暂中断）…"
+		cmd_apply
+		rc=$?
+		if [ "$rc" != 0 ]; then
+			echo "错误：主节点配置应用失败（详见上方输出）。可到「组网设置」页手动点一次「保存并应用」重试。"
+			return "$rc"
+		fi
+		mesh_log info "角色设置：master（已应用）"
+		echo "主节点组网已就绪：mesh0/bat0 已创建，现在可以点「开放加入」接待新节点。"
 	else
 		echo "已设为子节点并启用组网（未应用配置）：先点「一键加入」领凭证，"
-		echo "领到之后再应用 —— 现在应用会报「子节点没有 Mesh ID」。"
+		echo "领到之后会自动应用 —— 现在应用会报「子节点没有 Mesh ID」。"
 	fi
 	return 0
 }

@@ -136,3 +136,9 @@
 	color: #333;
 	word-break: break-all;
 }
+
+/* 退出组网区块（组网状态页「一键加入」卡片底部，r47）：
+   与主操作按钮之间用一条虚线隔开，避免"误点退出"—— 退出会还原配置、清凭证，
+   是不可逆的破坏性操作，视觉上必须与上方的加入/开放按钮拉开距离。 */
+.mesh-exit-box { margin-top: 14px; }
+.mesh-exit-sep { border-top: 1px dashed #ddd; margin-bottom: 10px; }

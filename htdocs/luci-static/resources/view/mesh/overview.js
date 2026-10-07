@@ -477,19 +477,115 @@ function repaintAll(d) {
 	rootNode = n;
 }
 
-/* 状态页直接选角色：只写 UCI，不应用（子节点还没凭证，apply 必失败）。 */
+/* 状态页直接选角色。
+   ★ 主节点（r46）：后端 set-role 会顺带把配置**应用**掉（创建 mesh0/bat0），
+     期间要 wifi reload + network reload，本 RPC 会阻塞十几秒到几十秒。
+     所以这里不能像以前那样一调完就重画 —— 必须先把"应用中"的提示打出去，
+     否则用户面对一个卡住的按钮会以为点坏了、跑去重复点击。
+   ★ 子节点：后端仍然只写 UCI（它手里还没凭证，立刻 apply 必失败），本 RPC 秒回，
+     真正的应用由随后的「一键加入」完成。 */
 function setRole(role) {
+	var isMaster = (role === 'master');
+	if (isMaster) {
+		/* 通知是短暂提示，apply 要跑几十秒，得留一条"进行中"的常驻说明。
+		   复用整页重画：先把 rootNode 换成"正在应用"，等 RPC 回来再重画成真实状态。 */
+		ui.showModal(null, [
+			E('p', { 'class': 'spinning' }, _('正在成为主节点并应用配置…')),
+			E('p', {}, _('会创建 mesh0/bat0 并重载无线与网络，网络可能中断 10~30 秒，请勿刷新页面。'))
+		]);
+	}
 	return callMeshPair('set_role', role).then(function (res) {
+		if (isMaster) { ui.hideModal(); }
 		var out = (res && res.stdout) ? res.stdout : '';
-		ui.addNotification(null, E('p', {}, out || _('已设置')), 'success');
+		var failed = (res && res.code != null && res.code !== 0);
+		ui.addNotification(null, E('p', {}, out || _('已设置')), failed ? 'danger' : 'success');
 		setTimeout(function () {
 			callMeshStatus().then(repaintAll, function () {});
 		}, 800);
 		return out;
 	}, function (e) {
-		ui.addNotification(null, E('p', {}, _('操作失败：%s').format(e)), 'danger');
+		if (isMaster) { ui.hideModal(); }
+		/* 超时不等于失败：apply 往往比 RPC 先完成，只是响应没回来。
+		   如实说明并提示以状态页为准，避免用户当成故障去反复重试。 */
+		ui.addNotification(null, E('p', {},
+			_('操作未收到响应（可能正在重载网络）：请等待约 30 秒后刷新本页查看结果。')
+			+ ' ' + _('详细：%s').format(e)), 'warning');
+		setTimeout(function () {
+			callMeshStatus().then(repaintAll, function () {});
+		}, 5000);
 		return null;
 	});
+}
+
+/* ★ 退出组网区块（r47）。
+   与「一键加入」构成完整生命周期：这里加入、这里退出，不必再跑去「诊断与维护」页
+   找一个叫「还原组网前配置」的按钮。
+   显示条件刻意收紧 —— 只有"真的组上网且手上有还原点"才给按钮：
+     role_set=1（选了角色）+ enabled=1（已启用）+ applied=1（配置已落地成 mesh0）
+     + mesh_id 非空（有凭证）+ backup_exists=1（有组网前备份可还原）
+   为什么不用 enabled=1 就够了：刚设完角色还没 apply 的中间态，退出没有意义
+   （备份可能是空的、也没有接口可拆）；没有备份时 cmd_revert 只会报"未找到组网前备份"，
+   提前置灰比让用户点完吃报错更友好。
+   交互上只用 confirm，不复制 WPS 按键那套"反悔窗口"：反悔窗口是为了弥补物理按键
+   没有确认对话框，网页上再套一层倒计时是过度设计。 */
+function exitSection(d) {
+	var roleSet = (d.role_set !== 0);
+	var ready = roleSet && d.enabled == 1 && d.applied == 1
+		&& d.mesh_id && d.backup_exists;
+	if (!ready) {
+		/* 有备份但还没组上网时给一句说明，避免用户以为功能丢了 */
+		if (roleSet && d.enabled == 1 && d.backup_exists) {
+			return E('div', { 'class': 'mesh-exit-box' }, [
+				E('div', { 'class': 'mesh-muted' },
+					_('组网就绪后可在此一键退出（当前尚未完成组网）。'))
+			]);
+		}
+		return null;
+	}
+
+	var isMaster = (d.role === 'master');
+	var btnExit = E('button', { 'class': 'btn cbi-button-negative', 'type': 'button' },
+		_('退出组网（还原组网前配置）'));
+	btnExit.addEventListener('click', function () {
+		var msg = '';
+		if (isMaster) {
+			msg += _('⚠ 本节点是主节点，退出后所有子节点都会断开，且需要各自重新加入。') + '\n\n';
+		}
+		msg += _('确定退出组网？') + '\n\n'
+			+ _('将把本节点还原到组网前的配置：') + '\n'
+			+ '· ' + _('恢复到备份时刻的 WiFi 名称密码、防火墙、DHCP、LAN 地址') + '\n'
+			+ '· ' + _('清除本机 Mesh 凭证与节点角色，回到"从未入网"状态') + '\n'
+			+ '· ' + _('管理地址可能变化，页面会短暂断开') + '\n\n'
+			+ _('备份创建于：%s').format(d.backup_created || _('未知')) + '\n\n'
+			+ _('该时刻之后的所有修改都会丢失。确定继续？');
+		if (!confirm(msg)) return;
+
+		ui.showModal(null, [
+			E('p', { 'class': 'spinning' }, _('正在退出组网并还原配置…')),
+			E('p', {}, _('会重载无线与网络，本机可能中断 10~30 秒，请勿刷新页面。'))
+		]);
+		/* 走 ubus exec 与「诊断与维护」页同一个 revert 命令，后端逻辑完全复用 */
+		callMeshExec('meshctl revert').then(function (res) {
+			ui.hideModal();
+			var out = (res && res.stdout) ? res.stdout : '';
+			var failed = (res && res.code != null && res.code !== 0);
+			ui.addNotification(null, E('p', {}, out || _('已退出组网')), failed ? 'danger' : 'success');
+			setTimeout(function () { callMeshStatus().then(repaintAll, function () {}); }, 2000);
+		}, function (e) {
+			ui.hideModal();
+			ui.addNotification(null, E('p', {},
+				_('操作未收到响应（可能正在重载网络）：请等待约 30 秒后刷新本页查看结果。')
+				+ ' ' + _('详细：%s').format(e)), 'warning');
+			setTimeout(function () { callMeshStatus().then(repaintAll, function () {}); }, 5000);
+		});
+	});
+
+	return E('div', { 'class': 'mesh-exit-box' }, [
+		E('div', { 'class': 'mesh-exit-sep' }),
+		E('div', { 'class': 'mesh-muted', 'style': 'margin-bottom:8px' },
+			_('退出组网会把本节点还原到备份时刻的配置，并清除 Mesh 凭证 —— 等同 WPS 键长按 14~20 秒。')),
+		btnExit
+	]);
 }
 
 function pairSection(d) {
@@ -552,19 +648,20 @@ function pairSection(d) {
 		var pickRow = E('div', { 'class': 'mesh-btnrow' });
 
 		var btnMaster = E('button', { 'class': 'btn cbi-button-apply', 'type': 'button' },
-			_('设为主节点(上网网关 · 配置源)并启用'));
+			_('成为主节点（一键组网）'));
 		btnMaster.addEventListener('click', function () {
-			if (!confirm(_('把本节点设为主节点并启用组网？\n\n只写配置，不会改动网络。'
-				+ '设完即可点「开放加入」；要让 mesh0/bat0 立刻跑起来，'
-				+ '再到组网设置页点一次「保存并应用」。'))) { return; }
+			if (!confirm(_('把本节点设为主节点并启用组网？\n\n'
+				+ '将立即应用配置：创建 mesh0/bat0 回程接口。\n'
+				+ '⚠ 应用过程会重载无线与网络，本机可能中断 10~30 秒（页面会短暂失去响应）。\n\n'
+				+ '完成后即可点「开放加入」接待新节点。确定继续？'))) { return; }
 			setRole('master');
 		});
 
 		var btnClient = E('button', { 'class': 'btn cbi-button-apply', 'type': 'button' },
-			_('设为子节点(全端口内网 · 跟随主节点)并启用'));
+			_('成为子节点（跟随主节点）'));
 		btnClient.addEventListener('click', function () {
 			if (!confirm(_('把本节点设为子节点并启用组网？\n\n只写配置，不会改动网络。'
-				+ '\n⚠ 设完之后先点本页的「一键加入」领凭证，领到之后再应用 ——'
+				+ '\n⚠ 设完之后先点本页的「一键加入」领凭证 —— 领到之后会自动应用；'
 				+ '现在就应用会报「子节点没有 Mesh ID」。'))) { return; }
 			setRole('client');
 		});
@@ -573,7 +670,7 @@ function pairSection(d) {
 		pickRow.appendChild(btnClient);
 		box.appendChild(pickRow);
 		box.appendChild(E('div', { 'class': 'mesh-muted' },
-			_('也可以到「组网设置」页改；那边的保存按钮还能顺带直接应用配置。')));
+			_('也可以到「组网设置」页改；那边的保存按钮也能顺带应用配置。')));
 		return box;
 	}
 
@@ -628,6 +725,8 @@ function pairSection(d) {
 				+ '本节点会等待最长 %s，期间每 10 秒重试一次。').format(fmtDur(p.wait || 300))));
 		box.appendChild(E('div', { 'class': 'mesh-muted' },
 			_('也可以命令行执行：meshctl pair-join --apply')));
+		var exC = exitSection(d);
+		if (exC) { box.appendChild(exC); }
 		return box;
 	}
 
@@ -640,6 +739,19 @@ function pairSection(d) {
 			card(_('本轮已加入'), '%s %s'.format(p.joined || 0, _('台')))
 		]);
 		box.appendChild(cards);
+		/* ★ 这个计数只表示"本轮窗口里领走凭证的台数"，不代表组网成功（r46）。
+		   真机 2026-10-07 就是"已加入 1 台"却根本没组上网 —— 因为主节点当时没 apply，
+		   mesh0/bat0 压根不存在，新节点拿了凭证无处可连。必须把这层歧义说破。 */
+		box.appendChild(E('div', { 'class': 'mesh-muted', 'style': 'margin:-4px 0 10px' },
+			_('「本轮已加入」只统计领走凭证的台数，不代表组网已通路由 —— 是否真正组上网请看上方「运行状态」与「节点列表」。')));
+
+		/* ★ 已设为主节点但配置没落地（r46）：这是最容易误判的中间态，顶部直接拦一道。 */
+		if (d.applied == 0) {
+			box.appendChild(E('div', { 'class': 'mesh-note red' },
+				_('本节点已设为主节点，但配置尚未应用 —— mesh0/bat0 还没创建，'
+					+ '新节点即使领到凭证也无法组网。请在下方重新点一次「成为主节点」'
+					+ '（会自动应用），或到「组网设置」页点「保存并应用」。')));
+		}
 
 		var line = E('div', { 'style': 'margin:10px 0;font-size:14px' }, [
 			E('b', { 'style': 'color:#37c837' }, _('已开放加入')),
@@ -685,10 +797,11 @@ function pairSection(d) {
 			_('开放后本节点会临时多一个配对信号（桥在内网上），到期自动撤掉。'
 				+ '窗口期内任何"连得上本节点、知道固件固定配对密码"的设备都能领到凭证，'
 				+ '所以默认只开几分钟——兜底就是"得本人在现场开窗"。')));
-		return box;
 	}
 
 	box.appendChild(row);
+	var exM = exitSection(d);
+	if (exM) { box.appendChild(exM); }
 	return box;
 }
 
