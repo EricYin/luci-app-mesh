@@ -1803,6 +1803,7 @@ cmd_pair_join() {
 	local do_apply=0 role radio ssid key stasec old_ch pch
 	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch sta_dev rpf_old
 	local collide=0 cand2="" selfips=""
+	local lastfail="" jerr="" jhint="" code=""
 	[ "$1" = "--apply" ] && do_apply=1
 
 	role=$(mesh_uci_get main.role)
@@ -1953,6 +1954,7 @@ cmd_pair_join() {
 		#   地址，却一次凭证都领不到。换成私网地址后是"私网→私网"，不再被拦。
 		cand="$MESH_PAIR_ALIAS $cand2"
 		echo "      本机内网与主节点撞号，改走备用地址 $MESH_PAIR_ALIAS"
+		mesh_log info "配对：本机内网与主节点撞号，改走备用地址 $MESH_PAIR_ALIAS（原候选：$cand2）"
 	else
 		cand="$cand2"
 	fi
@@ -1987,9 +1989,17 @@ cmd_pair_join() {
 	echo 0 > "/proc/sys/net/ipv4/conf/$sta_dev/rp_filter" 2>/dev/null
 
 	echo "      领取出口：$(ip route get "$(echo "$cand" | awk '{print $NF}')" 2>/dev/null | head -n1 | sed 's/ cache//')"
+	# ★ r48：把本次领取的"底牌"记进日志。这条链路以前完全静默 —— 全在 stdout 上，
+	#   rpcd 会把它重定向进 /tmp/mesh/pair.log（tmpfs，重启即失，且下次配对就被清空），
+	#   事后在「诊断与维护-日志」里一条都看不到。真机排查 403 问题时两口子都是静默的，
+	#   主节点看起来"什么都没发生"、子节点只说"等待超时"，中间的 403 只在 uhttpd
+	#   syslog 里露一次脸。配套：候选地址与网卡是"为什么连不上"的第一现场。
+	mesh_log info "配对：开始领取凭证（候选=[$cand] 网卡=$sta_dev 本机=$ip 撞号=$collide 超时=${maxwait}s）"
 
 	out=""
 	ok=""
+	# r48：上一轮各候选地址的失败原因，供超时汇总与"每 60 秒一次"的节流日志复用
+	lastfail=""
 	while [ "$waited" -lt "$maxwait" ]; do
 		for c in $cand; do
 			# ★ 直接把 socket 绑到设备上（SO_BINDTODEVICE）：它会把路由查找也
@@ -2000,11 +2010,26 @@ cmd_pair_join() {
 			# 个别 curl 构建不支持绑设备名，退回绑源地址（r32 的老写法）
 			[ -n "$out" ] || out=$(curl -s -m 6 --interface "$ip" \
 				"http://$c/cgi-bin/mesh-sync?action=join&mac=$mymac" 2>/dev/null)
-			[ -n "$out" ] || continue
+			[ -n "$out" ] || { lastfail="候选 $c 无响应（连不上或超时）"; continue; }
 			ok=$("$JF" -s "$out" -e '@.ok' 2>/dev/null)
 			[ "$ok" = "1" ] && break
+			# ★ r48：被拒绝时把**主节点给的原因**记下来（error/hint 一直都在响应体里，
+			#   以前直接丢掉）。不过这里只攒进变量，真正落盘由下面的节流逻辑统一做 ——
+			#   每 10 秒一轮、每轮 N 个候选，不节流的话一次 300 秒超时能刷 100+ 条。
+			jerr=$("$JF" -s "$out" -e '@.error' 2>/dev/null)
+			jhint=$("$JF" -s "$out" -e '@.hint' 2>/dev/null)
+			lastfail="候选 $c 被拒（${jerr:-unknown}${jhint:+：$jhint}）"
 		done
 		[ "$ok" = "1" ] && break
+		# ★ r48 节流（方案 A）：只在本轮的首轮与每 60 秒记一次失败详情。
+		#   复用循环里现成的 waited 计数器，与下面那句"已等待 Ns"提示同节奏 ——
+		#   不引入任何新 state 文件，也不改控制流。
+		#   上限：一次 300 秒超时最多 6 组，而不是 100+ 条。
+		#   取舍：失败原因若在 60 秒内发生变化会被漏掉，但循环结束后的
+		#   "超时汇总 + 一次性状态码探测"会给出最终准确状态，兜住这个缺口。
+		if [ "$waited" = 0 ] || [ $((waited % 60)) = 0 ]; then
+			mesh_log info "配对：领取未成功（已等待 ${waited}s）：${lastfail:-全部候选无响应}"
+		fi
 		# 已等到过久就提示一次，避免用户以为卡死
 		if [ "$waited" = 0 ] || [ $((waited % 60)) = 0 ]; then
 			echo "      等待主节点开放加入… 已等待 ${waited}s（请去主节点点『开放加入』）"
@@ -2013,10 +2038,25 @@ cmd_pair_join() {
 	done
 
 	if [ "$ok" != "1" ]; then
+		# ★ r48：超时后做一次**一次性状态码探测**，把"为什么连不上"钉死在日志里。
+		#   为什么不在重试循环里逐次探测：正常路径一个字节的额外开销都不要加。
+		#   这里用 -o /dev/null 是安全的 —— 这一遍本来就**不需要响应体**，只要状态码；
+		#   而重试循环里**绝不能**加 -o /dev/null，那会把 JSON 丢掉、jsonfilter
+		#   拿不到 .ok，整条配对链路直接崩。
+		#   状态码含义：000=连不上/超时，403=被 uhttpd 的 rfc1918_filter 拦（r45 那类），
+		#   404=CGI 路径不对，200 但 ok=0=主节点明确拒绝（原因见上一行 lastfail）。
+		for c in $cand; do
+			code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --interface "$sta_dev" \
+				"http://$c/cgi-bin/mesh-sync?action=join&mac=$mymac" 2>/dev/null)
+			[ -n "$code" ] || code="---"
+			mesh_log warn "配对：超时探测 $c → HTTP $code"
+		done
+		mesh_log warn "配对：等待超时（${maxwait}s）未领到凭证。最后失败：${lastfail:-全部候选无响应}"
 		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 		mesh_unlock
 		echo "错误：等待超时仍未领到凭证（主节点未开放加入，或不在同一网络内）"
 		echo "      本次配对网卡=$sta_dev 本机配对地址=$ip"
+		[ -n "$lastfail" ] && echo "      最后失败：$lastfail"
 		echo "      若配对信号明明连上了、地址也拿到了：多半是本机内网与配对链路撞在同一个子网"
 		echo "      （两边都是 192.168.1.0/24），报文走了错误的出口。r33 已改成绑设备发送；"
 		echo "      临时绕开可把本机内网改成其它网段（如 192.168.9.1）再试。"
@@ -2031,11 +2071,13 @@ cmd_pair_join() {
 	band=$("$JF" -s "$out" -e '@.mesh.band' 2>/dev/null)
 	ch=$("$JF" -s "$out" -e '@.mesh.channel' 2>/dev/null)
 	[ -n "$id" ] && [ -n "$k" ] || {
+		mesh_log warn "配对：领到的凭证不完整（id=${id:-空} key=${k:-空}）"
 		mesh_pair_join_cleanup "$stasec" "$radio" "$old_ch" "$sta_dev" "$rpf_old"
 		mesh_unlock
 		echo "错误：领到的凭证不完整（id=${id:-空} key=${k:-空}）"
 		return 1
 	}
+	mesh_log info "配对：已领取凭证（Mesh ID=$id，耗时 ${waited}s，撞号=$collide）"
 
 	echo "[4/4] 写入凭证并拆除配对连接"
 	uci set "mesh.main.mesh_id=$id"

@@ -44,11 +44,19 @@ hdr() { echo "Content-Type: application/json"; echo ""; }
 # 802.11s 的 SAE 没有 ACL，主节点无法按 MAC 拒绝 —— 兜底是"得本人在现场开窗"。
 if [ "$(qs_get action)" = "join" ]; then
 	hdr
+	# ★ r48：所有拒绝分支都补 mesh_log。以前只有"成功发凭证"记日志，失败一律静默 ——
+	#   子节点那边只说"等待超时"，主节点这边一片空白，中间真正的原因（窗口没开 /
+	#   角色不对 / 密码不符）全部只存在于 HTTP 响应体里，被 curl -s 丢掉。
+	#   真机排查 403 那次，两头都是静默的，全靠 uhttpd syslog 里那一行才定位。
+	#   这里**不做来源限流**：这些分支虽然被重试请求反复打到，但都属于"配置不正常"
+	#   的信号（正常流程几秒内就领走了），日志量可控；限流会掩盖首次失败原因。
 	if [ "$(mesh_uci_getd main.enabled 0)" != 1 ] || [ "$(mesh_uci_get main.role)" != master ]; then
+		mesh_log warn "配对：拒绝发凭证（本节点未启用组网或角色非 master，角色=$(mesh_uci_get main.role)）来源 ${peer_ip:--}"
 		echo '{"ok":0,"error":"not_master","hint":"只有已启用组网的主节点才能发放凭证"}'
 		exit 0
 	fi
 	if ! mesh_pair_window_open; then
+		mesh_log info "配对：拒绝发凭证（加入窗口未开放）来源 ${peer_ip:--} mac=${mac:--}"
 		echo '{"ok":0,"error":"pair_window_closed","hint":"主节点当前没有开放加入，请先在原主节点点『开放加入』"}'
 		exit 0
 	fi
@@ -77,12 +85,14 @@ fi
 # 这里拆开：disabled / role_unset / not_master(附实际角色)，并给一句可执行的提示。
 if [ "$(mesh_uci_getd main.enabled 0)" != 1 ]; then
 	hdr
+	mesh_log warn "配对：拒绝同步（本节点未启用组网）来源 ${peer_ip:--}"
 	echo '{"ok":0,"error":"disabled","hint":"本节点未启用 Mesh 组网（mesh.main.enabled != 1）"}'
 	exit 0
 fi
 mesh_role=$(mesh_uci_get main.role)
 if [ "$mesh_role" != master ]; then
 	hdr
+	mesh_log warn "配对：拒绝同步（本节点角色=${mesh_role:-未设置}）来源 ${peer_ip:--}"
 	if [ -z "$mesh_role" ]; then
 		echo '{"ok":0,"error":"role_unset","hint":"本节点未设置角色，请在组网设置页选择主节点后保存，或执行：uci set mesh.main.role=master; uci commit mesh"}'
 	else
@@ -93,11 +103,14 @@ fi
 want=$(mesh_uci_get main.mesh_key)
 if [ -z "$want" ] || [ "$token" != "$want" ]; then
 	hdr
+	# ★ r48：回程密码不符以前返回 {"ok":1,"auth":"bad"} 却毫无日志 —— 子节点凭证
+	#   过时（换过主节点 / 被还原过）时全靠猜。记一条才有排查线索。
+	mesh_log warn "配对：拒绝同步（回程密码不符）来源 ${peer_ip:--} mac=${mac:--}"
 	echo '{"ok":1,"auth":"bad"}'
 	exit 0
 fi
 case "$mac" in
-	''|*[!0-9A-Fa-f:-]*) hdr; echo '{"ok":0,"error":"bad_mac"}'; exit 0;;
+	''|*[!0-9A-Fa-f:-]*) hdr; mesh_log warn "配对：拒绝同步（MAC 非法：${mac:--}）来源 ${peer_ip:--}"; echo '{"ok":0,"error":"bad_mac"}'; exit 0;;
 esac
 
 # ---- 判断链路类型（未指定时自动判定） ----
