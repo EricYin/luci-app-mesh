@@ -256,6 +256,25 @@ function agoText(sec) {
 	return _('%d 天前').format(Math.floor(sec / 86400));
 }
 
+/* 连接时长换算成人话：天 / 小时 / 分（精确到分，不显示秒 —— 秒级精度对"连了多久"没意义，
+   还容易在窄列里折行）。
+   后端 p.connected 是秒（iw 的 connected time 原样透传），这里只做展示换算，不动后端。
+   天为 0 时不显示；从最大的非零单位开始，往下的单位一律补齐（含 0），
+   否则 25224s 会缩成「7 小时」，看不出到底是整点还是被截断。
+   不足一分钟的如实说"不足 1 分"，不硬凑成 0 分。 */
+function fmtSpan(s) {
+	s = Math.max(0, parseInt(s, 10) || 0);
+	if (s < 60) return _('不足 1 分');
+	var d = Math.floor(s / 86400),
+	    h = Math.floor((s % 86400) / 3600),
+	    m = Math.floor((s % 3600) / 60);
+	var parts = [];
+	if (d) parts.push(_('%d 天').format(d));
+	if (d || h) parts.push(_('%d 小时').format(h));
+	parts.push(_('%d 分').format(m));
+	return parts.join(' ');
+}
+
 function peersTable(d) {
 	var list = (d.peers && d.peers.list) ? d.peers.list : [];
 	var hasBat = list.some(function (p) { return p.bat && p.bat.tq != null; });
@@ -336,7 +355,7 @@ function peersTable(d) {
 			if (p.connected)
 				stCell.appendChild(E('div', {
 					'style': 'font-size:11px;color:#999;margin-top:2px'
-				}, _('连接时长 %s s').format(p.connected)));
+				}, _('连接时长 %s').format(fmtSpan(p.connected))));
 		} else {
 			stCell.appendChild(pill(_('离线'), 'grey'));
 			/* 离线行给最后上报时间：注册表里没清掉的行会一直显示"离线"，
@@ -809,36 +828,8 @@ function buildBody(d) {
 	ensureCss();
 	d = d || {};
 
-	/* 能力检测 */
-	var cap = d.capabilities || {};
-	var ok = cap.kernel_mesh && cap.wpad_mesh && cap.batman && cap.batctl;
-	/* 漫游引导（dawn + umdns）不是组网的前置条件 —— 缺了照样能组 mesh，
-	   只是客户端不会被引导到更优的 AP。所以单独判定：缺失时只把提示框降级为
-	   橙色提醒，不整框变红（否则没装 dawn 的设备会被误报成"组网不可用"）。 */
-	var roamOk = cap.dawn && cap.umdns;
-	var capBox = E('div', { 'class': 'mesh-note ' + (ok ? (roamOk ? 'green' : 'orange') : 'red') });
-	if (ok) {
-		var t2 = _('无线驱动已上报 mesh point 能力，已安装完整版 wpad，且已具备 batman-adv 内核模块与 batctl —— 802.11s 组网可用。');
-		if (roamOk) {
-			t2 += ' ' + _('漫游引导已就绪（dawn + umdns）：客户端会被引导到信号更优的 AP。');
-		} else {
-			t2 += ' ' + _('但缺少漫游引导：');
-			if (!cap.dawn) t2 += ' ' + _('需安装 dawn；');
-			if (!cap.umdns) t2 += ' ' + _('需安装 umdns（dawn 的邻居发现）。');
-			t2 += ' ' + _('客户端不会主动切换 AP（组网本身不受影响）。');
-		}
-		capBox.textContent = t2;
-	} else {
-		var t = _('组网能力不满足：');
-		if (!cap.kernel_mesh) t += ' ' + _('驱动未上报 mesh point；');
-		if (!cap.wpad_mesh) t += ' ' + _('需安装 wpad-openssl / wpad-wolfssl。');
-		if (!cap.batman) t += ' ' + _('需安装 kmod-batman-adv batctl。');
-		/* 内核模块在但 batctl 二进制缺失：界面不能显示全绿，否则 apply 会被静默拒绝 */
-		if (cap.batman && !cap.batctl) t += ' ' + _('已装 batman-adv 内核模块但缺少 batctl 工具。');
-		if (!cap.dawn) t += ' ' + _('缺少漫游引导 dawn；');
-		if (!cap.umdns) t += ' ' + _('缺少 dawn 的邻居发现组件 umdns。');
-		capBox.textContent = t;
-	}
+	/* 能力检测（capabilities 红框）已移到「诊断与维护」页 —— 见 tools.js。
+	   本页只保留"本机角色没落盘"这个状态类红框。 */
 
 	/* 角色没落盘时的红框：后端不再把空 role 兜底成 master（status 里给 role_set=0），
 	   这里必须显眼提示 —— 否则界面照旧写"主节点 · 配置源(下发中)"，而 apply 在
@@ -899,7 +890,7 @@ function buildBody(d) {
 	var rb = rollbackBox(d);
 
 	/* 配对卡片放在「运行状态」之后：它是"加新节点"的入口，属于状态页的高频操作，
-	   比拓扑图更该被先看到。放在最上面又会挤掉能力检测的红框，故居中。 */
+	   比拓扑图更该被先看到。 */
 	clearPairTimers();
 	pairHost = E('div', { 'class': 'cbi-section-node' });
 	pairHost.appendChild(pairSection(d));
@@ -911,7 +902,6 @@ function buildBody(d) {
 	return E('div', {}, [
 		rb,
 		roleBox,
-		section(_('能力检测'), capBox),
 		section(_('运行状态'), cards),
 		pairSec,
 		section(_('网络拓扑'), [ E('div', { 'class': 'mesh-topo-wrap' }, topo(d)), legend ]),

@@ -107,7 +107,7 @@
 .mesh-topo-svg {
 	display: inline-block;
 	background: #fff;
-	border: 1px solid #e3e3e3;
+	/* border: 1px solid #e3e3e3;  不要正方形外框 */
 	border-radius: 4px;
 	padding: 10px 6px;
 }

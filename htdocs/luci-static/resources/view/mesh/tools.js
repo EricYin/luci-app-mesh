@@ -131,6 +131,39 @@ return view.extend({
 		ensureCss();
 		d = d || {};
 
+		/* ---------- 能力检测 ---------- */
+		/* 2026-10-07 从「组网状态」页整段移来：它回答的是"这台设备到底能不能组网"，
+		   属于排查信息，和本页的射频能力表是一类，放最前面。 */
+		var cap = d.capabilities || {};
+		var ok = cap.kernel_mesh && cap.wpad_mesh && cap.batman && cap.batctl;
+		/* 漫游引导（dawn + umdns）不是组网的前置条件 —— 缺了照样能组 mesh，
+		   只是客户端不会被引导到更优的 AP。所以单独判定：缺失时只把提示框降级为
+		   橙色提醒，不整框变红（否则没装 dawn 的设备会被误报成"组网不可用"）。 */
+		var roamOk = cap.dawn && cap.umdns;
+		var capBox = E('div', { 'class': 'mesh-note ' + (ok ? (roamOk ? 'green' : 'orange') : 'red') });
+		if (ok) {
+			var t2 = _('无线驱动已上报 mesh point 能力，已安装完整版 wpad，且已具备 batman-adv 内核模块与 batctl —— 802.11s 组网可用。');
+			if (roamOk) {
+				t2 += ' ' + _('漫游引导已就绪（dawn + umdns）：客户端会被引导到信号更优的 AP。');
+			} else {
+				t2 += ' ' + _('但缺少漫游引导：');
+				if (!cap.dawn) t2 += ' ' + _('需安装 dawn；');
+				if (!cap.umdns) t2 += ' ' + _('需安装 umdns（dawn 的邻居发现）。');
+				t2 += ' ' + _('客户端不会主动切换 AP（组网本身不受影响）。');
+			}
+			capBox.textContent = t2;
+		} else {
+			var t = _('组网能力不满足：');
+			if (!cap.kernel_mesh) t += ' ' + _('驱动未上报 mesh point；');
+			if (!cap.wpad_mesh) t += ' ' + _('需安装 wpad-openssl / wpad-wolfssl。');
+			if (!cap.batman) t += ' ' + _('需安装 kmod-batman-adv batctl。');
+			/* 内核模块在但 batctl 二进制缺失：界面不能显示全绿，否则 apply 会被静默拒绝 */
+			if (cap.batman && !cap.batctl) t += ' ' + _('已装 batman-adv 内核模块但缺少 batctl 工具。');
+			if (!cap.dawn) t += ' ' + _('缺少漫游引导 dawn；');
+			if (!cap.umdns) t += ' ' + _('缺少 dawn 的邻居发现组件 umdns。');
+			capBox.textContent = t;
+		}
+
 		/* 维护 */
 		var bkTime = (d && d.backup_created) ? d.backup_created : '';
 		var btnRevert = E('button', { 'class': 'btn cbi-button-negative' }, _('退出组网-还原组网前配置'));
@@ -282,6 +315,7 @@ return view.extend({
 		loadLog();
 
 		return E('div', {}, [
+			section(_('能力检测'), capBox),
 			section(_('射频能力'), radiosTable(d)),
 			maintSec,
 			verSec,
