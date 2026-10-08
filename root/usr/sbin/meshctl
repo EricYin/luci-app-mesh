@@ -369,14 +369,18 @@ cmd_apply() {
 	# 把强制值写回 UCI：一是让状态页展示与实际一致，二是 mesh-sync 端点读的是
 	# main.batman，必须与"实际生效值"一致才能正确下发给子节点。
 	[ "$(q mesh.main.batman)" = "1" ] || uci set mesh.main.batman=1
-	# 网关模式策略恒为 off（方案 A）：本插件单主节点 + br-lan 二层桥接，全网没有出网
-	# 网关，client/server 都会让 DHCP 请求被单播投给"选中的网关"而整包丢弃
-	# （见 mesh_bat_gw_effective 的注释）。
-	# ★ 这一行就是"方案 C 的开关入口"：后期加开关时改成读 main.batman_gw（off/auto）
-	# 并按角色解析即可，其余调用方不用动。
-	# ⚠ 注意**不要**把解析后的生效值（server/client）写回 UCI —— 那会与这里的归一化
-	# 来回打架，触发无限重新 apply（见 mesh_sync_batman_from_json 的注释）。
-	[ "$(q mesh.main.batman_gw)" = "off" ] || uci set mesh.main.batman_gw=off
+	# 网关模式**策略**（main.batman_gw）白名单归一化：只允许 off / auto 两种。
+	#   off  = 全网不使用 batman 网关机制（默认，稳定）
+	#   auto = 主节点有外网出口时当网关、子节点按网关表自动跟随（多网关场景）
+	# 其它值（早期版本写过 server/client 这类**生效值**字面量）一律纠正为 off ——
+	# 那些值会让"网关表为空 + 有节点是 client"这个致命组合出现（r50 的 bug 成因）。
+	# ⚠ 注意**不要**把解析后的生效值（server/client）写回 main.batman_gw —— 那会与
+	# 这里的归一化来回打架，触发无限重新 apply（见 mesh_sync_batman_from_json 的注释）。
+	# 生效值只写 network.bat0.gw_mode，由 mesh_batman_apply / mesh_bat_gw_reconcile 负责。
+	case "$(q mesh.main.batman_gw)" in
+		off|auto) ;;
+		*) uci set mesh.main.batman_gw=off;;
+	esac
 	# 历史版本遗留的 main.batman_wired（0/1/2 三种有线回程模式）已无意义，
 	# 留着只会让"配置里写着 2、实际跑 B"这类偏差继续误导排查，顺手删掉
 	[ -n "$(q mesh.main.batman_wired)" ] && uci -q delete mesh.main.batman_wired
@@ -611,12 +615,15 @@ cmd_apply() {
 	sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
 	if [ "$batman" = "1" ]; then
 		local bat_gw
-		# 网关模式由 mesh_bat_gw_effective 统一解析（当前恒 off，见其注释）。
-		# ★ 旧实现这里有一段"主节点无默认路由 → server 降 client"的逻辑，是本次
+		# 网关模式由 mesh_bat_gw_effective 统一解析：策略 off → 恒 off；策略 auto →
+		# 主节点看外网出口、子节点看网关表。这里只写**初始值**，运行期的变化由守护
+		# 进程的 mesh_bat_gw_reconcile 热改（见其注释），不需要重新 apply。
+		# ★ 旧实现这里有一段"主节点无默认路由 → server 降 client"的逻辑，是 r50 那个
 		#   100% 复现 bug 的元凶：开机后第 ~307 秒才有默认路由，落在该窗口内的 apply
 		#   会把 bat0.gw_mode 写成 client 并固化，之后守护进程不会重算（见
 		#   mesh_sync_batman_from_json 的注释），错值永久固化、重启也不纠正。
-		#   降级逻辑已整体移除 —— off 策略下不需要它。
+		#   该逻辑已整体移除 —— 现在的降级目标是 **off**（退化成广播），
+		#   绝不会制造"网关表为空 + 有节点是 client"这个致命组合。
 		bat_gw=$(mesh_bat_gw_effective "$role")
 		mesh_batman_apply "$bat_gw"
 		[ -n "$sec" ] && uci set wireless.$sec.network=batmesh
@@ -1088,7 +1095,7 @@ cmd_status() {
 	fi
 
 	local kern wpad lanip lanproto bat_cap=0 bat_on=0 bat_if="" bat_hifs="" bat_hifs_json="" h
-	local bat_gw=auto bat_algo=default batctl_ok=0 dawn_ok=0 umdns_ok=0
+	local bat_gw=auto bat_gw_rt="" bat_algo=default batctl_ok=0 dawn_ok=0 umdns_ok=0
 	kern=0; mesh_kernel_mesh_cap && kern=1
 	wpad=0;  mesh_wpad_mesh_cap && wpad=1
 	bat_cap=0; mesh_batman_cap && bat_cap=1
@@ -1106,8 +1113,15 @@ cmd_status() {
 	# 不再读 main.batman —— 界面上也没有这个开关了。
 	bat_on=0
 	[ "$bat_cap" = 1 ] && bat_on=1
-	# 界面要显示"实际生效"的网关模式：由 mesh_bat_gw_effective 统一解析
+	# 网关模式要区分两个值 —— 它们在升级迟滞窗口（≤60 秒）内**必然不同**：
+	#   bat_gw    = 策略解析出的**目标值**（off/client/server）—— "准备切到哪"
+	#   bat_gw_rt = 内核**运行时实际值**（batctl 读 sysfs）      —— "现在实际是什么"
+	# 只报目标值会让人以为"已经切好了"（r52 首版就是这么做的，日志里出现过
+	# 「主节点通告 server，本机生效 client」而运行时其实还是 off 的误导）。
+	# bat0 还没建起来（未 apply / 已停用）时运行时读不到 → 退回目标值，避免界面空着。
 	bat_gw=$(mesh_bat_gw_effective "$role")
+	bat_gw_rt=$(mesh_bat_gw_runtime_mode)
+	[ -n "$bat_gw_rt" ] || bat_gw_rt="$bat_gw"
 	bat_algo=$(mesh_bat_routing_algo 2>/dev/null)
 	[ -n "$bat_algo" ] || bat_algo=default
 	if [ "$bat_cap" = 1 ] && [ "$bat_on" = "1" ]; then
@@ -1227,7 +1241,7 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
  "mac": "$(mesh_esc "$(mesh_primary_mac)")",
  "now": $now,
  "capabilities": {"kernel_mesh": $kern, "wpad_mesh": $wpad, "batman": $bat_cap, "batctl": $batctl_ok, "dawn": $dawn_ok, "umdns": $umdns_ok},
- "batman": {"capable": $bat_cap, "enabled": $bat_on, "iface": "$(mesh_esc "$bat_if")", "hardifs": [$bat_hifs_json], "gw_mode": "$(mesh_esc "$bat_gw")", "gw_mode_conf": "$(mesh_esc "$(mesh_uci_getd main.batman_gw off)")", "routing_algo": "$(mesh_esc "$bat_algo")"},
+ "batman": {"capable": $bat_cap, "enabled": $bat_on, "iface": "$(mesh_esc "$bat_if")", "hardifs": [$bat_hifs_json], "gw_mode": "$(mesh_esc "$bat_gw_rt")", "gw_mode_target": "$(mesh_esc "$bat_gw")", "gw_mode_conf": "$(mesh_esc "$(mesh_uci_getd main.batman_gw off)")", "routing_algo": "$(mesh_esc "$bat_algo")"},
  "radios": [$radios_json],
  "channels": {$channels_json},
  "backhaul": {"ifname": "$(mesh_esc "$bh_if")", "channel": "$(mesh_esc "$bh_ch")", "band": "$(mesh_esc "$bh_band")"},
@@ -1277,10 +1291,12 @@ EOF
 #
 # 【正确做法】比较「生效值」而不是「字面量」：
 #   · batman 开关恒为启用（cmd_apply 强制写 1），只有本机不是 1 时才需要写回并 apply；
-#   · 网关模式对本机由 mesh_bat_gw_effective 决定（当前恒 off），因此把主节点的
-#     生效模式与**本机解析后的生效模式**比即可，**绝不把解析后的字面量写回 batman_gw**。
+#   · 网关模式对本机由 mesh_bat_gw_effective 按角色自行解析（策略 off 恒 off；策略 auto
+#     时主节点看外网出口、子节点看网关表），因此把主节点的生效模式与**本机解析后的生效
+#     模式**比即可，**绝不把解析后的字面量写回 batman_gw**。两者短时不一致是正常的
+#     （升级迟滞窗口），故只记 info、不 warn、更不改配置。
 mesh_sync_batman_from_json() {
-	local json="$1" mb mg cur_gw
+	local json="$1" mb mg cur_gw gwseen gwcur
 	[ -n "$JF" ] || return 1
 	[ -x "$JF" ] || return 1
 	mb=$("$JF" -s "$json" -e '@.batman.enabled' 2>/dev/null)
@@ -1289,12 +1305,10 @@ mesh_sync_batman_from_json() {
 	# 旧主节点发来的 @.batman.wired 会被直接忽略 —— 这正是想要的：本端保持固定拓扑，
 	# 不会因为对端版本不同而被切到别的模式上去。
 	mg=$("$JF" -s "$json" -e '@.batman.gw' 2>/dev/null)
-	# 主节点是出网网关(server) → 自己必须是客户端；主节点都不是网关时跟着它降级
-	case "$mg" in
-		server) mg=client;;
-		client|off) ;;
-		*) mg=client;;
-	esac
+	# mg = 主节点通告的**它自己的**生效模式（server/client/off），仅用于日志。
+	# ★ 本包不再据此改配置：子节点改为自己探测 batman 网关表（表非空 → client，
+	#   表空 → off，见 mesh_bat_gw_effective）。网关表由 OGM 实时同步，本身就是主节点
+	#   gw_mode 的镜像，比"等下发的值"更快，也省掉了跨节点缓存机制。
 	# batman 开关：本包恒启用（cmd_apply 强制写 1）。对端若下发 0，本机也无法跟随
 	# （apply 会强制改回 1），写回只会来回打架 → 只告警，不动配置。
 	if [ "$mb" != "1" ]; then
@@ -1307,10 +1321,18 @@ mesh_sync_batman_from_json() {
 		mesh_log info "路径选择配置跟随主节点: batman=1（需重新 apply 以搭建 bat0）"
 		return 0
 	fi
-	# 网关模式：本机生效值由 mesh_bat_gw_effective 解析（当前恒 off），再与主节点下发的比。
+	# 网关模式：本机**目标值**由 mesh_bat_gw_effective 自行解析（可能随网关表 / 外网出口变化）。
+	# ★ 措辞用"目标"而非"生效"：这个值是策略解析结果，不是内核运行时值 —— 升级迟滞窗口内
+	#   两者不同，写"生效"会误导排查（曾出现「本机生效 client」而运行时其实还是 off）。
+	# 与主节点通告值短时不一致是**正常**的，所以只在**变化时**记一条 info，不每轮 warn
+	# —— 那会把日志刷爆（r51 之前踩过：子节点每 10 秒一条 warn）。
 	cur_gw=$(mesh_bat_gw_effective "$(mesh_uci_getd main.role master)")
-	[ "$mg" = "$cur_gw" ] || \
-		mesh_log warn "主节点网关模式($mg)与本机生效模式($cur_gw)不一致（本机按角色 $(mesh_uci_getd main.role master) 运行）"
+	gwcur="$mg|$cur_gw"
+	gwseen="$MESH_TMP_DIR/gw-seen"
+	if [ "$(cat "$gwseen" 2>/dev/null)" != "$gwcur" ]; then
+		printf '%s\n' "$gwcur" | mesh_state_write "$gwseen"
+		mesh_log info "网关模式：主节点通告 $mg，本机目标 $cur_gw"
+	fi
 	return 1
 }
 
@@ -1493,6 +1515,11 @@ cmd_daemon() {
 		# （mesh_bat_fix_mtu 补 MTU：无线回程 2304，须容纳 41B 的 batman 头）
 		if [ "$(mesh_uci_getd main.batman 1)" = "1" ]; then
 			mesh_bat_fix_mtu 2>/dev/null
+			# 网关模式自愈：把"策略解析出的目标模式"与"运行时 gw_mode"对齐。只在确实
+			# 需要变更时才写（热改 sysfs + commit，实测不断网），两端跑同一段代码、
+			# 不按角色分支。放这里而不是 cmd_sync_once 里：主节点不走同步路径，但它
+			# 同样需要自愈（WAN 起来 / 断掉都要重新判定 server/off）。
+			mesh_bat_gw_reconcile 2>/dev/null
 		fi
 		if [ "$(mesh_uci_getd main.enabled 0)" = "1" ] && [ "$(mesh_uci_getd main.role master)" = client ]; then
 			if cmd_sync_once >/dev/null 2>&1; then
@@ -1513,7 +1540,7 @@ cmd_daemon() {
 
 # ================= 诊断 =================
 cmd_diag() {
-	local r band ch ht sec mode p ifn st bgw h
+	local r band ch ht sec mode p ifn st bgw bgwrt h
 	echo "== 能力检测 =="
 	if mesh_kernel_mesh_cap; then echo "mesh_support = 1"; else echo "mesh_support = 0 (驱动不支持 802.11s)"; fi
 	if mesh_wpad_mesh_cap; then echo "wpad_mesh    = 1"; else echo "wpad_mesh    = 0 (需安装 wpad-openssl/wpad-wolfssl)"; fi
@@ -1540,7 +1567,9 @@ cmd_diag() {
 				echo "  hardif $h = $(mesh_bat_iface_link "$h") mtu=$(cat "/sys/class/net/$h/mtu" 2>/dev/null) hop_penalty=$_hp"
 			done
 			bgw=$(mesh_bat_gw_effective "$(mesh_uci_getd main.role master)")
-			echo "  gw_mode    = $bgw (配置: $(mesh_uci_getd main.batman_gw off))"
+			bgwrt=$(mesh_bat_gw_runtime_mode)
+			[ -n "$bgwrt" ] || bgwrt="$bgw"
+			echo "  gw_mode    = 运行时 $bgwrt / 目标 $bgw (策略: $(mesh_uci_getd main.batman_gw off))"
 			echo "  有线回程   = B 方案(唯一实现): 端口与 bat0 同进 br-lan, 二层直转走网线(BLA 防环, bat0 不被 STP 阻塞)"
 		else
 			echo "batman_adv   = 1 (已安装未启用; 在设置页「路径选择」里开启)"

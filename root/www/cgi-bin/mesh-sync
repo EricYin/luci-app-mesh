@@ -206,8 +206,9 @@ bat_json() {
 	local en gw
 	en=$(mesh_uci_getd main.batman 1)
 	# 下发"主节点实际生效"的网关模式（本函数在**主节点**上执行，故传 master）。
-	# A 方案下恒 off，子节点收到 off 后同样用 off（策略全局一致，两端独立解析结果相同，
-	# 不需要"跟随"）。方案 C 开关打开后才需要子节点跟随主节点的降级结果。
+	# 策略 off 时恒 off；策略 auto 时是 server/off（取决于主节点有无外网出口）。
+	# ⚠ 子节点**不再据此改配置**（方案 C 起改为自己探测 batman 网关表），这个字段
+	#   只作为"主节点当前是什么状态"的展示 / 排查线索。
 	gw=$(mesh_bat_gw_effective master)
 	printf '{"enabled":%s,"gw":"%s"}' "$en" "$gw"
 }

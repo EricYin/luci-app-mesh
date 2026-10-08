@@ -11,6 +11,12 @@ MESH_REGISTRY="${MESH_REGISTRY:-$MESH_TMP_DIR/registry.tsv}"
 MESH_LOG="${MESH_LOG:-$MESH_TMP_DIR/mesh.log}"
 MESH_SYNC_INTERVAL="${MESH_SYNC_INTERVAL:-10}"
 MESH_ROLLBACK_SECONDS="${MESH_ROLLBACK_SECONDS:-120}"
+# 网关模式（gw_mode）自愈的迟滞轮数，单位是守护进程的一轮（= MESH_SYNC_INTERVAL 秒）。
+# **不对称**：降级到 off 立即执行（救火 —— 网关表空了还留在 client 就是必坏）；
+# 升级到 server/client 需连续 N 轮一致才切（恢复能力，不急，防 WAN 抖动来回切）。
+# 默认 6 轮 ≈ 60 秒。迟滞只作用于恢复方向，不会拖长故障响应。
+MESH_GW_DOWNGRADE_ROUNDS="${MESH_GW_DOWNGRADE_ROUNDS:-1}"
+MESH_GW_UPGRADE_ROUNDS="${MESH_GW_UPGRADE_ROUNDS:-6}"
 
 # ---------------- 日志 ----------------
 mesh_log() {
@@ -763,23 +769,220 @@ mesh_bat_originators_tsv() {
 	return 0
 }
 
-# 本机生效的 batman-adv 网关模式（gw_mode）。
-#   $1 = 本机角色（master / 其它）。A 方案下不分角色，参数为方案 C 预留。
+# ================= batman-adv 网关模式（gw_mode） =================
+# 本插件的拓扑是「单主节点 + br-lan 二层桥接」：全网只有一个出网网关，就是主节点自己。
+# batman-adv 的网关机制（gw_mode）是为"多网关择优"设计的，在这个拓扑下本来零收益，
+# 但它会**改变 DHCP 报文的转发方式**，用错就全网丢包 —— 所以必须显式管住。
 #
-# 【为什么现在恒为 off】详见「根因报告-gw_mode-2026-10-08.md」。一句话：
-#   gw_mode != off 时，客户端发出的 DHCP 请求会被 batman-adv 当成"交给网关"处理
-#   （batadv_send_skb_via_gw），而本插件是**单主节点 + br-lan 二层桥接**，全网没有
-#   真正的出网网关，网关表恒空 → 整包丢弃（TX_DROPPED++）→ 子节点 apply 后拿不到
-#   DHCP 地址 → 240s 后 rollback 还原。off 让请求回到广播泛洪，不依赖任何收敛。
-#   实测：改 off 后 2 秒内拿到租约（对比 bug 态主节点 dnsmasq 全程 0 条）。
+# 【为什么 gw_mode != off 会丢包】内核 net/batman-adv/mesh-interface.c 的
+#   batadv_interface_tx() 里，报文**发出方自己**的 gw_mode 决定它发出的 DHCP 请求
+#   怎么走（dhcp_rcp == BATADV_DHCP_TO_SERVER）：
+#       off    → do_bcast=true，原样二层广播泛洪                       ✓
+#       client → batadv_gw_out_of_range() + send_skb_via_gw()，单播给
+#                "选中的网关"；**网关表为空时整包丢弃**（TX_DROPPED++）   ✗
+#       server → gw_mode==SERVER && TO_SERVER → 直接 goto dropped       ✗
+#   应答侧对称：服务器自己 gw_mode==off 时广播回来；client/server 时按
+#   dst_hint=chaddr 走 TT 单播（batadv_send_skb_via_tt）。
+#   → 唯一致命的组合是「网关表为空 + 有节点是 client」：请求被投给不存在的网关而丢弃。
+#   实测（2026-10-08）：该组合下 udhcpc 90 秒零响应；两端 off 时 2 秒拿到租约。
+#   详见「根因报告-gw_mode-2026-10-08.md」。
 #
-# 【★ 方案 C（双模式开关）上线时怎么改】**只动这个函数体**，所有调用方一行不用改：
-#     main.batman_gw = off  → 全网 off（A 方案，默认）
-#     main.batman_gw = auto → 主节点 server / 子节点 client（B 方案，保留多网关）
-#   并把"无默认路由时降级"的目标从 client 改为 **off** —— 退化成 A 方案，
-#   而不是让全网网关表为空（那正是本次 bug 的成因）。
+# 【策略】main.batman_gw 二选一：
+#   off  （默认）→ 全网一律 off。DHCP/ARP 全走二层广播，零收敛依赖。
+#   auto         → 主节点按"有没有真实外网出口"决定 server/off；
+#                  子节点按"网关表是否非空"决定 client/off。
+#   ★ 子节点看**网关表**而不是等主节点下发：网关表由 OGM 实时同步，本身就是主节点
+#     gw_mode 的镜像（主节点 server → OGM 带 GW flag → 全网网关表出现它；主节点 off
+#     → 表清空）。所以子节点不需要知道主节点的策略，看表即可 —— 省掉整条跨节点
+#     下发/缓存链路，感知也更快（≤ MESH_SYNC_INTERVAL 秒）。
+#   ★ 主节点无出口时降级目标是 **off** 而不是 client：降成 client 会让全网网关表为空，
+#     正好制造上面那个致命组合（r50 那个 100% 复现 bug 的成因）。
+#
+# 【调用方】meshctl apply / status / sync 与 mesh-sync CGI 都只调这一个函数取生效值；
+#   切换策略只改这个函数体，调用方一行不用动。
 mesh_bat_gw_effective() {
-	echo off
+	local role="${1:-}"
+	# 策略 off（默认）：短路返回，不做任何 fork —— 这是每 10 秒轮询的必经之路
+	[ "$(mesh_uci_getd main.batman_gw off)" = "auto" ] || { echo off; return 0; }
+	if [ "$role" = master ]; then
+		# 主节点：有真实外网出口才当网关，否则降级为 off
+		if mesh_bat_gw_uplink_ok; then echo server; else echo off; fi
+	else
+		# 子节点：网关表非空说明 mesh 里确实存在一个已收敛的网关，才敢用 client
+		if mesh_bat_gw_table_nonempty; then echo client; else echo off; fi
+	fi
+}
+
+# 主节点是否具备"真实的外网出口"。
+# 只剔除**一类**假出口 —— "下一跳恰好是本机 br-lan 的地址"：把网线误插进 lan1/lan2
+# （它们被配成 WAN）时，本机在 lan1 上发的 DHCP 请求会经**同一个二层域**（bat0 桥接）
+# 被**自己的 dnsmasq** 应答，于是拿到一条指向自己的默认路由。这种路由的下一跳是自己，
+# 一包都出不去 —— 比"次优"严重，必须挡。
+#
+# ★ 不再按**出口设备名**过滤（曾排除 br-lan / bat0 / mesh*）。那道过滤挡的是"借 mesh 内
+#   另一台设备的路当网关"（例如本机其实是子节点，或 network.lan 被配成 dhcp）—— 被挡掉
+#   的那台设备**其实能通**，只是多一跳，危害是"次优"而非"坏掉"；而它的代价是会误伤
+#   "WAN 真的桥进 br-lan"的合法配置（光猫一体机桥 PON / IPTV 复用）。权衡后决定：
+#   宁可接受"多网关下可能对外通告一个次优网关"，也不让合法的桥接配置被误判成无出口。
+#   注：mesh 子节点角色**根本不走本判据**（走 mesh_bat_gw_table_nonempty），去掉无副作用。
+mesh_bat_gw_uplink_ok() {
+	local lanip
+	# 本机 br-lan 地址（取第一个 inet，去掉前缀长度）；取法与 meshctl 状态页一致
+	lanip=$(ip -4 addr show dev br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n1)
+	ip route show default 2>/dev/null | awk -v lan="$lanip" '
+		# 空行直接跳过：NF==0 时下面的 for 不执行、if 也不命中，会一路落到
+		# found=1，把"没有默认路由"误判成"有外网出口"。真实 ip 命令无路由时
+		# 输出零行而非空行（实测 dev lan1=58B / dev lan2=0B），故此前不触发，
+		# 此为防御性兜底。★ 必须独立成 pattern-action，不能写进下面的 { } 块内。
+		NF == 0 { next }
+		{
+			via = ""
+			for (i = 2; i < NF; i++)
+				if ($i == "via") via = $(i + 1)
+			# 只挡"下一跳 = 自己"的自环；br-lan 无地址时 lan 为空串，
+			# 而 via != "" 已先排除空 via，不会误跳过
+			if (via != "" && via == lan) next
+			found = 1
+		}
+		END { exit !found }'
+}
+
+# mesh 内是否存在已收敛的网关（batman 网关表非空）。
+# 这是子节点敢用 client 的唯一充分条件：表空时 client 会把 DHCP 请求丢给不存在的网关。
+#
+# ★★ 判据**不能**写成 `[ -n "$out" ]`：batctl 在表为空时照样输出两行固定文本
+#    （横幅 + 表头，实测 176 字节），非空判断恒真 → 子节点会误判"表非空"而选 client，
+#    正好复现"网关表空 + client"这个整包丢弃的致命组合。必须找**真正的网关行**。
+#    网关行的特征是含 MAC 地址字段，如：
+#       0a:74:58:79:09:e2 (255) 0a:74:58:79:09:e2 [     mesh0]: 1000.0/1000.0 MBit
+#    横幅里的 "MainIF/MAC: mesh0/0a:74:..." 带接口名前缀（字段以字母开头），不会误匹配。
+#    实测（2026-10-08，主节点 192.168.1.1 / 子节点 A 192.168.1.245）：
+#       主节点 server → 子节点表 3 行（有网关行）；主节点 off → 子节点表 2 行（只有横幅+表头）。
+# batctl 新旧语法（meshif / -m）都试一遍，与 mesh_bat_hardifs 同套路。
+mesh_bat_gw_table_nonempty() {
+	local bat ctl out
+	bat=$(mesh_bat_iface) || return 1
+	[ -n "$bat" ] || return 1
+	ctl=$(mesh_batctl)
+	[ -n "$ctl" ] || return 1
+	out=$("$ctl" meshif "$bat" gateways 2>/dev/null)
+	[ -n "$out" ] || out=$("$ctl" -m "$bat" gateways 2>/dev/null)
+	[ -n "$out" ] || return 1
+	printf '%s\n' "$out" | awk '
+		{
+			for (i = 1; i <= NF; i++)
+				if ($i ~ /^[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:/) { found = 1; exit }
+		}
+		END { exit !found }'
+}
+
+# 读 bat0 运行时的 gw_mode（off / client / server）。
+# batctl 输出带后缀，如 "client (selection class: 20)"、"server (announced bw: ...)"，
+# 取第一个字段即可。bat0 不存在或 batctl 不可用时输出空串（调用方据此跳过本轮）。
+mesh_bat_gw_runtime_mode() {
+	local bat ctl out
+	bat=$(mesh_bat_iface) || return 0
+	[ -n "$bat" ] || return 0
+	ctl=$(mesh_batctl)
+	[ -n "$ctl" ] || return 0
+	out=$("$ctl" meshif "$bat" gw_mode 2>/dev/null)
+	[ -n "$out" ] || out=$("$ctl" -m "$bat" gw_mode 2>/dev/null)
+	printf '%s\n' "$out" | awk 'NR == 1 { print $1 }'
+}
+
+# 把目标 gw_mode 热改到内核，并持久化到 UCI。$1 = 目标模式，$2 = 变更前的模式（仅用于日志）
+#
+# 为什么可以热改：实测（2026-10-08）`batctl meshif bat0 gw_mode X` 只写 sysfs，
+# 不断网、不重建 bat0（ifindex / MAC / br-lan / 默认路由全不变）；`uci commit network`
+# 也不会触发 netifd reload（reload 需显式 `ubus call network reload`，见 cmd_apply）。
+# 为什么绝不走 cmd_apply：那会 network restart / reload，重建或扰动 bat0，而且会与同步
+# 路径互相触发 —— 正是 mesh_sync_batman_from_json 注释里记录的"无限重新 apply"。
+#
+# 必须取配置锁：本函数会写 network.bat0.gw_mode，与 cmd_apply 的写入点重合。抢不到锁
+# 就放弃本轮（下一轮 10 秒后自然重试），绝不无锁提交去覆盖用户正在进行的 apply。
+# ★ 锁的约束：cmd_apply 自己会抢锁，所以**本函数的调用方不能已持锁**（否则死锁）。
+mesh_bat_gw_commit() {
+	local target="$1" cur="$2" ctl bat gwbw
+	mesh_lock || { mesh_log info "网关模式需切到 $target，但配置锁被占用，本轮跳过"; return 1; }
+	bat=$(mesh_bat_iface)
+	ctl=$(mesh_batctl)
+	if [ -n "$bat" ] && [ -n "$ctl" ]; then
+		"$ctl" meshif "$bat" gw_mode "$target" 2>/dev/null \
+			|| "$ctl" -m "$bat" gw_mode "$target" 2>/dev/null
+	fi
+	mesh_uci_set_if_changed network.bat0.gw_mode "$target"
+	# 带宽只在 server 时需要；切走时清掉，避免留下误导性的残留值
+	# （与 mesh_batman_apply 里的同一段逻辑保持一致）
+	gwbw=$(mesh_bat_gw_bandwidth)
+	if [ "$target" = server ] && [ -n "$gwbw" ]; then
+		mesh_uci_set_if_changed network.bat0.gw_bandwidth "$gwbw"
+	else
+		uci -q delete network.bat0.gw_bandwidth 2>/dev/null
+	fi
+	uci commit network 2>/dev/null
+	mesh_unlock
+	mesh_log info "网关模式已热改：${cur:-?} -> $target（角色 $(mesh_uci_getd main.role master)，策略 $(mesh_uci_getd main.batman_gw off)）"
+	return 0
+}
+
+# 网关模式自愈：把"目标模式"与"运行时模式"对齐。每 10 秒由守护进程调用，
+# **两端跑同一段代码** —— 目标值本身已由 mesh_bat_gw_effective 按角色解析好了。
+#
+# 迟滞（不对称，见 MESH_GW_*_ROUNDS）：降级立即、升级需连续 N 轮一致。
+# 状态文件 $MESH_TMP_DIR/gw-pending：内容 "<目标>:<连续轮数>"，tmpfs，重启即弃。
+mesh_bat_gw_reconcile() {
+	local role target cur rounds pend ptarget pcount
+
+	role=$(mesh_uci_getd main.role master)
+	target=$(mesh_bat_gw_effective "$role")
+	cur=$(mesh_bat_gw_runtime_mode)
+	# bat0 还没建起来（未 apply / 已停用 / batctl 缺失）→ 本轮无事可做，
+	# 初始值由 cmd_apply 负责写入
+	[ -n "$cur" ] || return 0
+	[ -n "$target" ] || return 0
+
+	# 已经一致：清掉待定计数后直接返回（不写 UCI、不取锁、零副作用）
+	if [ "$cur" = "$target" ]; then
+		rm -f "$MESH_TMP_DIR/gw-pending" 2>/dev/null
+		return 0
+	fi
+
+	# 迟滞轮数：降级方向默认 1（立即），升级方向默认 6（≈60 秒）
+	if [ "$target" = off ]; then
+		rounds=$MESH_GW_DOWNGRADE_ROUNDS
+		case "$rounds" in ''|*[!0-9]*) rounds=1;; esac
+	else
+		rounds=$MESH_GW_UPGRADE_ROUNDS
+		case "$rounds" in ''|*[!0-9]*) rounds=6;; esac
+	fi
+	[ "$rounds" -ge 1 ] || rounds=1
+
+	# 轮数 1 = 立即执行，不留待定状态
+	if [ "$rounds" -le 1 ]; then
+		rm -f "$MESH_TMP_DIR/gw-pending" 2>/dev/null
+		mesh_bat_gw_commit "$target" "$cur"
+		return $?
+	fi
+
+	# 需连续 N 轮一致：累计计数，达标才切
+	ptarget=""; pcount=0
+	if [ -r "$MESH_TMP_DIR/gw-pending" ]; then
+		pend=$(cat "$MESH_TMP_DIR/gw-pending" 2>/dev/null)
+		ptarget=${pend%%:*}
+		pcount=${pend##*:}
+		case "$pcount" in ''|*[!0-9]*) pcount=0;; esac
+	fi
+	# 目标变了（例如 off→client 中途又变回 off→server）就重新计数
+	[ "$ptarget" = "$target" ] || pcount=0
+	pcount=$((pcount + 1))
+	if [ "$pcount" -lt "$rounds" ]; then
+		mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+		printf '%s:%s\n' "$target" "$pcount" > "$MESH_TMP_DIR/gw-pending" 2>/dev/null
+		mesh_log info "网关模式准备切到 $target（连续 $pcount/$rounds 轮，本机当前 $cur）"
+		return 0
+	fi
+	rm -f "$MESH_TMP_DIR/gw-pending" 2>/dev/null
+	mesh_bat_gw_commit "$target" "$cur"
 }
 
 # 出网网关向全网通告的出口带宽。
@@ -798,8 +1001,9 @@ mesh_bat_gw_bandwidth() {
 
 # 搭建 batman-adv：bat0(虚拟接口) + hard interface
 #   $1 = gw_mode: server(出网网关) / client / off
-#        本包当前恒传 off（方案 A，见 mesh_bat_gw_effective）；
-#        函数本身支持三态，方案 C 上线后会传 server/client。
+#        由调用方传 mesh_bat_gw_effective 的解析结果：策略 off 时恒 off，
+#        策略 auto 时按角色与本地判据给出 server/client/off。
+#        函数本身三态都支持，不需要改动。
 #
 # 本包只实现 B 方案（br-lan 二层桥接），拓扑固定为：
 #     物理端口 ─┐

@@ -371,20 +371,51 @@ return view.extend({
 		// br-lan 的 MAC 由 apply 钉成设备主 MAC：网桥 MAC 会随端口就绪顺序漂移，
 		// 一漂 DHCP 租约就换地址，子节点地址反而不可追踪。
 
-		/* ================= 路径选择 (batman-adv) —— 强制项，界面上不提供开关 ================= */
+		/* ================= 路径选择 (batman-adv) ================= */
 		// batman-adv 已随本包编译依赖强制安装（kmod-batman-adv + batctl），所以恒为启用：
 		//   · 路径选择：由 batman-adv 按 TQ 统一择优（802.11s 只负责建立链路）
-		//   · 网关模式：当前恒为 off（方案 A）—— 本插件是单主节点 + br-lan 二层桥接，
-		//     全网没有出网网关，client/server 都会让 DHCP 请求被 batman 单播投给
-		//     "选中的网关"而整包丢弃。off 让请求回到广播泛洪。
-		//     后期"多网关开关"（方案 C）上线后再按角色自动判断。
 		//   · 有线回程：固定 B 方案 —— 端口与 bat0 同进 br-lan，有网线时网桥二层直转
 		//     （零 batman 封装开销、满线速），拔线后 bat0 直接接管无线回程（它一直是
 		//     forwarding；跨 mesh 的环由 BLA 负责，bat0 并不会被 STP 阻塞）
-		//   · 网关通告带宽：仅在网关模式为 server 时写入（当前 off，故不写）
-		// 以上均由 meshctl apply 强制写回 UCI，无需（也不允许）用户设置，故不再渲染任何选项。
+		//   · 网关通告带宽：仅在网关模式为 server 时写入（见 etc/config/mesh 的说明）
+		// 以上均由 meshctl apply 强制写回 UCI，无需（也不允许）用户设置，故不渲染选项。
 		// 802.11s 自身的二层转发 / 网关通告 / HWMP 根模式在 batman-adv 接管后必然让位，
 		// 同样不暴露给用户（UCI 里仍保留，仅用于旧配置兼容与状态展示）。
+		//
+		// 网关模式是**唯一**暴露给用户的 batman 选项：它决定 DHCP 报文怎么转发。
+		// 后端给三个值，必须分开用，否则用户会看不懂"我明明开了自动，为什么还是关闭"：
+		//   gw_mode_conf   策略（off / auto）        —— 用户选的
+		//   gw_mode_target 策略解析出的**目标值**    —— 准备切到哪
+		//   gw_mode        内核**运行时实际值**      —— 现在实际是什么
+		// 升级方向有 ≤60 秒迟滞（防 WAN 抖动来回切），窗口内目标值与实际值必然不同；
+		// 只有把三者一起看，才能区分"还在收敛中"和"确实已退回关闭"。
+		var gwEff = (status.batman && status.batman.gw_mode) || '';
+		var gwTarget = (status.batman && status.batman.gw_mode_target) || '';
+		var gwConf = (status.batman && status.batman.gw_mode_conf) || '';
+		var gwHint = '';
+		if (gwEff) {
+			if (gwConf === 'auto' && gwTarget && gwTarget !== gwEff) {
+				gwHint = (gwTarget === 'off')
+					? _('当前生效：%s，正在退回关闭…').format(gwEff)
+					: _('当前生效：%s，正在切换到 %s（升级需连续约 1 分钟确认，防 WAN 抖动）')
+						.format(gwEff, gwTarget);
+			} else if (gwConf === 'auto' && gwTarget === 'off') {
+				gwHint = _('当前生效：已自动退回关闭（主节点没有外网出口，或本机所在 mesh 内暂无可用网关）');
+			} else {
+				gwHint = _('当前生效：%s').format(gwEff);
+			}
+		}
+
+		o = s.option(form.ListValue, 'batman_gw', _('网关模式'));
+		o.value('off', _('关闭（推荐）'));
+		o.value('auto', _('自动（多网关场景）'));
+		o.default = 'off';
+		o.rmempty = false;   // 同 role：停在默认值时不得被 LuCI 删掉
+		o.description = _('关闭：全网不使用 batman 的网关机制，DHCP/ARP 走二层广播，'
+			+ '零收敛依赖 —— 单主节点组网就用这个（默认）。'
+			+ '自动：主节点检测到外网出口时作为网关，子节点按网关表自动跟随；'
+			+ '检测不到出口时两端自动退回关闭，适合将来有多个出网网关的场景。')
+			+ (gwHint ? ' ' + gwHint : '');
 
 		/* ================= 一键加入（配对） ================= */
 		// 这里的四项都属于"新节点入网的临时通道"，与主网络的 Mesh ID / 回程密码

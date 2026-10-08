@@ -37,16 +37,19 @@ config main 'main'
 	# 否则网桥 MAC 随端口就绪顺序漂移、DHCP 租约跟着换地址。
 	option master_addr ''
 	option status_text '尚未配置'
-	# ===== 路径选择 (batman-adv) —— 强制项，界面上不提供开关 =====
+	# ===== 路径选择 (batman-adv) =====
 	# 本包的编译依赖已硬绑定 kmod-batman-adv + batctl + wpad-mesh-openssl + kmod-mac80211，
 	# 安装即具备条件，因此 batman-adv 恒为启用、由它统一接管路径选择：
 	#   · batman=1        必须启用（不可关闭）；缺失内核模块时 apply 直接报错而不是静默降级
-	#   · batman_gw=off   网关模式策略：关闭 batman-adv 的网关机制（默认）。
-	#                     本插件是单主节点 + br-lan 二层桥接，全网没有出网网关，
-	#                     client/server 都会让 DHCP 请求被 batman 单播投给"选中的网关"
-	#                     而整包丢弃 → 子节点 apply 后拿不到地址。off 让请求回到广播泛洪。
-	#                     详见 functions.sh 的 mesh_bat_gw_effective()。
-	#                     后期"多网关开关"（方案 C）上线时，这里会接受 auto（按角色）。
+	#   · batman_gw=off   网关模式**策略**（本插件唯一暴露给用户的 batman 选项）：
+	#                     off  = 关闭 batman-adv 的网关机制（默认）。本插件是单主节点 +
+	#                            br-lan 二层桥接，client/server 都会让 DHCP 请求被 batman
+	#                            单播投给"选中的网关"，而网关表为空时整包丢弃 → 子节点
+	#                            apply 后拿不到地址。off 让请求回到广播泛洪，零收敛依赖。
+	#                     auto = 主节点有外网出口时作为网关(server)，子节点按 batman 网关表
+	#                            自动跟随(client)；检测不到出口时两端自动退回 off。
+	#                     详见 functions.sh 的 mesh_bat_gw_effective() 与
+	#                     mesh_bat_gw_reconcile()（每 10 秒自愈，热改不重启网络）。
 	# 有线回程固定为 B 方案（br-lan 二层桥接），本包只实现这一种，UCI 里没有开关：
 	#   物理端口全部进 br-lan，bat0 也只作为 br-lan 的一个成员加入；bat0 的 hardif
 	#   只有无线回程 mesh0 一个。两节点拉一根网线 → 两个 br-lan 合成同一个二层域 →
@@ -55,8 +58,9 @@ config main 'main'
 	# 历史版本曾有 option batman_wired '0|1|2' 表示三种有线回程模式，现已废弃：
 	# 另外两种（端口作 bat0 的 hardif / mesh-on-LAN 用 VLAN 子接口）的实现代码已移除，
 	# 旧配置残留由 apply 与 mesh_bat_legacy_purge 自动清理，升级设备无需手工干预。
-	# 以上各项在 meshctl apply 中会被强制写回，用户无需（也无法）在界面上设置。
-	# 注：batman=0 的旧配置会被自动纠正为 1。
+	# 除 batman_gw（网关模式，可在设置页切换）外，以上各项在 meshctl apply 中会被强制写回，
+	# 用户无需（也无法）在界面上设置。
+	# 注：batman=0 的旧配置会被自动纠正为 1；batman_gw 非 off/auto 的值会被纠正为 off。
 	option batman '1'
 	option batman_gw 'off'
 	# 出网网关(batman_gw=server)向全网通告的出口带宽。

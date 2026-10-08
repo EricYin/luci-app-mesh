@@ -97,7 +97,9 @@ function batmanText(d) {
 		return _('802.11s HWMP（batman-adv 可用未启用）');
 	var t = 'batman-adv';
 	if (b.iface) t += ' · ' + b.iface;
-	// gw_mode 已经是后端按角色解析后的实际生效值
+	// gw_mode = 内核**运行时实际值**（off / client / server），由 batctl 读 sysfs。
+	// 不是策略值（那是 gw_mode_conf）也不是目标值（gw_mode_target）：升级迟滞窗口内
+	// 目标可能已算出 server 而运行时还是 off，这里要显示的是"现在实际是什么"。
 	if (b.gw_mode && b.gw_mode !== 'auto' && b.gw_mode !== 'off') t += ' · gw ' + b.gw_mode;
 	if (b.hardifs && b.hardifs.length) t += ' (' + b.hardifs.join(', ') + ')';
 	return t;
