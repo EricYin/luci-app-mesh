@@ -1862,7 +1862,7 @@ cmd_pair_status() {
 cmd_pair_join() {
 	local do_apply=0 role radio ssid key stasec old_ch pch
 	local ip gw cand c mymac out ok waited=0 maxwait id k enc band ch sta_dev rpf_old
-	local collide=0 cand2="" selfips=""
+	local collide=0 cand2="" selfips="" fallback="" fb_self=0
 	local lastfail="" jerr="" jhint="" code=""
 	[ "$1" = "--apply" ] && do_apply=1
 
@@ -1985,14 +1985,16 @@ cmd_pair_join() {
 	[ -n "$sta_dev" ] || sta_dev="$MESH_PAIR_STA_IFNAME"
 	echo "      配对网卡：$sta_dev（$ip）"
 
-	# 主节点地址候选：UCI 指定 → 本接口学到的网关 → 同网段 .1 → 192.168.1.1
+	# 主节点地址候选（**有意义**的）：UCI 指定 → 本接口学到的网关 → 同网段 .1
 	cand=""
 	[ -n "$(mesh_uci_get main.master_addr)" ] && cand="$(mesh_uci_get main.master_addr)"
 	gw=$(ubus call "network.interface.$MESH_PAIR_NET" status 2>/dev/null \
 		| "$JF" -e '@.route[0].nexthop' 2>/dev/null)
 	[ -n "$gw" ] && cand="$cand $gw"
 	case "$ip" in *.*.*.*) cand="$cand ${ip%.*}.1";; esac
-	cand="$cand 192.168.1.1"
+	# 兜底候选（厂商默认内网）单独放：它只是一句"猜"，不是线索 —— 撞到本机时
+	# 直接丢掉而不算撞号，理由见下面的过滤段（r54）。
+	fallback="192.168.1.1"
 
 	# ★ 候选地址不能是本机自己的地址（r34）。
 	#   出厂路由器的内网默认常是 192.168.1.1，和主节点撞号 —— 这时 192.168.1.1 是
@@ -2008,6 +2010,19 @@ cmd_pair_join() {
 		for s in $selfips; do [ "$c" = "$s" ] && { collide=1; continue 2; }; done
 		case " $cand2 " in *" $c "*) ;; *) cand2="$cand2 $c";; esac
 	done
+	# ★ r54：兜底候选 192.168.1.1 撞到本机时**直接丢掉，不算撞号**。
+	#   子节点的出厂内网就是 192.168.1.1（最常见），所以只要主节点不在这个网段
+	#   （如 192.168.8.1），旧逻辑必然把"兜底猜测撞了自己"误报成"主节点撞号" ——
+	#   于是白白先去试一次备用地址 10.255.255.1（旧版主节点没有该别名时，每个候选
+	#   curl -m 6 且要试两次，最多多耗约 12 秒），日志也会把用户引向错误方向。
+	#   ⚠ 只在"还有别的候选"时才丢：否则连最后一个猜测都没了，仍按老路走备用地址。
+	fb_self=0
+	for s in $selfips; do [ "$fallback" = "$s" ] && { fb_self=1; break; }; done
+	if [ "$fb_self" = 1 ]; then
+		[ -n "$cand2" ] || collide=1
+	else
+		case " $cand2 " in *" $fallback "*) ;; *) cand2="$cand2 $fallback";; esac
+	fi
 	if [ "$collide" = 1 ]; then
 		# ★ r35：撞号时改走主节点的备用地址。它不是本机地址 → 不会被本地投递；
 		#   配上 r33 的绑设备发送 + 主机路由，就能从配对网卡正常出去。
