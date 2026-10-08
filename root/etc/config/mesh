@@ -41,8 +41,12 @@ config main 'main'
 	# 本包的编译依赖已硬绑定 kmod-batman-adv + batctl + wpad-mesh-openssl + kmod-mac80211，
 	# 安装即具备条件，因此 batman-adv 恒为启用、由它统一接管路径选择：
 	#   · batman=1        必须启用（不可关闭）；缺失内核模块时 apply 直接报错而不是静默降级
-	#   · batman_gw=auto  网关模式按角色自动判断：主节点 server、子节点 client；
-	#                     主节点没有默认路由时自动降为 client
+	#   · batman_gw=off   网关模式策略：关闭 batman-adv 的网关机制（默认）。
+	#                     本插件是单主节点 + br-lan 二层桥接，全网没有出网网关，
+	#                     client/server 都会让 DHCP 请求被 batman 单播投给"选中的网关"
+	#                     而整包丢弃 → 子节点 apply 后拿不到地址。off 让请求回到广播泛洪。
+	#                     详见 functions.sh 的 mesh_bat_gw_effective()。
+	#                     后期"多网关开关"（方案 C）上线时，这里会接受 auto（按角色）。
 	# 有线回程固定为 B 方案（br-lan 二层桥接），本包只实现这一种，UCI 里没有开关：
 	#   物理端口全部进 br-lan，bat0 也只作为 br-lan 的一个成员加入；bat0 的 hardif
 	#   只有无线回程 mesh0 一个。两节点拉一根网线 → 两个 br-lan 合成同一个二层域 →
@@ -54,7 +58,7 @@ config main 'main'
 	# 以上各项在 meshctl apply 中会被强制写回，用户无需（也无法）在界面上设置。
 	# 注：batman=0 的旧配置会被自动纠正为 1。
 	option batman '1'
-	option batman_gw 'auto'
+	option batman_gw 'off'
 	# 出网网关(batman_gw=server)向全网通告的出口带宽。
 	# 'auto' = 按角色自动：本节点作为网关时通告千兆口(1000mbit/1000mbit)，
 	# 非网关侧该项不写入（batman-adv 只在 gw_mode=server 时使用）。

@@ -311,7 +311,7 @@ mesh_uci_cleanup_ap_sections() {
 # ================= 应用配置 =================
 cmd_apply() {
 	local enabled role id key enc country band ch rssi maxp fwd gw hwmp bh_radio hwmp_root r sec has need_cfg
-	local rb_ip rb_sec batman batman_gw def_ch
+	local rb_ip rb_sec batman def_ch
 	# ===== 先把"暂存未提交"的 mesh 改动落盘，再读配置 =====
 	# 场景：脚本/CI 里 `uci set mesh...` 之后直接调 apply。uci 的改动在 shell 里
 	# 是**暂存在 /tmp/.uci/<config>** 的，没 commit 就读不到新值，于是走进
@@ -349,7 +349,7 @@ cmd_apply() {
 	# ===== 路径选择 (batman-adv) 为强制项：界面上不提供开关，这里也不读配置 =====
 	# 本包编译依赖已硬绑定 kmod-batman-adv + batctl + wpad-mesh-openssl + kmod-mac80211，
 	# 装完即具备条件，所以恒为启用；缺失内核模块时下面 [1/7] 会直接报错（而不是静默降级）。
-	# 网关模式按角色自动判断（master=server / client=client，主节点无默认路由时降 client）。
+	# 网关模式恒为 off（方案 A），由 mesh_bat_gw_effective 统一解析。
 	# 有线回程固定为 B 方案（br-lan 二层桥接），本包只实现这一种：
 	#   物理端口全部进 br-lan，bat0 也只作为 br-lan 的一个成员加入，
 	#   bat0 的 hardif 只有无线回程 mesh0 一个。
@@ -366,11 +366,17 @@ cmd_apply() {
 	#   换来的是完全不碰 VLAN 配置（另一种做法要在 br-lan 上开 VLAN filtering，netifd
 	#   落地与预期不符时端口会被隔离、设备失联，真机踩到过）。
 	batman=1
-	batman_gw=auto
 	# 把强制值写回 UCI：一是让状态页展示与实际一致，二是 mesh-sync 端点读的是
 	# main.batman，必须与"实际生效值"一致才能正确下发给子节点。
 	[ "$(q mesh.main.batman)" = "1" ] || uci set mesh.main.batman=1
-	[ "$(q mesh.main.batman_gw)" = "auto" ] || uci set mesh.main.batman_gw=auto
+	# 网关模式策略恒为 off（方案 A）：本插件单主节点 + br-lan 二层桥接，全网没有出网
+	# 网关，client/server 都会让 DHCP 请求被单播投给"选中的网关"而整包丢弃
+	# （见 mesh_bat_gw_effective 的注释）。
+	# ★ 这一行就是"方案 C 的开关入口"：后期加开关时改成读 main.batman_gw（off/auto）
+	# 并按角色解析即可，其余调用方不用动。
+	# ⚠ 注意**不要**把解析后的生效值（server/client）写回 UCI —— 那会与这里的归一化
+	# 来回打架，触发无限重新 apply（见 mesh_sync_batman_from_json 的注释）。
+	[ "$(q mesh.main.batman_gw)" = "off" ] || uci set mesh.main.batman_gw=off
 	# 历史版本遗留的 main.batman_wired（0/1/2 三种有线回程模式）已无意义，
 	# 留着只会让"配置里写着 2、实际跑 B"这类偏差继续误导排查，顺手删掉
 	[ -n "$(q mesh.main.batman_wired)" ] && uci -q delete mesh.main.batman_wired
@@ -604,12 +610,14 @@ cmd_apply() {
 	# batman-adv：mesh 接口改挂到 bat0 的 hardif 上，而不是直接进 br-lan
 	sec=$(cat "$MESH_STATE_DIR/mesh-iface" 2>/dev/null)
 	if [ "$batman" = "1" ]; then
-		local bat_gw=$batman_gw
-		[ "$batman_gw" = auto ] && { [ "$role" = master ] && bat_gw=server || bat_gw=client; }
-		if [ "$bat_gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
-			echo "提示：未检测到默认路由，batman-adv 网关模式降为 client"
-			bat_gw=client
-		fi
+		local bat_gw
+		# 网关模式由 mesh_bat_gw_effective 统一解析（当前恒 off，见其注释）。
+		# ★ 旧实现这里有一段"主节点无默认路由 → server 降 client"的逻辑，是本次
+		#   100% 复现 bug 的元凶：开机后第 ~307 秒才有默认路由，落在该窗口内的 apply
+		#   会把 bat0.gw_mode 写成 client 并固化，之后守护进程不会重算（见
+		#   mesh_sync_batman_from_json 的注释），错值永久固化、重启也不纠正。
+		#   降级逻辑已整体移除 —— off 策略下不需要它。
+		bat_gw=$(mesh_bat_gw_effective "$role")
 		mesh_batman_apply "$bat_gw"
 		[ -n "$sec" ] && uci set wireless.$sec.network=batmesh
 		echo "      batman-adv 已接管路径选择（网关模式 $bat_gw，802.11s 转发已关闭）"
@@ -1098,12 +1106,8 @@ cmd_status() {
 	# 不再读 main.batman —— 界面上也没有这个开关了。
 	bat_on=0
 	[ "$bat_cap" = 1 ] && bat_on=1
-	# 界面要显示"实际生效"的网关模式：auto 按角色解析后才是真值
-	bat_gw=$(mesh_uci_getd main.batman_gw auto)
-	[ "$bat_gw" = auto ] && { [ "$role" = master ] && bat_gw=server || bat_gw=client; }
-	if [ "$bat_on" = "1" ] && [ "$bat_gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
-		bat_gw=client
-	fi
+	# 界面要显示"实际生效"的网关模式：由 mesh_bat_gw_effective 统一解析
+	bat_gw=$(mesh_bat_gw_effective "$role")
 	bat_algo=$(mesh_bat_routing_algo 2>/dev/null)
 	[ -n "$bat_algo" ] || bat_algo=default
 	if [ "$bat_cap" = 1 ] && [ "$bat_on" = "1" ]; then
@@ -1223,7 +1227,7 @@ local rb_active=0 rb_deadline=0 rb_ip="" rb_left=0
  "mac": "$(mesh_esc "$(mesh_primary_mac)")",
  "now": $now,
  "capabilities": {"kernel_mesh": $kern, "wpad_mesh": $wpad, "batman": $bat_cap, "batctl": $batctl_ok, "dawn": $dawn_ok, "umdns": $umdns_ok},
- "batman": {"capable": $bat_cap, "enabled": $bat_on, "iface": "$(mesh_esc "$bat_if")", "hardifs": [$bat_hifs_json], "gw_mode": "$(mesh_esc "$bat_gw")", "gw_mode_conf": "$(mesh_esc "$(mesh_uci_getd main.batman_gw auto)")", "routing_algo": "$(mesh_esc "$bat_algo")"},
+ "batman": {"capable": $bat_cap, "enabled": $bat_on, "iface": "$(mesh_esc "$bat_if")", "hardifs": [$bat_hifs_json], "gw_mode": "$(mesh_esc "$bat_gw")", "gw_mode_conf": "$(mesh_esc "$(mesh_uci_getd main.batman_gw off)")", "routing_algo": "$(mesh_esc "$bat_algo")"},
  "radios": [$radios_json],
  "channels": {$channels_json},
  "backhaul": {"ifname": "$(mesh_esc "$bh_if")", "channel": "$(mesh_esc "$bh_ch")", "band": "$(mesh_esc "$bh_band")"},
@@ -1264,7 +1268,7 @@ EOF
 #
 # 【为什么原来会无限重新 apply】旧实现把「主节点解析后的网关模式」当成待写入的配置值：
 #   uci set mesh.main.batman_gw="$mg"     # mg 是解析结果，如 client
-# 而 cmd_apply 又把 batman_gw **归一化回** auto（见其 [1/7]，再由角色解析成 server/client）。
+# 而 cmd_apply 又把 batman_gw **归一化回** off（见其 [1/7]，当前策略恒 off）。
 # 于是每轮同步都拿 `auto` 与 `client` 相比 → 永远"有变化" → uci commit + 触发一次完整
 # cmd_apply（含 wifi reload / network restart）；下一轮 apply 又写回 auto …… 无限循环。
 # 实测：子节点每 ~24 秒重新应用一次（logread 累计 72 条），主节点 0 条。
@@ -1273,7 +1277,7 @@ EOF
 #
 # 【正确做法】比较「生效值」而不是「字面量」：
 #   · batman 开关恒为启用（cmd_apply 强制写 1），只有本机不是 1 时才需要写回并 apply；
-#   · 网关模式对本机恒由「角色 + auto」决定（client 角色 → client），因此把主节点的
+#   · 网关模式对本机由 mesh_bat_gw_effective 决定（当前恒 off），因此把主节点的
 #     生效模式与**本机解析后的生效模式**比即可，**绝不把解析后的字面量写回 batman_gw**。
 mesh_sync_batman_from_json() {
 	local json="$1" mb mg cur_gw
@@ -1303,9 +1307,8 @@ mesh_sync_batman_from_json() {
 		mesh_log info "路径选择配置跟随主节点: batman=1（需重新 apply 以搭建 bat0）"
 		return 0
 	fi
-	# 网关模式：本机配置恒为 auto，按角色解析成生效值后再与主节点比。
-	cur_gw=$(mesh_uci_getd main.batman_gw auto)
-	[ "$cur_gw" = auto ] && { [ "$(mesh_uci_getd main.role master)" = master ] && cur_gw=server || cur_gw=client; }
+	# 网关模式：本机生效值由 mesh_bat_gw_effective 解析（当前恒 off），再与主节点下发的比。
+	cur_gw=$(mesh_bat_gw_effective "$(mesh_uci_getd main.role master)")
 	[ "$mg" = "$cur_gw" ] || \
 		mesh_log warn "主节点网关模式($mg)与本机生效模式($cur_gw)不一致（本机按角色 $(mesh_uci_getd main.role master) 运行）"
 	return 1
@@ -1536,9 +1539,8 @@ cmd_diag() {
 				fi
 				echo "  hardif $h = $(mesh_bat_iface_link "$h") mtu=$(cat "/sys/class/net/$h/mtu" 2>/dev/null) hop_penalty=$_hp"
 			done
-			bgw=$(mesh_uci_getd main.batman_gw auto)
-			[ "$bgw" = auto ] && { [ "$(mesh_uci_getd main.role master)" = master ] && bgw=server || bgw=client; }
-			echo "  gw_mode    = $bgw (配置: $(mesh_uci_getd main.batman_gw auto))"
+			bgw=$(mesh_bat_gw_effective "$(mesh_uci_getd main.role master)")
+			echo "  gw_mode    = $bgw (配置: $(mesh_uci_getd main.batman_gw off))"
 			echo "  有线回程   = B 方案(唯一实现): 端口与 bat0 同进 br-lan, 二层直转走网线(BLA 防环, bat0 不被 STP 阻塞)"
 		else
 			echo "batman_adv   = 1 (已安装未启用; 在设置页「路径选择」里开启)"

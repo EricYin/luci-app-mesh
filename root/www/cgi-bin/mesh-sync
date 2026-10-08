@@ -205,11 +205,10 @@ mwmac=$(mesh_mesh_iface_macs)
 bat_json() {
 	local en gw
 	en=$(mesh_uci_getd main.batman 1)
-	gw=$(mesh_uci_getd main.batman_gw auto)
-	[ "$gw" = auto ] && gw=server
-	if [ "$en" = "1" ] && [ "$gw" = server ] && ! ip route show default 2>/dev/null | grep -q .; then
-		gw=client
-	fi
+	# 下发"主节点实际生效"的网关模式（本函数在**主节点**上执行，故传 master）。
+	# A 方案下恒 off，子节点收到 off 后同样用 off（策略全局一致，两端独立解析结果相同，
+	# 不需要"跟随"）。方案 C 开关打开后才需要子节点跟随主节点的降级结果。
+	gw=$(mesh_bat_gw_effective master)
 	printf '{"enabled":%s,"gw":"%s"}' "$en" "$gw"
 }
 

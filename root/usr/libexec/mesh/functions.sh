@@ -763,6 +763,25 @@ mesh_bat_originators_tsv() {
 	return 0
 }
 
+# 本机生效的 batman-adv 网关模式（gw_mode）。
+#   $1 = 本机角色（master / 其它）。A 方案下不分角色，参数为方案 C 预留。
+#
+# 【为什么现在恒为 off】详见「根因报告-gw_mode-2026-10-08.md」。一句话：
+#   gw_mode != off 时，客户端发出的 DHCP 请求会被 batman-adv 当成"交给网关"处理
+#   （batadv_send_skb_via_gw），而本插件是**单主节点 + br-lan 二层桥接**，全网没有
+#   真正的出网网关，网关表恒空 → 整包丢弃（TX_DROPPED++）→ 子节点 apply 后拿不到
+#   DHCP 地址 → 240s 后 rollback 还原。off 让请求回到广播泛洪，不依赖任何收敛。
+#   实测：改 off 后 2 秒内拿到租约（对比 bug 态主节点 dnsmasq 全程 0 条）。
+#
+# 【★ 方案 C（双模式开关）上线时怎么改】**只动这个函数体**，所有调用方一行不用改：
+#     main.batman_gw = off  → 全网 off（A 方案，默认）
+#     main.batman_gw = auto → 主节点 server / 子节点 client（B 方案，保留多网关）
+#   并把"无默认路由时降级"的目标从 client 改为 **off** —— 退化成 A 方案，
+#   而不是让全网网关表为空（那正是本次 bug 的成因）。
+mesh_bat_gw_effective() {
+	echo off
+}
+
 # 出网网关向全网通告的出口带宽。
 #   'auto'（默认）或留空 → 千兆口 1000mbit/1000mbit
 #   其它值原样返回（允许手工定制，如 '300mbit/100mbit'）
@@ -779,6 +798,8 @@ mesh_bat_gw_bandwidth() {
 
 # 搭建 batman-adv：bat0(虚拟接口) + hard interface
 #   $1 = gw_mode: server(出网网关) / client / off
+#        本包当前恒传 off（方案 A，见 mesh_bat_gw_effective）；
+#        函数本身支持三态，方案 C 上线后会传 server/client。
 #
 # 本包只实现 B 方案（br-lan 二层桥接），拓扑固定为：
 #     物理端口 ─┐
