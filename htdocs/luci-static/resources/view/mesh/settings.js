@@ -349,6 +349,7 @@ return view.extend({
 		o.value('US', _('美国'));
 		o.value('JP', _('日本'));
 		o.value('DE', _('德国'));
+		o.value('AU', _('澳大利亚'));
 	o.value('00', _('全球(宽松)'));
 	o.default = 'CN';
 	o.rmempty = false;   // 同 role：停在默认值时不得被 LuCI 删掉

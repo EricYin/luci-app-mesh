@@ -15,11 +15,17 @@
  * 字段落点与同步关系：
  *   SSID / 加密 / 密码  -> AP 段      -> 下发子节点（mesh-sync 的 ap 数组）
  *   信道 / 通道宽度      -> radio 段   -> 下发子节点（radios 数组 + 按序号错开）
+ *   国家/地区代码        -> radio 段   -> **仅本机 · 每节点各自设置**（mesh-sync 不下发 country）
+ *   发射功率            -> radio 段   -> **仅本机 · 每节点各自设置**（插件从不写 txpower，
+ *                                        不会被 apply 回滚，也不会被子节点同步覆盖）
  *
  * 组网联动（未组网时全部可改，就是一个普通 WiFi 页）：
- *   · 主节点：SSID/加密/带宽可改（它就是同步源）；**回程频段的信道锁定为「跟随回程」**
- *     —— 回程频段与回程共用同一射频，改了会拆掉组网，故只读，要改请去「组网设置」。
- *   · 子节点：SSID/加密/信道/带宽全部由主节点下发（每 10 秒镜像覆盖），一律只读。
+ *   · 主节点：SSID/加密/带宽/国家码/发射功率可改（它就是同步源）；**回程频段的信道锁定为
+ *     「跟随回程」** —— 回程频段与回程共用同一射频，改了会拆掉组网，故只读，要改请去
+ *     「组网设置」。发射功率**不锁回程频段**（原生无线页本来就能改），只加一句提示。
+ *   · 子节点：SSID/加密/信道/带宽只读 —— 这几项**都在同步链路上**（mesh-sync 下发，
+ *     子节点每 10 秒镜像一次），在这里改会在下一轮被覆盖回去；**国家码与发射功率仍可改**
+ *     —— 这两项**不参与同步**，是每台设备自己的设置（见上面「字段落点」）。
  *
  * 保存：uci.set -> uci.save() -> uci.apply()（落盘并触发无线重载）-> 组网时再调
  *   meshctl wifi_ensure 补一次自愈（防 mt76 热重载 -122 把 AP 留在 disabled）。
@@ -30,6 +36,15 @@
 var callMeshStatus = rpc.declare({ object: 'mesh', method: 'status', expect: {} });
 var callMeshExec = rpc.declare({ object: 'mesh', method: 'exec', params: [ 'cmd' ], expect: {} });
 
+/* 发射功率用的就是**原生无线页同一批** iwinfo 接口（txpowerlist / info）。
+   ★★ 这两个都用 `params: ['device']` —— 这是**位置参数**形式（与原生页
+   `callTxPowerList(section_id)` 一致）：调用时要传「射频段名字符串」本身，例如
+   `callIwinfoInfo('radio0')`。若误传对象 `{device:'radio0'}`，LuCI 会拼成
+   `{"device":{"device":"radio0"}}` → ubus 报 Invalid argument → Promise reject →
+   页面**静默退化成只读标签**（真机踩过一次，务必保持位置传参）。 */
+var callIwinfoTxPowerList = rpc.declare({ object: 'iwinfo', method: 'txpowerlist', params: [ 'device' ], expect: { results: [] } });
+var callIwinfoInfo = rpc.declare({ object: 'iwinfo', method: 'info', params: [ 'device' ], expect: {} });
+
 var ENC_OPTS = [
 	{ v: 'psk2', t: 'WPA2-PSK' },
 	{ v: 'psk', t: 'WPA-PSK' },
@@ -39,6 +54,18 @@ var ENC_OPTS = [
 ];
 
 var BAND_ORDER = [ '2g', '5g', '6g' ];
+
+/* 国家/地区代码：**故意只列少量常用项**（与「组网设置」页同一份列表，避免两页选项不一致）。
+   不引 iwinfo.countrylist（247 项）—— 对家用场景是纯噪音。要冷门国家请去「组网设置」或原生无线页。
+   当前值若不在表内，countryField() 会把它补进来，保证已有配置不丢。 */
+var COUNTRY_OPTS = [
+	{ v: 'CN', t: '中国' },
+	{ v: 'US', t: '美国' },
+	{ v: 'JP', t: '日本' },
+	{ v: 'DE', t: '德国' },
+	{ v: 'AU', t: '澳大利亚' },
+	{ v: '00', t: '全球（宽松）' }
+];
 
 function bandText(b) {
 	return b === '2g' ? '2.4 GHz' : (b === '6g' ? '6 GHz' : '5 GHz');
@@ -60,6 +87,14 @@ function htmodeLabel(v) {
 	var m = htmodeParse(v);
 	if (!m) return v;
 	return m.mhz + ' MHz · WiFi ' + m.gen;
+}
+
+/* iwinfo 的列表类返回归一：`{results:[…]}` 与裸数组两种形态都认，拿不到就 null */
+function normList(rv) {
+	if (!rv) return null;
+	if (Array.isArray(rv)) return rv;
+	if (Array.isArray(rv.results)) return rv.results;
+	return null;
 }
 
 function ensureCss() {
@@ -101,13 +136,34 @@ return view.extend({
 	load: function () {
 		return Promise.all([
 			callMeshStatus(),
-			uci.load('wireless')
-		]).then(function (r) { return r[0] || {}; });
+			uci.load('wireless'),
+			uci.load('mesh')
+		]).then(function (r) {
+			var status = r[0] || {};
+			var radios = (status.radios && status.radios.length) ? status.radios : [];
+			/* 每个射频各拉一次「可选功率表」+「当前功率」。失败不致命：
+			   下面 txField() 拿不到表时会退化成只读标签，不会给用户一个空下拉。 */
+			return Promise.all(radios.map(function (rd) {
+				return Promise.all([
+					/* ★ 位置传参：rd.radio 本身就是字符串（radio0/radio1），不要再包成对象 */
+					callIwinfoTxPowerList(rd.radio).catch(function () { return null; }),
+					callIwinfoInfo(rd.radio).catch(function () { return null; })
+				]).then(function (t) {
+					return { radio: rd.radio, list: normList(t[0]), info: t[1] || null };
+				});
+			})).then(function (arr) {
+				var tx = {};
+				arr.forEach(function (x) { tx[x.radio] = { list: x.list, info: x.info }; });
+				return { status: status, tx: tx };
+			});
+		});
 	},
 
-	render: function (status) {
+	render: function (payload) {
 		ensureCss();
-		status = status || {};
+		payload = payload || {};
+		var status = payload.status || {};
+		var txData = payload.tx || {};
 
 		var meshOn = (Number(status.enabled) === 1);
 		var isChild = meshOn && status.role === 'client';
@@ -137,6 +193,13 @@ return view.extend({
 		function apEditable() { return !isChild; }
 		function chanEditable(b) { return !isChild && (!meshOn || b !== bhBand); }
 		function htEditable() { return !isChild; }
+		/* 国家码**每节点各自设置**：子节点也可改。它不参与同步
+		   （mesh-sync 里根本没有 country），所以子节点上改了不会被主节点覆盖。 */
+		function countryEditable() { return true; }
+		/* ★ 发射功率**每个节点各自设置**：子节点也可改。txpower 不参与同步
+		   （mesh-sync 不下发、meshctl 从不写），所以子节点上改了不会被主节点覆盖。
+		   另外**不锁回程频段**（原生无线页本来就能改，锁了只会逼用户绕路）。 */
+		function txEditable() { return true; }
 
 		/* 只在值真的变了时才写 UCI —— 否则 uci.set 写入相同值也会留下变更记录，
 		   保存时就会白白触发一次无线重载。 */
@@ -152,13 +215,24 @@ return view.extend({
 		}
 
 		/* ---------- 当前值 ---------- */
-		var ssidByBand = {}, chanByBand = {}, htByBand = {};
+		var ssidByBand = {}, chanByBand = {}, htByBand = {}, txByBand = {};
 		bands.forEach(function (b) {
 			ssidByBand[b] = apByBand[b] ? (apByBand[b].ssid || '') : '';
 			var r = radioByBand[b];
 			chanByBand[b] = r.channel || 'auto';
 			htByBand[b] = r.htmode || '';
+			var tp = uci.get('wireless', r.radio, 'txpower');
+			txByBand[b] = (tp == null) ? '' : String(tp);   /* '' = 驱动默认（删除该项） */
 		});
+
+		/* 国家码：整机一个。以**实际生效**的 wireless.<radio>.country 为准，
+		   退到 mesh.main.country（apply 的来源，见 meshctl:612），再退 CN。 */
+		var countryVal = '';
+		bands.forEach(function (b) {
+			if (!countryVal) countryVal = uci.get('wireless', radioByBand[b].radio, 'country') || '';
+		});
+		if (!countryVal) countryVal = uci.get('mesh', 'main', 'country') || 'CN';
+
 		var firstAp = apBands.length ? apByBand[apBands[0]] : null;
 		var enc = (firstAp && firstAp.encryption) ? firstAp.encryption : 'psk2';
 		var key = (firstAp && firstAp.key) ? firstAp.key : '';
@@ -240,6 +314,30 @@ return view.extend({
 		]);
 
 		/* ---------- 信道与带宽 ---------- */
+		/* 国家/地区代码：**整机一个**（它决定可用信道与功率上限，逻辑上"先定监管域再选信道"）。
+		   短列表；当前值不在表内时补一条，保证已有配置能正常显示、不被静默改写。 */
+		function countryLabel(code) {
+			var m = COUNTRY_OPTS.filter(function (o) { return o.v === code; })[0];
+			return m ? (_(m.t) + ' (' + code + ')') : (code || '—');
+		}
+
+		function countryField() {
+			/* countryEditable() 目前**恒为 true**（每节点各自设置）；保留只读分支作为将来的钩子 */
+			if (!countryEditable())
+				return E('span', { 'class': 'mesh-tag' }, countryLabel(countryVal));
+			var opts = COUNTRY_OPTS.slice();
+			if (!opts.some(function (o) { return o.v === countryVal; }))
+				opts.unshift({ v: countryVal, t: countryVal });
+			var sel = E('select', { 'class': 'cbi-input-select' });
+			opts.forEach(function (o) {
+				sel.appendChild(E('option', { 'value': o.v },
+					o.t === o.v ? o.v : (_(o.t) + ' (' + o.v + ')')));
+			});
+			sel.value = countryVal;
+			sel.addEventListener('change', function () { countryVal = sel.value; });
+			return sel;
+		}
+
 		function channelField(b) {
 			var r = radioByBand[b];
 			if (!chanEditable(b)) {
@@ -303,25 +401,79 @@ return view.extend({
 			return sel;
 		}
 
-		var radioSec = section(_('信道与带宽'), bands.map(function (b) {
-			return E('div', {}, [
+		/* 发射功率：**每频段一个**（txpower 是 per-radio）。选项来自 iwinfo.txpowerlist，
+		   首项「驱动默认」= 删除 UCI 项（不是写 0）；行尾显示 iwinfo.info 报的实际当前功率。
+		   ★ **不锁回程频段** —— 原生无线页本来就能改，锁了只会逼用户绕路（见文件头注释）。 */
+		function txField(b) {
+			var r = radioByBand[b];
+			var t = txData[r.radio] || {};
+			var info = t.info || {};
+			var cur = txByBand[b] || '';
+			var curDbm = Number(info.txpower);
+			var curTxt = (isFinite(curDbm) && curDbm > 0) ? _('当前功率: %s dBm').format(curDbm) : '';
+
+			/* txEditable() 目前**恒为 true**（每个节点都能改自己的发射功率）。
+			   保留这个只读分支，将来若要按角色/频段锁定，只改 txEditable() 即可。 */
+			if (!txEditable(b))
+				return E('span', { 'class': 'mesh-tag' },
+					(cur ? cur + ' dBm' : _('驱动默认')) + (curTxt ? ' · ' + curTxt : ''));
+
+			var list = t.list;
+			if (!list || !list.length) {
+				/* 拿不到功率表（接口不可用）：退化成只读标签，别给用户一个空下拉 */
+				return E('span', { 'class': 'mesh-tag' },
+					curTxt || (cur ? cur + ' dBm' : _('驱动默认')));
+			}
+
+			var sel = E('select', { 'class': 'cbi-input-select' });
+			sel.appendChild(E('option', { 'value': '' }, _('驱动默认')));
+			var seen = {};
+			list.forEach(function (p) {
+				var dbm = String(p.dbm);
+				if (seen[dbm]) return;
+				seen[dbm] = 1;
+				sel.appendChild(E('option', { 'value': dbm },
+					dbm + ' dBm' + (p.mw ? ' (' + p.mw + ' mW)' : '')));
+			});
+			/* 当前 UCI 值不在表里时补一条，避免选中项对不上真实配置 */
+			if (cur && !seen[cur])
+				sel.appendChild(E('option', { 'value': cur }, cur + ' dBm' + _('（当前）')));
+			sel.value = cur;
+			sel.addEventListener('change', function () { txByBand[b] = sel.value; });
+
+			/* select 与提示同在 div 里即为同行（都是行内元素），无需额外 CSS */
+			var wrap = E('div', {}, [ sel ]);
+			if (curTxt) wrap.appendChild(E('span', { 'class': 'mesh-muted' }, ' - ' + curTxt));
+			return wrap;
+		}
+
+		var secRows = [ row(_('国家/地区代码'), countryField()) ];
+		bands.forEach(function (b) {
+			secRows.push(E('div', {}, [
 				E('h4', { 'class': 'mesh-band-title' }, bandText(b)),
 				row(_('信道'), channelField(b)),
-				row(_('通道宽度'), htmodeField(b))
-			]);
-		}).concat([
-			E('div', { 'class': 'mesh-muted' },
-				'· ' + _('带宽越大速度越快，但越怕干扰：2.4G 建议 20 MHz，5G 建议 80 MHz。')),
-			E('div', { 'class': 'mesh-muted' },
-				'· ' + _('「WiFi 4 / 5 / 6」是制式代际（数字越高越新），本页已自动为你选本机支持的最高代际。'))
-		]));
+				row(_('通道宽度'), htmodeField(b)),
+				row(_('发射功率'), txField(b))
+			]));
+		});
+		secRows.push(E('div', { 'class': 'mesh-muted' },
+			'· ' + _('带宽越大速度越快，但越怕干扰：2.4G 建议 20 MHz，5G 建议 80 MHz。')));
+		secRows.push(E('div', { 'class': 'mesh-muted' },
+			'· ' + _('「WiFi 4 / 5 / 6」是制式代际（数字越高越新），本页已自动为你选本机支持的最高代际。')));
+		secRows.push(E('div', { 'class': 'mesh-muted' },
+			'· ' + _('国家/地区代码影响可用信道与功率上限；改完后信道列表会在下次进入本页时刷新。')));
+		if (meshOn && bhBand)
+			secRows.push(E('div', { 'class': 'mesh-muted' },
+				'· ' + _('回程频段（%s）的发射功率过低会削弱组网链路，请谨慎调低。').format(bandText(bhBand))));
+
+		var radioSec = section(_('信道与带宽'), secRows);
 
 		/* ---------- 提示 ---------- */
 		var hint;
 		if (isChild) {
-			hint = note(_('本节点是子节点：WiFi 名称、密码、信道、带宽均由主节点统一管理，每 10 秒自动同步，此处仅供查看。要修改请到主节点上操作。'), 'orange');
+			hint = note(_('本节点是子节点：WiFi 名称、密码、信道、带宽由主节点统一管理（每 10 秒自动同步），此处仅供查看；国家/地区代码与发射功率是每台设备自己的设置，可以在本页修改。要改其它项请到主节点上操作。'), 'orange');
 		} else if (meshOn) {
-			hint = note(_('本节点是主节点：这里的 WiFi 设置会下发到所有子节点。')
+			hint = note(_('本节点是主节点：SSID / 加密 / 信道 / 带宽会下发到所有子节点；国家码与发射功率仅在本机生效。')
 				+ (bhBand ? _('回程频段（%s）的信道与组网绑定，已锁定为「跟随回程」，如需修改请到「组网设置」。').format(bandText(bhBand)) : ''), 'green');
 		} else {
 			hint = note(_('未启用组网：这里就是一个普通的 WiFi 设置入口，改完保存即可。'), 'green');
@@ -340,10 +492,22 @@ return view.extend({
 					else if (key) setIfChanged(s['.name'], 'key', key);
 				});
 			}
+			/* 国家码：**双写** —— wireless.<每个 radio>.country + mesh.main.country。
+			   只写前者的话，下次 meshctl apply 会用 mesh.main.country 覆盖回去（meshctl:612）。 */
+			if (countryEditable()) {
+				bands.forEach(function (b) { setIfChanged(radioByBand[b].radio, 'country', countryVal); });
+				var mc = uci.get('mesh', 'main', 'country');
+				if ((mc == null ? '' : String(mc)) !== countryVal) {
+					uci.set('mesh', 'main', 'country', countryVal);
+					changed = true;
+				}
+			}
 			bands.forEach(function (b) {
 				var r = radioByBand[b];
 				if (chanEditable(b)) setIfChanged(r.radio, 'channel', chanByBand[b]);
 				if (htEditable() && htByBand[b]) setIfChanged(r.radio, 'htmode', htByBand[b]);
+				/* 发射功率：空值走 setIfChanged 的 uci.unset 分支 = 「驱动默认」 */
+				if (txEditable()) setIfChanged(r.radio, 'txpower', txByBand[b]);
 			});
 
 			if (!changed) {
@@ -377,15 +541,15 @@ return view.extend({
 				function () { btnSave.disabled = false; });
 		});
 
-		/* 当前状态下有没有可改的项：子节点全部只读，就不放一个永远点不动的保存按钮 */
-		var anyEditable = apEditable() || bands.some(function (b) {
-			return chanEditable(b) || htEditable();
+		/* 当前状态下有没有可改的项：发射功率恒可改，所以正常都会有；这里只兜「一个射频都没有」的极端情况 */
+		var anyEditable = apEditable() || countryEditable() || bands.some(function (b) {
+			return chanEditable(b) || htEditable() || txEditable();
 		});
 
 		var actSec = section(_('应用'), [
 			anyEditable
 				? E('div', { 'class': 'mesh-btnrow' }, [ btnSave ])
-				: E('div', { 'class': 'mesh-muted' }, '· ' + _('本页当前没有可修改的项：子节点的无线设置由主节点统一管理。')),
+				: E('div', { 'class': 'mesh-muted' }, '· ' + _('本页当前没有可修改的项。')),
 			E('div', { 'class': 'mesh-muted' }, [
 				E('div', {}, '· ' + _('本页只是「网络 → 无线」的快捷入口，两者共用同一份配置，改哪边都一样。')),
 				E('div', {}, '· ' + _('保存后无线会重载一次（约 10~20 秒），期间连接可能短暂中断。'))
