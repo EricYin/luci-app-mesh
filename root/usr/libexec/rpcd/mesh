@@ -141,7 +141,7 @@ case "$1" in
 					out=$("$MESHCTL" log $arg 2>&1)
 					code=$?
 					;;
-				diag|sync|revert|port_bridging|confirm_rollback|backup-refresh|clients)
+				diag|sync|revert|port_bridging|confirm_rollback|backup-refresh|clients|roam_show|roam_apply)
 						out=$("$MESHCTL" "$cmd" 2>&1)
 						code=$?
 						;;

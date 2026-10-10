@@ -1,6 +1,7 @@
 #!/bin/sh /etc/rc.common
 #
-# 自检：按本机 LAN 网段自动校正 dawn / umdns 的漫游配置
+# 自检：按本机 LAN 网段自动校正 dawn / umdns 的漫游配置，
+#       并把「漫游灵敏度档位」（mesh.main.roam_*，r57）翻译进 dawn。
 #
 # 触发方式（三种，可叠加）：
 #   1. 开机自启      —— /etc/init.d/99-dawn-roaming enable
@@ -68,12 +69,15 @@ mesh_enabled() {
 	[ "$(uci -q get mesh.main.enabled 2>/dev/null)" = "1" ]
 }
 
-# 快速通道：network / dawn / umdns 三个配置都没变 -> 跳过
+# 快速通道：network / mesh / dawn / umdns 四个配置都没变 -> 跳过
+# ⚠ 必须包含 /etc/config/mesh（r57 起）：漫游灵敏度档位存在 mesh.main.roam_* 里，
+#   由本脚本每分钟翻译进 dawn。若哈希不含 mesh，则"用户改了档位、dawn 还没变"时
+#   哈希不变 -> 整个脚本被跳过 -> 档位永远落不了地（只在下次改 network/dawn 时才生效）。
 fast_skip() {
 	local cur prev
 	[ "$ROAM_DRYRUN" = "1" ] && return 1
 	command -v md5sum >/dev/null 2>&1 || return 1
-	cur=$( ( cat /etc/config/network /etc/config/dawn /etc/config/umdns 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 )
+	cur=$( ( cat /etc/config/network /etc/config/dawn /etc/config/umdns /etc/config/mesh 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 )
 	[ -n "$cur" ] || return 1
 	prev=$(cat "$STATE" 2>/dev/null)
 	[ "$cur" = "$prev" ] && return 0
@@ -83,7 +87,7 @@ fast_skip() {
 
 state_save() {
 	command -v md5sum >/dev/null 2>&1 || return 0
-	( cat /etc/config/network /etc/config/dawn /etc/config/umdns 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 > "$STATE" 2>/dev/null
+	( cat /etc/config/network /etc/config/dawn /etc/config/umdns /etc/config/mesh 2>/dev/null; md5sum "$SELF" 2>/dev/null ) | md5sum | cut -d' ' -f1 > "$STATE" 2>/dev/null
 }
 
 # 取 LAN 广播地址：优先运行时 brd 字段，回退 UCI 静态地址按掩码计算
@@ -163,6 +167,17 @@ start() {
 	set_if_diff dawn global eval_assoc_req      1          && changed=1
 	set_if_diff dawn global use_station_count   1          && changed=1
 	set_if_diff dawn global max_station_diff    1          && changed=1
+
+	# ---- 漫游灵敏度档位（r57）----
+	# 唯一实现是 meshctl roam_apply：读 mesh.main.roam_* → 写 /etc/config/dawn
+	# → uci commit dawn → ubus call dawn reload_config（免重启，不丢邻居视图）。
+	# 这里只负责"每分钟把档位拉回正轨"：用户手动改过 dawn、或升级包后配置被重置，
+	# 都会被它纠正回来。无变化时它不 commit、不 reload，所以巡检开销可忽略。
+	# ⚠ 依赖 fast_skip 的哈希包含 /etc/config/mesh（见该函数注释），否则会被整体跳过。
+	# 干跑模式不调用（它会真写盘）—— 档位的干跑预览见 meshctl roam_show。
+	if [ "$ROAM_DRYRUN" != "1" ] && [ -x /usr/sbin/meshctl ]; then
+		/usr/sbin/meshctl roam_apply >/dev/null 2>&1
+	fi
 
 	# ---- umdns 侧（dawn 靠它发现邻居 AP）----
 	if [ -x /etc/init.d/umdns ] && [ -f /etc/config/umdns ]; then

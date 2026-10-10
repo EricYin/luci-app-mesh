@@ -213,10 +213,27 @@ bat_json() {
 	printf '{"enabled":%s,"gw":"%s"}' "$en" "$gw"
 }
 
+# 漫游灵敏度档位（r57）：**原样下发** mesh.main.roam_*（空串 = 跟随档位）。
+# 下发"用户意图"而不是"翻译结果"，两端用同一个 mesh_roam_effective() 推导生效值，
+# 所以主/子不会算出不同结果；子节点上也能显示「档位 5」而不是一堆裸数字。
+# ⚠ 字段名必须与 mesh.main 的选项名完全一致 —— 子节点 mesh_uci_mirror_roam 直接
+#   拿它拼 `mesh.main.<字段>` 写回本机，改名要两处同时改。
+roam_json() {
+	local o v first=1
+	for o in roam_enabled roam_level roam_kicking roam_threshold roam_minkick \
+	         roam_rssi_val roam_low_rssi_val roam_rssi_center roam_update roam_bw_threshold; do
+		v=$(uci -q get "mesh.main.$o" 2>/dev/null)
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '"%s":"%s"' "$o" "$(mesh_esc "$v")"
+	done
+}
+
 cat <<EOF
 {"ok":1,"index":$idx,"mesh":{"id":"$(mesh_esc "$mesh_id")","enc":"$enc","band":"$band","channel":"$ch","channel_real":$ch_real},
 "master":{"mac":"$(mesh_esc "$mmac")","wmac":"$(mesh_esc "$mwmac")","hostname":"$(mesh_esc "$(mesh_hostname)")"},
 "batman":$(bat_json),
+"roam":{$(roam_json)},
 "ap":[$(ap_json)],
 "radios":[$(radios_json)]}
 EOF

@@ -1350,6 +1350,211 @@ mesh_pkg_cap() {
 mesh_dawn_cap() { mesh_pkg_cap dawn; }
 mesh_umdns_cap() { mesh_pkg_cap umdns; }
 
+# ============================================================================
+# 漫游切换灵敏度（r57）
+# ============================================================================
+# 设计：**唯一真源 = mesh.main.roam_*（UCI）**，/etc/config/dawn 只是产物。
+# 这样避免"mesh 与 dawn 两处真源互相覆盖"（同 r55 country 双写的教训）。
+#
+#   roam_enabled        0/1     总开关（0 = dawn kicking 0：只写日志不动作）
+#   roam_level          1..10   灵敏度档位（默认 5 = dawn 出厂值）
+#   —— 以下为「高级」覆盖项，**留空 = 跟随档位 / 用内置默认** ——
+#   roam_kicking        0..3    踢人方法（默认 1）
+#   roam_threshold      int     分数差阈值（默认跟随档位）
+#   roam_minkick        int     连续评估次数（默认跟随档位）
+#   roam_rssi_val       int     好信号门限 dBm（默认 -60）
+#   roam_low_rssi_val   int     差信号门限 dBm（默认 -80）
+#   roam_rssi_center    int     加权中点 dBm（默认 -70；仅踢人方法 2/3 生效）
+#   roam_update         int     评估间隔秒（默认 10）
+#   roam_bw_threshold   int     带宽门限 Mbit/s（默认 6）
+#
+# ★ 为什么默认锁 kicking=1（RSSI Comparison）—— 依据 dawn 官方 CONFIGURE.md：
+#   1 = 比较「当前 AP 对该设备的分数」与「其他 AP 的分数」，差值 ≥ kicking_threshold
+#       才踢 → **只在确实存在更优 AP 时才动作**，语义正好是"漫游灵敏度"。
+#   2 = 只看当前 RSSI，低于 rssi_center 就发 802.11v BTM **软踢** —— 官方原文明确
+#       它在**没有更好 AP 时也会发**（设备白扫一遍，瞬时空口开销/延迟抖动），且被
+#       归为 less tested。
+#   3 = 1+2（OpenWrt 打包默认值，并非更适合手机漫游场景）。
+#
+# ★ 写入者只有 mesh_roam_apply()：meshctl roam_apply / cmd_sync_once /
+#   99-dawn-roaming 三条路径都调它，档位→参数的翻译逻辑**绝不复制**。
+MESH_ROAM_DEFAULT_LEVEL=5
+# dawn 配置路径。做成可覆盖（与文件头的 MESH_LIBDIR / MESH_TMP_DIR 同一风格），
+# 这样"档位 → dawn 参数"的翻译逻辑可以在离线环境里被完整自测
+# （见 tmp/r57-roam-selftest.sh —— 没有这个钩子，本函数在 Windows 上必然提前 return）。
+MESH_DAWN_CONF="${MESH_DAWN_CONF:-/etc/config/dawn}"
+# 与 meshctl / mesh-sync 同义：本文件被多处 source，兜底取一次 jsonfilter 路径
+JF="${JF:-$(command -v jsonfilter || echo /usr/bin/jsonfilter)}"
+
+# 档位 -> "kicking_threshold min_number_to_kick"
+# 档 1 最稳（阈值大 = 要求更大的分数优势才切），档 10 最激进（阈值小 + 评估次数少）。
+# 档 5 = dawn 出厂默认（20 / 3）。
+# ⚠ dawn 的分数是**台阶式**的（rssi 增量 ±15，见 rssi_val/low_rssi_val），所以相邻
+#   档位未必有可感差异 —— 真正手感不同的是跨越 ±15 台阶的那几档（20/26/32/40 附近）。
+mesh_roam_level_params() {
+	case "$1" in
+	1)  echo "40 6";;
+	2)  echo "36 6";;
+	3)  echo "32 5";;
+	4)  echo "26 4";;
+	5)  echo "20 3";;
+	6)  echo "17 3";;
+	7)  echo "14 3";;
+	8)  echo "11 2";;
+	9)  echo "9 2";;
+	10) echo "6 2";;
+	*)  echo "20 3";;
+	esac
+}
+
+# 档位（1..10，越界夹紧；非法值回默认）
+mesh_roam_level() {
+	local l
+	l=$(mesh_uci_get main.roam_level)
+	case "$l" in ''|*[!0-9]*) l=$MESH_ROAM_DEFAULT_LEVEL;; esac
+	[ "$l" -lt 1 ] && l=1
+	[ "$l" -gt 10 ] && l=10
+	echo "$l"
+}
+
+# 高级覆盖项取值：$1 = UCI 选项名（不含 mesh.main. 前缀），$2 = 缺省值。
+# 空值 -> 缺省；含非数字（允许一个前导减号）-> 缺省，避免把坏值写进 dawn。
+mesh_roam_ov() {
+	local v d
+	v=$(mesh_uci_get "$1")
+	[ -n "$v" ] || { echo "$2"; return 0; }
+	case "$v" in
+		-*) d=${v#-}; case "$d" in ''|*[!0-9]*) echo "$2"; return 0;; esac;;
+		*)  case "$v" in *[!0-9]*) echo "$2"; return 0;; esac;;
+	esac
+	echo "$v"
+}
+
+# 输出**生效值**，每行 "key=value"（key 用 UCI 选项名去掉 roam_ 前缀）。
+# 供 meshctl roam_show 转 JSON、mesh_roam_apply 写 dawn 共用 —— 同一份翻译，不会漂移。
+mesh_roam_effective() {
+	local lvl th mk
+	lvl=$(mesh_roam_level)
+	set -- $(mesh_roam_level_params "$lvl")
+	th=$1; mk=$2
+
+	printf 'enabled=%s\n'      "$(mesh_uci_getd main.roam_enabled 1)"
+	printf 'level=%s\n'        "$lvl"
+	printf 'kicking=%s\n'      "$(mesh_roam_ov main.roam_kicking 1)"
+	printf 'threshold=%s\n'    "$(mesh_roam_ov main.roam_threshold "$th")"
+	printf 'minkick=%s\n'      "$(mesh_roam_ov main.roam_minkick "$mk")"
+	printf 'rssi_val=%s\n'     "$(mesh_roam_ov main.roam_rssi_val -60)"
+	printf 'low_rssi_val=%s\n' "$(mesh_roam_ov main.roam_low_rssi_val -80)"
+	printf 'rssi_center=%s\n'  "$(mesh_roam_ov main.roam_rssi_center -70)"
+	printf 'update=%s\n'       "$(mesh_roam_ov main.roam_update 10)"
+	printf 'bw=%s\n'           "$(mesh_roam_ov main.roam_bw_threshold 6)"
+}
+
+# 列出 dawn 的 metric 段名。$1=global 只回 global 段；$1=bands 回其余（各频段）段。
+# 兼容两种命名：本固件是具名段（dawn.global / dawn.802_11g / dawn.802_11a），
+# 其他版本可能是匿名段（uci show 会输出 dawn.@metric[N]）—— 两种 uci 都能寻址。
+mesh_dawn_metric_secs() {
+	local want="$1"
+	uci -q show dawn 2>/dev/null \
+		| sed -n 's/^dawn\.\([^=]*\)=metric$/\1/p' \
+		| while read -r s; do
+			[ -n "$s" ] || continue
+			case "$want" in
+			global) [ "$s" = "global" ] && echo "$s";;
+			bands)  [ "$s" = "global" ] || echo "$s";;
+			esac
+		done
+}
+
+# 仅在值真的变了才写 UCI，并**返回"是否改了"**（改了返回 0）。
+# 注意不能直接用 mesh_uci_set_if_changed：它恒返回 0（要么 [ ] 成立、要么 uci set 成功），
+# 拿它来判断"有没有改动"会永远为真 → 每分钟巡检都 commit + 重启 dawn。
+mesh_roam_set() {
+	local cur
+	cur=$(uci -q get "$1" 2>/dev/null)
+	[ "$cur" = "$2" ] && return 1
+	uci set "$1=$2" 2>/dev/null || return 1
+	return 0
+}
+
+# 从生效值串里取一项：$1 = 生效值串（key=value 多行），$2 = key。
+# 写成独立函数（而不是 mesh_roam_apply 里的嵌套函数）是为了不依赖 ash 的
+# 动态作用域 —— busybox ash 的 `local` 是动态作用域，嵌套函数能读到外层 local，
+# 但这一点在不同 busybox 版本上并不保证，显式传参最稳。
+mesh_roam_pick() {
+	printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n1
+}
+
+# 把 mesh.main.roam_* 的生效值写进 /etc/config/dawn。
+# ⚠ 只 `uci set`（暂存），**不 commit、不 reload** —— 由调用方统一提交并生效。
+# 返回 0 = 有改动，1 = 本来就一致（调用方据此决定要不要 commit/reload）。
+mesh_roam_apply() {
+	[ -f "$MESH_DAWN_CONF" ] || return 1
+	local eff gsec bsec tsec k changed=0
+	eff=$(mesh_roam_effective)
+
+	gsec=$(mesh_dawn_metric_secs global | head -n1)
+	[ -n "$gsec" ] || return 1
+
+	# ---- 全局段：踢人方法 / 分数差阈值 / 连续评估次数 / 带宽门限 ----
+	k=$(mesh_roam_pick "$eff" kicking)
+	# 总开关关掉 = kicking 0（dawn 只写日志"本来会踢谁"，不动作）——排障用
+	[ "$(mesh_roam_pick "$eff" enabled)" = "1" ] || k=0
+	mesh_roam_set "dawn.$gsec.kicking"             "$k"                                && changed=1
+	mesh_roam_set "dawn.$gsec.kicking_threshold"   "$(mesh_roam_pick "$eff" threshold)"   && changed=1
+	mesh_roam_set "dawn.$gsec.min_number_to_kick"  "$(mesh_roam_pick "$eff" minkick)"     && changed=1
+	mesh_roam_set "dawn.$gsec.bandwidth_threshold" "$(mesh_roam_pick "$eff" bw)"          && changed=1
+
+	# ---- 各频段段：好/差信号门限 + 加权中点 ----
+	for bsec in $(mesh_dawn_metric_secs bands); do
+		mesh_roam_set "dawn.$bsec.rssi_val"     "$(mesh_roam_pick "$eff" rssi_val)"     && changed=1
+		mesh_roam_set "dawn.$bsec.low_rssi_val" "$(mesh_roam_pick "$eff" low_rssi_val)" && changed=1
+		mesh_roam_set "dawn.$bsec.rssi_center"  "$(mesh_roam_pick "$eff" rssi_center)"  && changed=1
+	done
+
+	# ---- times 段：评估间隔（段缺失时补建一个具名段）----
+	tsec=$(uci -q show dawn 2>/dev/null | sed -n 's/^dawn\.\([^=]*\)=times$/\1/p' | head -n1)
+	if [ -z "$tsec" ]; then
+		uci -q set dawn.times=times 2>/dev/null && { tsec=times; changed=1; }
+	fi
+	[ -n "$tsec" ] && mesh_roam_set "dawn.$tsec.update_client" "$(mesh_roam_pick "$eff" update)" && changed=1
+
+	[ "$changed" = 1 ]
+}
+
+# 让 dawn 重新读取配置。优先 ubus reload_config（**免重启**：实测 pid 不变、
+# 邻居视图不丢，无需 20~45s 重建）；老版本 dawn 没有该方法时退回 service restart。
+mesh_dawn_reload() {
+	if ubus -v list dawn 2>/dev/null | grep -q '"reload_config"'; then
+		ubus call dawn reload_config >/dev/null 2>&1 && return 0
+	fi
+	[ -x /etc/init.d/dawn ] && /etc/init.d/dawn restart >/dev/null 2>&1
+	return 0
+}
+
+# 子节点：把主节点下发的 roam 块镜像到本机 mesh.main.roam_*。
+# 语义与 mesh_uci_mirror_aps 一致 —— 主节点该字段为空则子节点 **unset**，
+# 防止子节点残留旧的单项覆盖（主节点已改回"跟随档位"、子节点却还在用旧值）。
+# $1 = 同步 JSON。返回 0 = mesh 配置有改动（调用方负责 uci commit mesh）。
+mesh_uci_mirror_roam() {
+	local json="$1" o v cur changed=0
+	[ -n "$json" ] || return 1
+	# 主节点没下发 roam 块（旧主节点 + 新子节点）时保持现状，绝不把档位清空
+	printf '%s' "$json" | grep -q '"roam"' || return 1
+
+	for o in roam_enabled roam_level roam_kicking roam_threshold roam_minkick \
+	         roam_rssi_val roam_low_rssi_val roam_rssi_center roam_update roam_bw_threshold; do
+		v=$("$JF" -s "$json" -e "@.roam.$o" 2>/dev/null)
+		cur=$(uci -q get "mesh.main.$o" 2>/dev/null)
+		if [ -z "$v" ]; then
+			[ -n "$cur" ] && { uci -q delete "mesh.main.$o" 2>/dev/null; changed=1; }
+		else
+			[ "$cur" = "$v" ] || { uci set "mesh.main.$o=$v" 2>/dev/null; changed=1; }
+		fi
+	done
+	[ "$changed" = 1 ]
+}
+
 # ---------------- 信道 ----------------
 mesh_channel_valid() {
 	local band="$1" ch="$2"

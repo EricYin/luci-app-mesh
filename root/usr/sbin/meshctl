@@ -699,6 +699,16 @@ cmd_apply() {
 	if [ "$batman" = "1" ]; then
 		mesh_bat_fix_mtu >>"$MESH_LOG" 2>&1
 	fi
+	# 漫游灵敏度档位（r57）：把 mesh.main.roam_* 翻译进 /etc/config/dawn。
+	# 与「子节点同步」「99-dawn-roaming 每分钟巡检」共用同一个 mesh_roam_apply，
+	# 翻译逻辑只有一份。无变化时不 commit、不 reload —— 免得每次 apply 都重启 dawn
+	# （dawn 重启会丢邻居视图，需 20~45s 重建）。
+	if mesh_roam_apply; then
+		uci commit dawn
+		mesh_dawn_reload
+		mesh_log info "漫游灵敏度档位已应用到 dawn（level=$(mesh_roam_level)）"
+	fi
+
 	[ "$role" = client ] && date '+%Y-%m-%d %H:%M:%S' > "$MESH_TMP_DIR/lastok"
 	mesh_unlock
 	echo "完成。无线重启约需 10~20 秒。"
@@ -1473,6 +1483,12 @@ cmd_sync_once() {
 	# 而不是无锁提交去覆盖用户正在进行的 apply。
 	mesh_lock || { sync_fail "本机正在执行其他组网操作，本轮同步已跳过"; return 1; }
 	mesh_uci_mirror_aps "$idx" "$bh_band"
+
+	# 漫游灵敏度档位（r57）：把主节点下发的 roam 块镜像到本机 mesh.main.roam_*。
+	# 必须与 wireless 的镜像一起在锁内完成，否则可能与用户正在进行的操作打架。
+	local roam_chg=0
+	mesh_uci_mirror_roam "$json" && roam_chg=1
+
 	if [ -n "$(uci changes wireless)" ]; then
 		uci commit wireless
 		wifi reload >>"$MESH_LOG" 2>&1
@@ -1481,9 +1497,25 @@ cmd_sync_once() {
 		# "主节点改密码 → 子节点跟随"走的正是这条路径，否则子节点 AP 会直接消失。
 		mesh_wifi_ensure_aps_up >>"$MESH_LOG" 2>&1
 		sync_ok "已从主节点同步配置(节点序号 $idx，非 auto 信道已错开)"
+	elif [ "$roam_chg" = 1 ]; then
+		sync_ok "已从主节点同步漫游灵敏度档位"
 	else
 		sync_ok "配置与主节点一致，无需变更"
 	fi
+
+	# 漫游档位单独提交并生效：它只写 /etc/config/mesh 与 /etc/config/dawn，与无线无关，
+	# 因此**不需要 wifi reload**（用户不用等 10~20 秒）。无变化时不 commit、不 reload。
+	# ⚠ 放在 wireless 分支之后：两者都可能变化，wireless 的重载不能因为 roam 的
+	#   处理而被跳过（这里用独立的 if，不是 elif）。
+	if [ "$roam_chg" = 1 ]; then
+		uci commit mesh
+		if mesh_roam_apply; then
+			uci commit dawn
+			mesh_dawn_reload
+			mesh_log info "漫游灵敏度档位已从主节点同步（level=$(mesh_roam_level)）"
+		fi
+	fi
+
 	mesh_unlock
 	return 0
 }
@@ -2987,6 +3019,53 @@ cmd_wifi_ensure() {
 	mesh_wifi_ensure_aps_up
 }
 
+# ================= 漫游灵敏度（r57） =================
+# 输出给「WiFi 快速设置」页：档位 / 总开关 / 高级覆盖项（原样，空串=跟随档位）/
+# 生效值。前端只需要这一个 rpc 就能渲染整块「漫游引导」——
+# **档位 → dawn 参数的翻译只留在后端一处**（mesh_roam_effective），
+# 前端不重复维护档位表，改档位规则不用动 JS。
+cmd_roam_show() {
+	local eff o v first
+	eff=$(mesh_roam_effective)
+	printf '{"ok":1,"enabled":%s,"level":%s,"dawn":%s,"overrides":{' \
+		"$(mesh_roam_pick "$eff" enabled)" \
+		"$(mesh_roam_pick "$eff" level)" \
+		"$(mesh_dawn_cap >/dev/null 2>&1 && echo 1 || echo 0)"
+	first=1
+	for o in kicking threshold minkick rssi_val low_rssi_val rssi_center update bw; do
+		v=$(mesh_uci_get "main.roam_$o")
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '"%s":"%s"' "$o" "$(mesh_esc "$v")"
+	done
+	printf '},"effective":{'
+	first=1
+	for o in kicking threshold minkick rssi_val low_rssi_val rssi_center update bw; do
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '"%s":%s' "$o" "$(mesh_roam_pick "$eff" "$o")"
+	done
+	printf '}}\n'
+}
+
+# 「WiFi 快速设置」页保存后调用：把 mesh.main.roam_* 落到 /etc/config/dawn 并
+# **免重启**生效（ubus dawn reload_config）。无变化时不 commit、不 reload。
+cmd_roam_apply() {
+	if [ ! -f "$MESH_DAWN_CONF" ]; then
+		echo "未安装 dawn，漫游灵敏度设置无处生效（本设置只在装了 dawn 的节点上起作用）"
+		return 0
+	fi
+	if mesh_roam_apply; then
+		uci commit dawn
+		mesh_dawn_reload
+		mesh_log info "漫游灵敏度档位已应用到 dawn（level=$(mesh_roam_level)）"
+		echo "漫游灵敏度已应用（档位 $(mesh_roam_level)）"
+	else
+		echo "漫游灵敏度与当前配置一致，无需变更"
+	fi
+	return 0
+}
+
 # ================= 入口 =================
 case "$1" in
 	apply)            shift; cmd_apply "$@";;
@@ -3006,6 +3085,8 @@ case "$1" in
 	set-role)         shift; cmd_set_role "$@";;
 	button)           shift; cmd_button "$@";;
 	wifi_ensure)      cmd_wifi_ensure;;
+	roam_show)        cmd_roam_show;;
+	roam_apply)       cmd_roam_apply;;
 	clients)          cmd_clients;;
 	client_kick)      shift; cmd_client_kick "$@";;
 	client_unban)     shift; cmd_client_unban "$@";;

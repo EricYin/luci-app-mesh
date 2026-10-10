@@ -7,6 +7,53 @@
 
 ---
 
+## r57（2026-10-10）
+新增「漫游引导」区块：可调手机在节点之间的漫游切换灵敏度，并**同步到所有子节点**。
+
+- **位置**：「WiFi 快速设置」页新增**独立区块**（不挤进「信道与带宽」，两者语义无关）。
+  未装 dawn 时显示提示、不显示控件；子节点上**只读**（与 SSID/信道一致 —— 它参与同步）。
+- **总开关 + 10 档灵敏度**：
+  - 开关关掉 = `dawn.global.kicking=0`（dawn 只写日志"本来会踢谁"，不动作），排障用。
+  - 档位 1~10 同时驱动 `kicking_threshold`（分数差阈值，越小越易切）与
+    `min_number_to_kick`（连续评估次数，越小越快切）：
+    档 1 = 40/6（最稳）… **档 5 = 20/3（= dawn 出厂默认，标"标准（推荐）"）** … 档 10 = 6/2（最激进）。
+  - ⚠ dawn 的评分是**台阶式**的（`rssi` 增量 ±15，`rssi_val=-60`/`low_rssi_val=-80`），
+    相邻档位未必有明显手感差异 —— 真正不同的是跨台阶的那几档。已在界面上如实说明。
+- **高级折叠区（8 项，留空 = 跟随档位）**：踢人方法、分数差阈值、连续评估次数、
+  好/差信号门限、加权中点、评估间隔、带宽门限。输入框的灰色 placeholder 就是**当前生效值**。
+  另附「全部跟随档位」一键清空覆盖。
+- ★★ **`kicking` 默认锁方法 1（RSSI Comparison）** —— 依据 dawn 官方 `CONFIGURE.md`：
+  方法 1 只在**确实存在更优 AP** 时才踢，语义才等于"漫游灵敏度"；方法 2 只看当前 RSSI，
+  **没有更好 AP 时也会发 802.11v BTM 软踢**（设备白扫一遍，瞬时空口开销/抖动），官方归为
+  *less tested*；方法 3 = 1+2，是 OpenWrt 打包默认值、并非更适合手机漫游。高级区仍可改，
+  但选项文案已标注各自代价。
+- ★★ **同步到子节点**（本次设计重点）：**唯一真源 = `mesh.main.roam_*`（UCI）**，
+  `/etc/config/dawn` 只是产物 —— 避免"mesh 与 dawn 两处真源互相覆盖"（r55 country 的教训）。
+  - `/cgi-bin/mesh-sync` 的下发 JSON 新增 `"roam":{…}`，**原样下发** `roam_level` + 各覆盖项
+    （下发"用户意图"而不是"翻译结果"，两端用同一个 `mesh_roam_effective()` 推导，永不漂移）。
+  - 子节点 `cmd_sync_once` 用新增的 `mesh_uci_mirror_roam()` 镜像到本机 `mesh.main.roam_*`
+    （主节点某项为空 → 子节点 `uci unset`，防残留旧覆盖），随即落地 dawn 并生效。
+  - 档位只在**变化时**才 commit / reload；只改漫游**不会重启无线**，用户不用等 10~20 秒。
+- ★★ **免重启生效**：改用 `ubus call dawn reload_config`（实测 pid 不变、`get_network`
+  邻居视图不丢），替代 `service dawn restart`（后者要 20~45 秒重建邻居表）。
+  老版本 dawn 没有该方法时自动退回 `service restart`（运行时能力探测）。
+- ★★ **修一个会让档位"永远落不了地"的坑**：`99-dawn-roaming` 的 `fast_skip()` 原来只 hash
+  `/etc/config/network + dawn + umdns`，**不含 `/etc/config/mesh`** —— 改了 `roam_level`
+  而 dawn 尚未变化时哈希不变 → 每分钟巡检被整体跳过。已把 `/etc/config/mesh` 纳入哈希。
+- **菜单归属调整**：「WiFi 快速设置」的**真实页面**从 `admin/network/wifi-quick` 移到
+  `admin/network/mesh/wifi-quick`（顶层 `admin/network/wifi-quick` 改为 `alias` 指过来，
+  旧地址仍可访问）。这样它与其余 4 页同属 `admin/network/mesh` 菜单组，**自动获得主题自带的
+  页签栏**（组网状态 / 连接设备 / WiFi 快速设置 / 组网设置 / 诊断与维护）—— 不再手写导航条。
+  原先它挂在 `admin/network` 下时没有页签，站在该页侧边栏也看不到 Mesh 子菜单。
+- **后端**：`functions.sh` 新增 `mesh_roam_level_params` / `mesh_roam_level` / `mesh_roam_ov` /
+  `mesh_roam_effective` / `mesh_dawn_metric_secs` / `mesh_roam_set` / `mesh_roam_pick` /
+  `mesh_roam_apply` / `mesh_dawn_reload` / `mesh_uci_mirror_roam`；
+  `meshctl` 新增 `roam_show`（输出档位 / 覆盖项 / **后端算好的生效值**，前端不维护档位表）与
+  `roam_apply`；`cmd_apply` 末尾与 `cmd_sync_once` 也接同一套翻译。rpcd 白名单加 `roam_show|roam_apply`。
+- 离线校验：`tmp/r57-render-sim.js`（47/47，含"阈值 placeholder 必须等于后端生效值"、
+  "页面不得出现自定义导航条 `.mesh-nav`"这类断言）、
+  `tmp/r57-roam-selftest.sh`（53/53：档位表 / 覆盖 / 非法值兜底 / 幂等 / 子节点镜像）。
+
 ## r56（2026-10-09）
 新增「连接设备」页：查看本机各 AP 上关联的无线客户端，并可踢除 / 引导 / 测量。
 

@@ -131,15 +131,64 @@ function isNoData(rv) {
 		return /ubus code 5\b/.test(rv.message) || rv.message.indexOf('未收到数据') !== -1;
 	return false;
 }
+/* ---------- 漫游灵敏度（r57）常量 ----------
+ * ★ 这里**只有档位编号与文案**，没有"档位 → dawn 参数"的映射表 ——
+ *   那份映射留在后端一处（functions.sh 的 mesh_roam_level_params /
+ *   mesh_roam_effective，经 meshctl roam_show 暴露）。前端只显示后端算好的
+ *   生效值，所以改档位规则永远不用动 JS。 */
+var ROAM_LEVELS = [
+	{ v: '1',  t: '1 · 最稳（几乎不切）' },
+	{ v: '2',  t: '2 · 很稳' },
+	{ v: '3',  t: '3 · 稳' },
+	{ v: '4',  t: '4 · 偏稳' },
+	{ v: '5',  t: '5 · 标准（推荐）' },
+	{ v: '6',  t: '6 · 略灵敏' },
+	{ v: '7',  t: '7 · 灵敏' },
+	{ v: '8',  t: '8 · 很灵敏' },
+	{ v: '9',  t: '9 · 激进' },
+	{ v: '10', t: '10 · 极激进（可能来回跳）' }
+];
+
+/* 踢人方法。默认锁 1（相对比较）—— 只有它"只在确实存在更优 AP 时才动作"，
+ * 语义才等于"漫游灵敏度"。方法 2 在**没有更好 AP 时也会发 BTM 软踢**（官方
+ * CONFIGURE.md 明说），设备白扫一遍；3 = 1+2 是 OpenWrt 打包默认值。 */
+var ROAM_KICKING_OPTS = [
+	{ v: '1', t: '1 · 相对比较（推荐）' },
+	{ v: '0', t: '0 · 关闭（只观测不动作）' },
+	{ v: '2', t: '2 · 绝对信号（无更好 AP 时也会软踢）' },
+	{ v: '3', t: '3 · 两者（OpenWrt 出厂默认）' }
+];
+
+/* 高级覆盖项：k = UCI 选项名后缀（mesh.main.roam_<k>），t = 界面标签。
+ * 留空 = 跟随档位（输入框以"生效值"作 placeholder）。 */
+var ROAM_ADV = [
+	{ k: 'kicking',      t: '踢人方法',           kind: 'select' },
+	{ k: 'threshold',    t: '分数差阈值',         kind: 'num' },
+	{ k: 'minkick',      t: '连续评估次数',       kind: 'num' },
+	{ k: 'rssi_val',     t: '好信号门限 (dBm)',   kind: 'num' },
+	{ k: 'low_rssi_val', t: '差信号门限 (dBm)',   kind: 'num' },
+	{ k: 'rssi_center',  t: '加权中点 (dBm)',     kind: 'num' },
+	{ k: 'update',       t: '评估间隔 (秒)',      kind: 'num' },
+	{ k: 'bw',           t: '带宽门限 (Mbit/s)',  kind: 'num' }
+];
 
 return view.extend({
 	load: function () {
 		return Promise.all([
 			callMeshStatus(),
 			uci.load('wireless'),
-			uci.load('mesh')
+			uci.load('mesh'),
+			/* 漫游灵敏度（r57）：档位 / 总开关 / 高级覆盖项 / 后端算好的生效值。
+			   取不到不致命 —— render 里会显示"读取失败"并隐藏控件，而不是拿默认值
+			   去覆盖用户的真实配置。 */
+			callMeshExec('roam_show').catch(function () { return null; })
 		]).then(function (r) {
 			var status = r[0] || {};
+			var roamRaw = r[3] || null;
+			var roam = null;
+			if (roamRaw && roamRaw.stdout) {
+				try { roam = JSON.parse(roamRaw.stdout); } catch (e) { roam = null; }
+			}
 			var radios = (status.radios && status.radios.length) ? status.radios : [];
 			/* 每个射频各拉一次「可选功率表」+「当前功率」。失败不致命：
 			   下面 txField() 拿不到表时会退化成只读标签，不会给用户一个空下拉。 */
@@ -154,7 +203,7 @@ return view.extend({
 			})).then(function (arr) {
 				var tx = {};
 				arr.forEach(function (x) { tx[x.radio] = { list: x.list, info: x.info }; });
-				return { status: status, tx: tx };
+				return { status: status, tx: tx, roam: roam };
 			});
 		});
 	},
@@ -164,6 +213,7 @@ return view.extend({
 		payload = payload || {};
 		var status = payload.status || {};
 		var txData = payload.tx || {};
+		var roam = payload.roam || null;
 
 		var meshOn = (Number(status.enabled) === 1);
 		var isChild = meshOn && status.role === 'client';
@@ -468,6 +518,118 @@ return view.extend({
 
 		var radioSec = section(_('信道与带宽'), secRows);
 
+		/* ---------- 漫游引导（r57） ----------
+		 * 独立区块（不塞进「信道与带宽」—— 两者语义无关）。
+		 * 数据源 = 后端 meshctl roam_show（档位→dawn 参数的翻译在后端一处）；
+		 * 保存只写 mesh.main.roam_*，dawn 由后端 roam_apply 翻译 + reload_config（免重启）。 */
+		var roamState = { enabled: true, level: '5', adv: {}, changed: false };
+		if (roam) {
+			roamState.enabled = (Number(roam.enabled) === 1);
+			roamState.level = String(roam.level || 5);
+			var rov = roam.overrides || {};
+			ROAM_ADV.forEach(function (f) {
+				roamState.adv[f.k] = (rov[f.k] == null ? '' : String(rov[f.k]));
+			});
+		}
+
+		function roamEditable() {
+			return !isChild && !!roam && Number(roam.dawn) === 1;
+		}
+
+		function roamEff(k) {
+			var e = (roam && roam.effective) || {};
+			return (e[k] == null ? '—' : String(e[k]));
+		}
+
+		function roamSection() {
+			var rows = [];
+			if (!roam)
+				return section(_('漫游引导'), [ note(_('读取漫游设置失败：无法从后端获取档位信息，请刷新页面（Ctrl+F5）后重试。'), 'red') ]);
+			if (Number(roam.dawn) !== 1)
+				return section(_('漫游引导'), [ note(_('本节点未安装 dawn，无法设置漫游灵敏度。安装 dawn 后本区块会自动可用。'), 'orange') ]);
+
+			if (isChild)
+				rows.push(note(_('本节点是子节点：漫游灵敏度由主节点统一管理（每 10 秒自动同步），此处仅供查看。要改请到主节点上操作。'), 'orange'));
+			else if (!meshOn)
+				rows.push(note(_('当前未启用 Mesh 组网：漫游引导只在有多个 AP 节点时才有意义。'), 'orange'));
+
+			/* --- 灵敏度档位（先建，开关的监听要用到它） --- */
+			var levelSel = E('select', { 'class': 'cbi-input-select' });
+			ROAM_LEVELS.forEach(function (o) { levelSel.appendChild(E('option', { 'value': o.v }, _(o.t))); });
+			levelSel.value = roamState.level;
+
+			/* --- 总开关：关掉 = dawn kicking 0（只写日志"本来会踢谁"，不动作） --- */
+			var chk = E('input', { 'type': 'checkbox', 'id': 'mesh-roam-en' });
+			chk.checked = roamState.enabled;
+			chk.disabled = !roamEditable();
+			chk.addEventListener('change', function () {
+				roamState.enabled = chk.checked;
+				roamState.changed = true;
+				levelSel.disabled = !chk.checked || !roamEditable();
+			});
+			rows.push(row(_('启用漫游引导'), E('label', { 'class': 'mesh-roam-chk', 'for': 'mesh-roam-en' },
+				[ chk, _('让设备在节点之间自动切换到信号更好的那个') ])));
+
+			levelSel.disabled = !roamEditable() || !roamState.enabled;
+			levelSel.addEventListener('change', function () {
+				roamState.level = levelSel.value;
+				roamState.changed = true;
+			});
+			rows.push(row(_('灵敏度'), E('div', { 'class': 'mesh-roam-lv' }, [ levelSel ])));
+			rows.push(E('div', { 'class': 'mesh-muted' },
+				'· ' + _('档位越高越容易切换：1 最稳（除非另一节点明显更好，否则不动），5 是标准值（dawn 出厂默认），10 最激进（轻微优势就切，节点密集时可能来回跳）。')));
+			rows.push(E('div', { 'class': 'mesh-muted' },
+				'· ' + _('dawn 的评分是台阶式的，相邻档位未必有明显手感差异 —— 真正不同的是跨台阶的那几档。')));
+
+			/* --- 高级（可折叠）：留空 = 跟随档位，placeholder 显示当前生效值 --- */
+			var grid = E('div', { 'class': 'mesh-roam-grid' });
+			ROAM_ADV.forEach(function (f) {
+				var inp;
+				if (f.kind === 'select') {
+					inp = E('select', { 'class': 'cbi-input-select' });
+					inp.appendChild(E('option', { 'value': '' }, _('跟随档位')));
+					ROAM_KICKING_OPTS.forEach(function (o) { inp.appendChild(E('option', { 'value': o.v }, _(o.t))); });
+					inp.value = roamState.adv[f.k] || '';
+				} else {
+					inp = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': roamEff(f.k) });
+					inp.value = roamState.adv[f.k] || '';
+				}
+				inp.disabled = !roamEditable();
+				inp.addEventListener('change', function () {
+					roamState.adv[f.k] = inp.value;
+					roamState.changed = true;
+				});
+				grid.appendChild(E('div', { 'class': 'mesh-roam-field' }, [
+					E('label', {}, _(f.t)), inp
+				]));
+			});
+
+			var btnReset = E('button', { 'class': 'cbi-button cbi-button-neutral', 'type': 'button' }, _('全部跟随档位'));
+			btnReset.disabled = !roamEditable();
+			btnReset.addEventListener('click', function (ev) {
+				/* type=button 已显式写；这里再拦一次，防止某些主题下按钮落在 <form> 里 */
+				ev.preventDefault();
+				ev.stopPropagation();
+				ROAM_ADV.forEach(function (f) { roamState.adv[f.k] = ''; });
+				/* 控件同步回填成空（真正的写入在「保存并应用」时统一做） */
+				var els = grid.querySelectorAll('input, select');
+				for (var i = 0; i < els.length && i < ROAM_ADV.length; i++) els[i].value = '';
+				roamState.changed = true;
+			});
+
+			rows.push(E('details', { 'class': 'mesh-roam-adv' }, [
+				E('summary', {}, _('高级设置（一般不用改）')),
+				grid,
+				E('div', { 'class': 'mesh-btnrow' }, [ btnReset ]),
+				E('div', { 'class': 'mesh-muted' }, '· ' + _('留空 = 跟随档位；输入框里的灰色数字就是当前的生效值。')),
+				E('div', { 'class': 'mesh-muted' }, '· ' + _('「加权中点」只在踢人方法选 2 / 3 时生效；「好/差信号门限」影响 dawn 的评分台阶。'))
+			]));
+
+			return section(_('漫游引导'), rows);
+		}
+
+		var roamSec = roamSection();
+
 		/* ---------- 提示 ---------- */
 		var hint;
 		if (isChild) {
@@ -480,6 +642,30 @@ return view.extend({
 		}
 
 		/* ---------- 保存 ---------- */
+		/* 漫游灵敏度：只写 mesh.main.roam_*（dawn 由后端 roam_apply 翻译）。
+		   ★ 必须去重：uci.set 写相同值也会留下变更记录，进而触发一次无谓的
+		     uci.apply（若 wireless 恰好也在本次改动里，就是一次真正的无线重载）。 */
+		function roamCollect() {
+			if (!roamEditable()) return;
+			function mm(opt, val) {
+				var cur = uci.get('mesh', 'main', opt);
+				cur = (cur == null) ? '' : String(cur);
+				if (cur === val) return;
+				if (val === '') uci.unset('mesh', 'main', opt);
+				else uci.set('mesh', 'main', opt, val);
+				changed = true;
+				roamState.changed = true;
+			}
+			mm('roam_enabled', roamState.enabled ? '1' : '0');
+			mm('roam_level', roamState.level);
+			ROAM_ADV.forEach(function (f) {
+				var v = String(roamState.adv[f.k] == null ? '' : roamState.adv[f.k]).replace(/\s+/g, '');
+				/* 非整数一律当"跟随档位"（清空），绝不把坏值写进配置 */
+				if (v !== '' && !/^-?\d+$/.test(v)) v = '';
+				mm('roam_' + f.k, v);
+			});
+		}
+
 		function doSave() {
 			changed = false;
 			if (apEditable()) {
@@ -510,6 +696,12 @@ return view.extend({
 				if (txEditable()) setIfChanged(r.radio, 'txpower', txByBand[b]);
 			});
 
+			/* 漫游档位：记下"除了漫游还有没有别的改动" —— 只改漫游时不需要 wifi 重载，
+			   提示文案也就不该说"无线重启约 10~20 秒"。 */
+			var otherChanged = changed;
+			roamCollect();
+			var roamOnly = (!otherChanged && changed);
+
 			if (!changed) {
 				ui.addNotification(null, E('p', {}, _('没有需要保存的改动')), 'info');
 				return Promise.resolve();
@@ -526,8 +718,15 @@ return view.extend({
 					if (meshOn) return callMeshExec('wifi_ensure').catch(function () {});
 				})
 				.then(function () {
-					ui.addNotification(null, E('p', {},
-						_('已保存并应用：无线重启约 10~20 秒，期间连接可能中断。')), 'success');
+					/* dawn 配置不受 uci.apply 管辖（它只管 uci 配置）——必须显式让后端
+					   把 mesh.main.roam_* 翻译进 /etc/config/dawn 并 reload_config。
+					   无变化时后端不 commit、不 reload，所以这一步可以无条件调。 */
+					if (roamState.changed) return callMeshExec('roam_apply').catch(function () {});
+				})
+				.then(function () {
+					ui.addNotification(null, E('p', {}, roamOnly
+						? _('已保存：漫游灵敏度已生效（无需重启无线）。')
+						: _('已保存并应用：无线重启约 10~20 秒，期间连接可能中断。')), 'success');
 				}, function (e) {
 					ui.addNotification(null, E('p', {}, _('保存失败：%s').format(e)), 'danger');
 					return Promise.reject(e);
@@ -542,7 +741,7 @@ return view.extend({
 		});
 
 		/* 当前状态下有没有可改的项：发射功率恒可改，所以正常都会有；这里只兜「一个射频都没有」的极端情况 */
-		var anyEditable = apEditable() || countryEditable() || bands.some(function (b) {
+		var anyEditable = apEditable() || countryEditable() || roamEditable() || bands.some(function (b) {
 			return chanEditable(b) || htEditable() || txEditable();
 		});
 
@@ -552,10 +751,10 @@ return view.extend({
 				: E('div', { 'class': 'mesh-muted' }, '· ' + _('本页当前没有可修改的项。')),
 			E('div', { 'class': 'mesh-muted' }, [
 				E('div', {}, '· ' + _('本页只是「网络 → 无线」的快捷入口，两者共用同一份配置，改哪边都一样。')),
-				E('div', {}, '· ' + _('保存后无线会重载一次（约 10~20 秒），期间连接可能短暂中断。'))
+				E('div', {}, '· ' + _('保存后无线会重载一次（约 10~20 秒），期间连接可能短暂中断；只改漫游灵敏度时不会重启无线。'))
 			])
 		]);
 
-		return E('div', {}, [ hint, nameSec, radioSec, actSec ]);
+		return E('div', {}, [ hint, nameSec, radioSec, roamSec, actSec ]);
 	}
 });

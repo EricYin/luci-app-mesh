@@ -165,3 +165,19 @@
 .mesh-sig-row.mesh-sig-best { background: #eef7ee; border-color: #cfe6cf; }
 .mesh-sig-row.mesh-sig-best .mesh-sig-val { color: #2e7d32; }
 .mesh-sig-row.mesh-sig-best .mesh-sig-where { color: #3c763d; }
+
+/* ---------- 漫游引导区块（r57，WiFi 快速设置页） ---------- */
+.mesh-roam-lv { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mesh-roam-lv select { min-width: 220px; }
+.mesh-roam-chk { display: inline-flex; align-items: center; gap: 6px; }
+.mesh-roam-adv { margin-top: 10px; border-top: 1px dashed #e6e6e6; padding-top: 10px; }
+.mesh-roam-adv > summary { cursor: pointer; font-size: 13px; color: #4a6fa5; outline: none; }
+.mesh-roam-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+	gap: 8px 16px;
+	margin: 12px 0 4px;
+}
+.mesh-roam-field { display: flex; align-items: center; gap: 8px; }
+.mesh-roam-field label { flex: 0 0 auto; font-size: 13px; color: #555; white-space: nowrap; }
+.mesh-roam-field input, .mesh-roam-field select { flex: 1 1 auto; min-width: 90px; }
