@@ -7,6 +7,92 @@
 
 ---
 
+## r56（2026-10-09）
+新增「连接设备」页：查看本机各 AP 上关联的无线客户端，并可踢除 / 引导 / 测量。
+
+- **新菜单「网络 → Mesh 组网 → 连接设备」**（order 15，位于「组网状态」之后）。
+  **单一列表**（不按频段分组）列出每台设备，频段只标一个小标签（5G / 2.4G）：
+  名称、MAC、IP、在线/停用、信号(dBm)、协商速率(峰值)、实时速度、累计流量、
+  已连接时长、是否支持 802.11k/v、六个操作按钮。
+  名称与 IP 来自 `luci-rpc getDHCPLeases`（官方只读接口）按 MAC 关联。
+- **六种操作**：
+  1. **踢下线** —— `hostapd.<bss> del_client`，设备断开后自动重连。
+  2. **停用一段时长** —— 同上，带 `ban_time`；档位 `1 / 5 / 30 / 60 分钟 / 直到重启`。
+     停用状态**只存在 hostapd 内存里**，重启或无线重载即清空，不会永久拉黑。
+  3. **解除停用** —— 已停用的设备单独显示该按钮。
+  4. **引导到更优节点** —— `bss_transition_request`（802.11v BTM），**不断流**的软踢，
+     由客户端自行选择目标 AP。本期为简单版（不带候选列表）。
+  5. **查看各节点信号（方案 A）** —— 点击弹窗直接显示该设备在各节点/频段上的实测信号
+     （dBm，数值越大越好），数据来自 dawn 持续汇总的 hearing map，**无需翻日志、无需等待**。
+     dawn 不可用时（极少数固件）自动退回「测量周围信号」（`rrm_beacon_req` 一次性 11k 测量，
+     结果仍落在 hostapd 日志，多数手机只回空报告）。
+  6. 列表自动刷新（每 15 秒）+ 手动刷新按钮。
+- **只管理本机**：踢除/引导必须落到「客户端当前所在的那个 BSS」，而 BSS 是各节点本地的
+  hostapd 实例；页面顶部已注明。跨节点操作需要另开同步指令通道，本期不做。
+- ★★ **零新依赖**：踢除 / 引导 / 列表只使用固件自带的 hostapd ubus 接口，**不引入
+  dawn / usteer / nrsyncd**。「查看各节点信号」**能力自适应** —— 有 dawn 就直读它的
+  hearing map（现成数据），没有就退回 11k 一次性测量，功能只少一块、不会坏掉。
+- ★★ **抗版本漂移设计**（本页核心约束）：
+  - **能力探测**：后端用 `ubus -v list` 在运行时探测 hostapd 是否提供
+    `del_client` / `bss_transition_request` / `rrm_beacon_req` 等方法，结果进
+    `capabilities`；前端**按能力渲染按钮** —— 缺哪项就没有哪个按钮，而不是点了报错。
+  - **逐字段降级**：客户端对象的每个字段（signal / rate / bytes / airtime / rrm …）
+    都是「有则显示、无则省略」，不留空白占位、不显示 `undefined`。
+  - **整页降级**：hostapd ubus 完全不可用时，页面显示一行说明，不报错、不白屏。
+- **ACL 同步扩权**（`acl.d/luci-app-mesh.json`）：新增 `hostapd.*` 的只读方法
+  （`get_clients` / `get_status` / `list_bans` / `rrm_beacon_req`）、`luci-rpc getDHCPLeases`、
+  `iwinfo assoclist`、`dawn get_hearing_map` / `get_network`（方案 A 用），
+  以及写入方法（`del_client` / `bss_transition_request` / `rrm_beacon_req`）。
+  写法照抄官方 `luci-mod-network.json`：对象名用 `hostapd.*` 通配 + 方法白名单数组。
+- **数据来源**：列表走 `mesh exec clients`（= `meshctl clients`），**不是** `mesh status`
+  —— status 返回的是组网状态（enabled/role/peer…），里面没有 `bss`/`clients` 字段。
+  早期版本误用 status 取列表，导致页面永远显示空列表。
+- **改为单一列表，不再按 2.4G/5G 分组**：频段改在每台设备上标一个小标签。
+  分组会把同一家人的手机和笔记本拆到两个区块里，扫视与查找都更绕。
+- **速率与指标（本版重点，实测校准）**：
+  - ★ **方向约定（最易搞反）**：hostapd/iwinfo 的 rx/tx 都是 **AP 视角** ——
+    rx = 设备→AP（**上传 ↑**），tx = AP→设备（**下载 ↓**）。界面一律按**设备视角**显示：
+    ↓ 取 tx、↑ 取 rx。早期按字段名直出（↓rx ↑tx），被手机测速一眼识破是反的。
+  - ★ 修正 hostapd `rate` 的**数量级 bug**：单位是 **100 kbit/s**（不是 bps），
+    此前按 bps 显示成 216 Mbps，少一个数量级（校准：`×100k` 换算 ÷100000 与 MCS 对照）。
+  - ★ **协商速率用峰值，不用瞬时值**：iwinfo 的 rx/tx.rate 是「最近一帧用的档位」，实测在
+    17 Mbps ~ 2401 Mbps 之间跳（连带宽都跳成 20MHz）；内核 `thr`（期望吞吐）在接收型 /
+    多设备场景也不准（一台上传为主的手机 thr 只有 5 Mbps）。所以速率数字取**连入以来
+    max(rx,tx) 的峰值**（反映链路能力，不因空闲掉低），带宽/流数/MCS 取峰值那一轮，
+    形如 `协商 ↓2161 Mbps（160MHz · 2×2 · HE-MCS 10）`。**统一用 Mbps 单位**
+    （哪怕上千也显示成 `2161 Mbps`），不让用户去换算 Gbps。iwinfo 缺失时整项不显示。
+  - ★ **实时速度**：前端按 `bytes` 前后两帧做差（每 MAC 各自记时间戳），↓ 下载 ↑ 上传。
+    首帧 / 间隔异常 **显示 0**（不再整项隐藏，避免列表忽长忽短），第二轮起才有真实值。
+  - ★ **信号只显示原始 dBm**，不做「优秀/一般」分级（阈值是拍脑袋定的，反而让人怀疑数据）。
+  - ★ **已连接时长取代「空口占用」**：`airtime`（微秒）是「这台设备累计占用了多少空口时间」，
+    跟「连了多久」是两回事，且空闲设备 airtime 很小（实测只 54 秒却连了好几天），直接显示会被
+    误认为「经常掉线」。改用 iwinfo 的 `connected_time`（秒，→ 后端 `nconn`），显示成
+    「已连接 X 天 / 小时 / 分 / 秒」。
+  - ★ **累计流量**同样按设备视角（↓ 下载 = AP 的 tx，↑ 上传 = AP 的 rx）。
+  - ★ **`[object HTMLSpanElement]` 乱码 bug**：早期把设备的标签数组**嵌套**进 E() 的
+    children，真机 LuCI 的 E() 只摊平一层，嵌套数组被字符串化成
+    `Xiaomi-15-Pro[object HTMLSpanElement],[object HTMLSpanElement]`。已改为
+    `[nameText].concat(tags)` 摊平；离线模拟新增「stub 自检」+「真机 JSON 回放」挡回归。
+- **跨节点标注（本期）**：列表上半是连在本机的设备（可操作），下半是连在
+  **其他节点**的设备 —— 后者本机 hostapd 管不到，不给操作按钮，改为「去该节点管理」跳转链接。
+  - 判据：br-lan **内核桥转发表**（`mesh_brlan_fdb_tsv`，实时读）里该 MAC 的出口是
+    `bat0`（经 mesh 回程）而非本机无线口 `phy*-ap*`。两端实测完全对称。
+  - 为防误列（节点自身 MAC / batman 虚拟 MAC / 有线设备），**只保留有 DHCP 租约的**。
+    → 主节点是 DHCP 服务器，判据可靠；子节点没有租约 → 远端列表为空（降级为只显示本机，不猜测）。
+  - 目标 IP 来自 `registry.tsv`，且**仅当注册表里恰好一台子节点时**才给跳转链接；
+    多台时只提示「请登录该设备所在节点进行管理」—— 宁可不给链接，也不把用户送错节点。
+  - ★ 主节点视角可见全网设备的名称与 IP（它握全部租约），正好补上子节点「（未知设备）」的缺憾。
+- **方案 A 后端实现**（`meshctl`）：
+  - `mesh_hapd_caps_json` 新增 `dawn` 能力位（`ubus -v list dawn` 含 `get_hearing_map` 即真）。
+  - 新增 `cmd_client_signal_map <MAC>`：读 `dawn get_hearing_map` 取该设备在所有 BSSID 上的
+    信号（`@.*["<MAC>"]`），读 `dawn get_network` 取各 BSSID 的 `local` / `iface` / `hostname`
+    （`@.*["<BSSID>"].local` 判本机/远端），输出 `[{bssid,signal,freq,local,iface,node_host}]`。
+    ⚠ `jsonfilter` **不支持** `@.keys()`，BSSID 清单改用 grep 抓 17 位 MAC 串得到；
+    dawn 存 MAC 大小写不定，两种都试。登记进 rpcd 白名单（`client_signal_map`）。
+  - 前端「查看各节点信号」弹窗按信号值排序、最强一行标绿、区分本机/远端节点与频段。
+- **已知设计事实**：子节点上本机设备可能拿不到 IP 与主机名 —— 因为 DHCP 租约由**主节点**
+  发放，子节点本地无租约。此时这两项留空、设备名显示「（未知设备）」，不影响踢除/引导。
+
 ## r55（2026-10-08）
 WiFi 快速设置页新增「国家/地区代码」与「发射功率」两项，**只改本机、不下发子节点**。
 

@@ -40,6 +40,7 @@ root/etc/nginx/conf.d/mesh-sync.locations|/etc/nginx/conf.d/mesh-sync.locations|
 root/usr/share/luci/menu.d/luci-app-mesh.json|/usr/share/luci/menu.d/luci-app-mesh.json|644
 root/usr/share/rpcd/acl.d/luci-app-mesh.json|/usr/share/rpcd/acl.d/luci-app-mesh.json|644
 htdocs/luci-static/resources/view/mesh/overview.js|/www/luci-static/resources/view/mesh/overview.js|644
+htdocs/luci-static/resources/view/mesh/clients.js|/www/luci-static/resources/view/mesh/clients.js|644
 htdocs/luci-static/resources/view/mesh/settings.js|/www/luci-static/resources/view/mesh/settings.js|644
 htdocs/luci-static/resources/view/mesh/tools.js|/www/luci-static/resources/view/mesh/tools.js|644
 htdocs/luci-static/resources/view/mesh/wifi.js|/www/luci-static/resources/view/mesh/wifi.js|644

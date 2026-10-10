@@ -1547,6 +1547,524 @@ cmd_daemon() {
 	done
 }
 
+# ================= 连接设备（客户端查看 / 踢除 / 引导） =================
+# 底层全部走 ubus，**不依赖任何第三方组件**（hostapd 的 ubus 对象由 wpad/hostapd 自带）：
+#   hostapd.<bss> get_clients            关联客户端（信号/速率/字节/airtime/rrm 能力）
+#   hostapd.<bss> list_bans              封禁名单
+#   hostapd.<bss> del_client             踢下线 / 封禁 / 解封
+#   hostapd.<bss> bss_transition_request  802.11v 软踢（引导换 AP，不断流）
+#   hostapd.<bss> rrm_beacon_req         让客户端回报周围 AP 的实测信号
+#   luci-rpc getDHCPLeases               客户端主机名 / IP
+#
+# ★ 为什么 BSS 名必须靠 `ubus list 'hostapd.*'` 枚举、不能从 UCI 推：
+#   实测 AP 接口名（phy0-ap0 / phy1-ap0）是 hostapd 自己按 phy 生成的，UCI 的
+#   wifi-iface 节里**没有 ifname**（只有 device=radio0）。从 UCI 推不出正确的对象名。
+# ★ `ubus list <name>` 是**精确匹配**，所以通配必须写成 'hostapd.*' 并加引号。
+# ★ ubus 对象名里的方法名可能随 hostapd 版本增减 → 用 `ubus -v list` 运行时探测，
+#   结果进 capabilities，前端按能力渲染按钮，缺能力时降级为只读（不报错）。
+
+# 枚举本机所有 hostapd BSS 对象名（去掉 hostapd. 前缀，返回 phy0-ap0 这种 ifname）
+mesh_hapd_bss() {
+	ubus list 'hostapd.*' 2>/dev/null | sed -n 's/^hostapd\.//p'
+}
+
+# 探测某个 BSS 上是否存在指定 ubus 方法。用法：mesh_hapd_has <bss> <method>
+mesh_hapd_has() {
+	local bss="$1" m="$2"
+	[ -n "$bss" ] && [ -n "$m" ] || return 1
+	ubus -v list "hostapd.$bss" 2>/dev/null | grep -q "\"$m\""
+}
+
+# 能力探测（用第一个 BSS 代表；同一次 hostapd 启动下各 BSS 能力一致）。
+# 输出 JSON 片段 {"del_client":true,...}；一个 BSS 都没有时全 false。
+mesh_hapd_caps_json() {
+	local bss first="" d=0 b=0 p=0 l=0 g=0 s=0 w=0 dn=0
+	for bss in $(mesh_hapd_bss); do first="$bss"; break; done
+	if [ -n "$first" ]; then
+		mesh_hapd_has "$first" del_client            && d=1
+		mesh_hapd_has "$first" bss_transition_request && b=1
+		mesh_hapd_has "$first" rrm_beacon_req         && p=1
+		mesh_hapd_has "$first" list_bans              && l=1
+		mesh_hapd_has "$first" get_clients            && g=1
+		mesh_hapd_has "$first" get_status             && s=1
+	fi
+	# iwinfo 用于拿"协商速率"的明细（MCS / 空间流 / 带宽）—— hostapd 只给一个数。
+	# 不是所有固件都有 iwinfo，缺失时前端不显示协商速率即可（列表本身照常）。
+	ubus -v list iwinfo 2>/dev/null | grep -q '"assoclist"' && w=1
+	# dawn：提供「各节点信号」查询（get_hearing_map 汇总全网各 AP 实测信号），
+	# 让前端"查看各节点信号"能直接弹窗显示该设备在每个节点/频段上的实测信号，
+	# 不用再让用户去翻 hostapd 日志。缺失时前端退回「测量周围信号」（一次性 11k
+	# 测量，多数手机只回空报告，结果落在系统日志）。
+	ubus -v list dawn 2>/dev/null | grep -q '"get_hearing_map"' && dn=1
+	printf '{"bss_ok":%s,"get_clients":%s,"get_status":%s,"list_bans":%s,"del_client":%s,"bss_transition_request":%s,"rrm_beacon_req":%s,"iwinfo":%s,"dawn":%s}' \
+		"$([ -n "$first" ] && echo true || echo false)" \
+		"$([ "$g" = 1 ] && echo true || echo false)" \
+		"$([ "$s" = 1 ] && echo true || echo false)" \
+		"$([ "$l" = 1 ] && echo true || echo false)" \
+		"$([ "$d" = 1 ] && echo true || echo false)" \
+		"$([ "$b" = 1 ] && echo true || echo false)" \
+		"$([ "$p" = 1 ] && echo true || echo false)" \
+		"$([ "$w" = 1 ] && echo true || echo false)" \
+		"$([ "$dn" = 1 ] && echo true || echo false)"
+}
+
+# ---- 协商速率（iwinfo assoclist）----
+# hostapd 的 rate 只给一个数字，说不清"怎么协商出来的"；iwinfo 同时给出
+#   rate / mcs / nss / mhz / he，这才是用户能读懂的"协商速率"。
+# ★★ 单位（实测校准，别再搞错）：
+#   iwinfo   rate 单位 = kbit/s    → Mbps = rate / 1000（2161300 → 2161.3 Mbps）
+#   hostapd  rate 单位 = 100kbit/s → Mbps = rate / 100000（216130000 → 2161.3 Mbps）
+#   两者相差 100 倍。曾把 hostapd 的当 bps 处理 → 显示 216 Mbps（少一个数量级）。
+# 抓一次整个接口的 assoclist 存文件（每个 BSS 只调一次 ubus，别按设备重复调）。
+mesh_iwinfo_dump() {
+	local ifn="$1" f="$2"
+	[ -n "$ifn" ] && [ -n "$f" ] || return 1
+	ubus call iwinfo assoclist "{\"device\":\"$ifn\"}" >"$f" 2>/dev/null
+	[ -s "$f" ]
+}
+
+# 从 assoclist 文件里取某 MAC 的链路信息，结果放进全局变量：
+#   IW_THR（Mbps，整数，期望吞吐 —— **主用**的"协商速率"）
+#   IW_IDLE（毫秒，距上次收发 —— 用来判断这个速率还**可不可信**）
+#   IW_RX / IW_TX（Mbps，整数，瞬时速率，仅在 IW_THR 缺失时兜底）
+#   IW_MCS · IW_NSS · IW_MHZ · IW_HE（全部取 **tx 侧**，与 IW_THR 同向）
+#   IW_CT（秒，已连接时长 —— 用户要看的是"连了多久"，不是空口占用时长）
+# 取不到就全部留空 —— 调用方按"有则输出"处理。
+#
+# ★★ 为什么主数字用 thr 而不是 rx/tx.rate（实测踩过，别改回去）：
+#   rx/tx.rate 是"**最近一帧**实际用的档位"，跳动剧烈 —— 同一台设备连续采样出现过
+#   1921.5 / 2161.3 / 2401.9 Mbps，空闲时甚至掉到 17 Mbps，连 mcs/nss/mhz 都会
+#   跟着跳成 1/1/20（最后收发的可能是低速管理帧）。拿它当"协商速率"显示，
+#   用户会以为"我的 WiFi 只有 17 Mbps"。thr 是内核按链路能力算的期望吞吐，
+#   设备**在传数据时**稳定得多（连续采样 1.84 / 1.68 Gbps，只在 10% 内浮动）。
+#
+# ★★ 但 thr 也救不了"设备空闲"：实测一台锁屏的手机 thr 只有 5 Mbps / 20MHz
+#   （它活跃时是 1200 Mbps / 80MHz）。这不是插件算错，是内核在没有流量时
+#   没有样本可用。所以必须把 inactive 一并输出，让界面能标注"设备空闲中，
+#   该速率不代表链路能力"—— 否则用户还是会以为自己的 WiFi 只有 5 Mbps。
+mesh_iwinfo_client() {
+	local f="$1" mac="$2" m line rx tx thr idle ct
+	IW_RX=""; IW_TX=""; IW_THR=""; IW_IDLE=""; IW_CT=""; IW_MCS=""; IW_NSS=""; IW_MHZ=""; IW_HE=""
+	[ -s "$f" ] || return 0
+	[ -n "$JF" ] && [ -x "$JF" ] || return 0
+	m=$(printf '%s' "$mac" | tr 'a-f' 'A-F')
+	# 逐条输出再用 grep 定位该 MAC —— 不依赖 jsonfilter 的过滤语法是否支持
+	line=$("$JF" -s "$(cat "$f")" -e '@.results[*]' 2>/dev/null \
+		| sed 's/}[[:space:]]*{/}\n{/g' \
+		| grep -iE "\"mac\"[[:space:]]*:[[:space:]]*\"$m\"" | head -n1)
+	[ -n "$line" ] || return 0
+	rx=$("$JF" -s "$line" -e '@.rx.rate' 2>/dev/null)
+	tx=$("$JF" -s "$line" -e '@.tx.rate' 2>/dev/null)
+	thr=$("$JF" -s "$line" -e '@.thr' 2>/dev/null)
+	idle=$("$JF" -s "$line" -e '@.inactive' 2>/dev/null)
+	ct=$("$JF" -s "$line" -e '@.connected_time' 2>/dev/null)
+	case "$rx" in ''|*[!0-9]*) ;; *) IW_RX=$((rx / 1000));; esac
+	case "$tx" in ''|*[!0-9]*) ;; *) IW_TX=$((tx / 1000));; esac
+	case "$thr" in ''|*[!0-9]*) ;; *) IW_THR=$((thr / 1000));; esac
+	case "$idle" in ''|*[!0-9]*) ;; *) IW_IDLE=$idle;; esac
+	case "$ct" in ''|*[!0-9]*) ;; *) IW_CT=$ct;; esac
+	# 明细统一取 tx 侧（与 thr 同为 AP→设备方向），避免"下行数字 + 上行参数"的错位
+	IW_MCS=$("$JF" -s "$line" -e '@.tx.mcs' 2>/dev/null)
+	IW_NSS=$("$JF" -s "$line" -e '@.tx.nss' 2>/dev/null)
+	IW_MHZ=$("$JF" -s "$line" -e '@.tx.mhz' 2>/dev/null)
+	case "$IW_MCS" in ''|*[!0-9]*) IW_MCS="";; esac
+	case "$IW_NSS" in ''|*[!0-9]*) IW_NSS="";; esac
+	case "$IW_MHZ" in ''|*[!0-9]*) IW_MHZ="";; esac
+	if [ "$("$JF" -s "$line" -e '@.tx.he' 2>/dev/null)" = "true" ]; then
+		IW_HE=true
+	elif [ -n "$IW_MCS" ]; then
+		IW_HE=false
+	fi
+	return 0
+}
+
+# 该 BSS 属于哪个频段（由 get_status 的 freq 判定）以及 SSID
+mesh_hapd_bss_meta() {
+	local bss="$1" st freq ssid ch band
+	st=$(ubus call "hostapd.$bss" get_status 2>/dev/null)
+	freq=$(printf '%s' "$st" | sed -n 's/.*"freq"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+	ch=$(printf '%s' "$st" | sed -n 's/.*"channel"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+	ssid=$(printf '%s' "$st" | sed -n 's/.*"ssid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+	case "$freq" in
+		''|*[!0-9]*) band="?";;
+		*)
+			if [ "$freq" -lt 2500 ] 2>/dev/null; then band="2.4G"
+			elif [ "$freq" -lt 5900 ] 2>/dev/null; then band="5G"
+			else band="6G"; fi
+			;;
+	esac
+	printf '%s|%s|%s|%s' "${band:-?}" "${freq:--1}" "${ch:--1}" "$(mesh_esc "${ssid:--}")"
+}
+
+# 单个客户端对象 -> JSON 一行（字段"有则输出"，缺字段不填，前端据此降级）
+# 参数：mac(小写) <客户端属性 JSON>  ip hostname online banned [iwinfo文件] [node] [node_ip]
+#   iwinfo文件：该 BSS 的 assoclist 转储，用于协商速率；省略则无协商字段
+#   node:      local(连在本机) / remote(连在别的节点)
+#   node_ip:   remote 时目标节点的 IP（跳转链接用）
+mesh_client_json() {
+	local mac="$1" js="$2" ip="$3" name="$4" online="$5" banned="$6"
+	local iwf="$7" node="$8" node_ip="$9"
+	local sig rrx rtx brx btx arx atx v=""
+	# 用 jsonfilter 取字段；取不到就留空 —— 绝不写默认值冒充真实数据
+	if [ -n "$JF" ] && [ -x "$JF" ]; then
+		sig=$("$JF" -s "$js" -e '@.signal' 2>/dev/null)
+		rrx=$("$JF" -s "$js" -e '@.rate.rx' 2>/dev/null)
+		rtx=$("$JF" -s "$js" -e '@.rate.tx' 2>/dev/null)
+		brx=$("$JF" -s "$js" -e '@.bytes.rx' 2>/dev/null)
+		btx=$("$JF" -s "$js" -e '@.bytes.tx' 2>/dev/null)
+		arx=$("$JF" -s "$js" -e '@.airtime.rx' 2>/dev/null)
+		atx=$("$JF" -s "$js" -e '@.airtime.tx' 2>/dev/null)
+	fi
+	add_num() { # $1=键 $2=值；非纯数字（含空/错误串）则跳过
+		local k="$1" x="$2"
+		case "$x" in ''|*[!0-9-]*) return 0;; esac
+		v="$v${v:+,}\"$k\":$x"
+	}
+	add_num signal "$sig"
+	# ★ 不再输出 hostapd 的 rate_rx/rate_tx：它是"最近一次传输用的 PHY 速率"，
+	#   实测会在 192/216/240 Mbps 之间跳、空闲时掉到 0.6 Mbps，容易被当成"实时速度"。
+	#   真正要展示的两项由别处提供：协商速率（iwinfo，下方 nrx/ntx…）+
+	#   实时速度（前端按 bytes 前后两帧做差）。
+	#   bytes/airtime 保留 —— 它们是累计量，做差即实时速度、累加即总流量，语义明确。
+	add_num bytes_rx "$brx";   add_num bytes_tx "$btx"
+	add_num airtime_rx "$arx"; add_num airtime_tx "$atx"
+	# 802.11k/v 支持：get_clients 里有 rrm 数组即支持（数组本身是能力位）
+	local kv=false
+	if [ -n "$JF" ] && [ -x "$JF" ]; then
+		"$JF" -s "$js" -e '@.rrm[0]' >/dev/null 2>&1 && kv=true
+	fi
+	# 协商速率明细（iwinfo）—— 全部"有则输出"
+	local nv=""
+	if [ -n "$iwf" ]; then
+		mesh_iwinfo_client "$iwf" "$mac"
+		add_nv() { # $1=键 $2=值；空则跳过（数字键直接写值，字符串键加引号）
+			local k="$1" x="$2" q="$3"
+			[ -n "$x" ] || return 0
+			if [ "$q" = "s" ]; then x="\"$(mesh_esc "$x")\""; fi
+			nv="$nv${nv:+,}\"$k\":$x"
+		}
+		add_nv nthr "$IW_THR"; add_nv nidle "$IW_IDLE"; add_nv nconn "$IW_CT"
+		add_nv nrx "$IW_RX";   add_nv ntx "$IW_TX"
+		add_nv nmcs "$IW_MCS"; add_nv nnss "$IW_NSS"; add_nv nmhz "$IW_MHZ"
+		add_nv nhe  "$IW_HE"
+	fi
+	# node 恒输出（缺省 local）；node_ip 仅在真有值时才输出 —— 必须**整段**一起
+	# 判空，只给逗号加 ${var:+,} 会漏出 `"node_ip":""` 这种空字段（实测踩过）。
+	local nseg=""
+	[ -n "$node_ip" ] && nseg=",\"node_ip\":\"$(mesh_esc "$node_ip")\""
+	printf '{"mac":"%s","ip":"%s","hostname":"%s","online":%s,"banned":%s,"kv_capable":%s%s%s%s%s%s%s}' \
+		"$(mesh_esc "$(printf '%s' "$mac" | tr 'a-f' 'A-F')")" \
+		"$(mesh_esc "$ip")" "$(mesh_esc "$name")" \
+		"$online" "$banned" "$kv" \
+		"${v:+,}" "$v" \
+		"${nv:+,}" "$nv" \
+		",\"node\":\"$(mesh_esc "${node:-local}")\"" \
+		"$nseg"
+}
+
+# 全部 BSS + 客户端 + 租约 join -> JSON
+mesh_clients_json() {
+	local bss mac js meta band freq ch ssid ip name online banned
+	local raw leases bans neigh out="" line mU
+	local JFX=""
+	[ -n "$JF" ] && [ -x "$JF" ] && JFX="$JF"
+
+	# 租约：luci-rpc getDHCPLeases 是官方只读接口，比解析 /tmp/dhcp.leases 稳。
+	# 逐条取（jsonfilter 的 [*] 通配在本固件已验证可用），每条一行，便于后面 grep join。
+	leases=""
+	if [ -n "$JFX" ]; then
+		leases=$(ubus call luci-rpc getDHCPLeases 2>/dev/null | "$JFX" -e '@.dhcp_leases[*]' 2>/dev/null \
+			| sed 's/}[[:space:]]*{/}\n{/g')
+	fi
+
+	# 封禁名单：各 BSS 的 list_bans 合并（ban 是 per-BSS 的，同一 MAC 可能同时在多个 BSS 里）
+	bans=""
+	for bss in $(mesh_hapd_bss); do
+		bans="$bans$(ubus call "hostapd.$bss" list_bans 2>/dev/null \
+			| "$JFX" -e '@.clients[*]' 2>/dev/null | tr -d '"' )"$'\n'
+	done
+
+	# 在线表（ip neigh）：形如 "192.168.1.228 dev br-lan lladdr .. REACHABLE"
+	neigh=$(ip -4 neigh show 2>/dev/null)
+
+	# 协商速率：每个 BSS 抓一次 assoclist 存临时文件（tmpfs），循环内按 MAC 查。
+	local iwf=""
+	if ubus -v list iwinfo 2>/dev/null | grep -q '"assoclist"'; then
+		iwf="$MESH_TMP_DIR/.iwinfo.$$"
+	fi
+	[ -n "$iwf" ] && mkdir -p "$MESH_TMP_DIR" 2>/dev/null
+
+	for bss in $(mesh_hapd_bss); do
+		[ -n "$iwf" ] && mesh_iwinfo_dump "$bss" "$iwf.$bss"
+		meta=$(mesh_hapd_bss_meta "$bss")
+		band=${meta%%|*}; meta=${meta#*|}
+		freq=${meta%%|*}; meta=${meta#*|}
+		ch=${meta%%|*};   ssid=${meta#*|}
+		case "$freq" in ''|*[!0-9]*) freq=-1;; esac
+		case "$ch"   in ''|*[!0-9]*) ch=-1;;   esac
+
+		# 关联客户端：get_clients 返回 {"freq":N,"clients":{"<mac>":{...}}}。
+		# ★ 用 `jsonfilter -e '@.clients'` 取整个 clients 对象再抓 17 位 MAC 键 ——
+		#   不依赖 ubus 输出是否美化（换行/缩进多变），比 sed 范围匹配稳得多。
+		#   逐个 MAC 再用 @.clients["<mac>"] 取子对象。
+		local cl=""
+		raw=$(ubus call "hostapd.$bss" get_clients 2>/dev/null)
+		local macs=""
+		if [ -n "$JFX" ]; then
+			macs=$(printf '%s' "$raw" | "$JFX" -e '@.clients' 2>/dev/null \
+				| grep -o '"[0-9a-fA-F:]\{17\}"' | tr -d '"' | sort -u)
+		fi
+		for mac in $macs; do
+			js=$(printf '%s' "$raw" | "$JFX" -e "@.clients[\"$mac\"]" 2>/dev/null)
+			[ -n "$js" ] || continue
+			# join 租约（租约里 MAC 是大写，get_clients 的键是小写）
+			# ⚠ jsonfilter 输出形如 `"macaddr": "42:06:..."`（冒号后有空格），
+			#   匹配必须容忍可选空格 —— 写死 `"macaddr":"xx"` 会永远匹配不上。
+			mU=$(printf '%s' "$mac" | tr 'a-f' 'A-F')
+			ip=""; name=""
+			line=$(printf '%s\n' "$leases" | grep -iE "\"macaddr\"[[:space:]]*:[[:space:]]*\"$mU\"" | head -n1)
+			if [ -n "$line" ]; then
+				ip=$(printf '%s' "$line" | sed -n 's/.*"ipaddr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+				name=$(printf '%s' "$line" | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+			fi
+			# 在线判定：ip neigh 里该 IP 存在且状态不是 FAILED/INCOMPLETE
+			online=false
+			if [ -n "$ip" ] && printf '%s\n' "$neigh" | grep -q "^$ip "; then
+				printf '%s\n' "$neigh" | grep "^$ip " | grep -qvE 'FAILED|INCOMPLETE' && online=true
+			fi
+			# 封禁判定（大小写不敏感；bans 里可能是小写也可能是大写）
+			banned=false
+			[ -n "$bans" ] && printf '%s\n' "$bans" | grep -qi "^${mac}$" && banned=true
+			cl="$cl${cl:+,}$(mesh_client_json "$mac" "$js" "$ip" "$name" "$online" "$banned" \
+				"$iwf.$bss" "local")"
+		done
+		local cnt=0
+		[ -n "$cl" ] && cnt=$(printf '%s' "$cl" | grep -o '{"mac"' | wc -l)
+		out="$out${out:+,}{\"iface\":\"$(mesh_esc "$bss")\",\"band\":\"$band\",\"freq\":$freq,\"channel\":$ch,\"ssid\":\"$(mesh_esc "${ssid:--}")\",\"clients\":[$cl],\"count\":$cnt}"
+	done
+	[ -n "$iwf" ] && rm -f "$iwf".* 2>/dev/null
+	# 连在别的节点上的客户端（主节点才有；子节点无租约 → 空数组）
+	local rem=""
+	rem=$(mesh_remote_clients_json 2>/dev/null)
+	printf '{"capabilities":%s,"bss":[%s],"remote":[%s]}' \
+		"$(mesh_hapd_caps_json)" "$out" "$rem"
+}
+
+# ---- 连在「别的节点」上的客户端 ----
+#
+# 判据：br-lan 内核桥转发表里该 MAC 的出口是 bat0（= 经 mesh 回程），而不是本机
+#   无线口 phy*-ap*。转发表由 mesh_brlan_fdb_tsv() **实时读**内核（不是缓存）。
+#   实测两端完全对称、互相印证：
+#     主节点  32:D0:…|phy1-ap0（本机）   42:06:…|bat0（在子节点）
+#     子节点  42:06:…|phy1-ap0（本机）   32:D0:…|bat0（在主节点）
+# ★ 为什么还要拿租约过滤：bat0 上还挂着节点自身 MAC、batman 的虚拟 MAC、以及可能
+#   的有线设备，直接全列会冒出一堆不是客户端的东西。只保留**有 DHCP 租约**的，
+#   误列风险最小。→ 主节点是 DHCP 服务器，判据可靠；子节点没有租约，本函数
+#   自然返回空（降级为「只显示本机」，不做猜测）。
+# ★ 目标 IP：注册表里**恰好一台**子节点时才能唯一定位，多台时不猜 —— 宁可不给
+#   跳转链接，也不把用户送到错的节点上。
+mesh_remote_clients_json() {
+	local fdb="$MESH_TMP_DIR/fdb.tsv" reg="$MESH_REGISTRY"
+	local leases="" JFX="" mac ifn ip name line mU out="" node_ip="" n excl=""
+	[ -n "$JF" ] && [ -x "$JF" ] && JFX="$JF"
+	[ -n "$JFX" ] || return 0
+	mesh_brlan_fdb_tsv > "$fdb" 2>/dev/null
+	[ -s "$fdb" ] || return 0
+	leases=$(ubus call luci-rpc getDHCPLeases 2>/dev/null | "$JFX" -e '@.dhcp_leases[*]' 2>/dev/null \
+		| sed 's/}[[:space:]]*{/}\n{/g')
+	[ -n "$leases" ] || return 0
+
+	if [ -f "$reg" ]; then
+		n=$(grep -c '|' "$reg" 2>/dev/null)
+		[ "$n" = "1" ] && node_ip=$(sed -n 's/^[^|]*|\([^|]*\)|.*/\1/p' "$reg" | head -n1)
+		excl=$(cut -d'|' -f1 "$reg" 2>/dev/null | tr 'a-f' 'A-F')
+	fi
+	excl="$excl $(mesh_primary_mac 2>/dev/null | tr 'a-f' 'A-F')"
+
+	while IFS='|' read -r mac ifn; do
+		case "$ifn" in bat0) ;; *) continue;; esac
+		mU=$(printf '%s' "$mac" | tr 'a-f' 'A-F')
+		[ -n "$mU" ] || continue
+		printf '%s\n' "$excl" | grep -q "$mU" && continue
+		line=$(printf '%s\n' "$leases" | grep -iE "\"macaddr\"[[:space:]]*:[[:space:]]*\"$mU\"" | head -n1)
+		[ -n "$line" ] || continue
+		ip=$(printf '%s' "$line" | sed -n 's/.*"ipaddr"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+		name=$(printf '%s' "$line" | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+		out="$out${out:+,}$(mesh_client_json "$mU" "" "$ip" "$name" "true" "false" "" "remote" "$node_ip")"
+	done < "$fdb"
+	printf '%s' "$out"
+}
+
+# 找一个 MAC 当前所在的 BSS（用于踢除/引导：ubus 调用必须落到该 BSS 上）
+mesh_client_find_bss() {
+	local want="$1" bss mac raw
+	want=$(printf '%s' "$want" | tr 'a-f' 'A-F')
+	for bss in $(mesh_hapd_bss); do
+		raw=$(ubus call "hostapd.$bss" get_clients 2>/dev/null)
+		for mac in $(printf '%s' "$raw" | sed -n '/"clients"[[:space:]]*:[[:space:]]*{/,/^[[:space:]]*}[[:space:]]*$/p' \
+				| grep -o '"[0-9a-fA-F:]\{17\}"' | tr -d '"' | sort -u); do
+			[ "$(printf '%s' "$mac" | tr 'a-f' 'A-F')" = "$want" ] && { printf '%s' "$bss"; return 0; }
+		done
+	done
+	return 1
+}
+
+# MAC 规范化：统一小写（hostapd 的 ubus 接口吃小写）
+mesh_mac_lc() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
+mesh_mac_valid() { printf '%s' "$1" | grep -qiE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
+
+# 命令：列出连接设备
+cmd_clients() { mesh_clients_json; echo; }
+
+# 命令：踢除客户端，可顺带停用一段时间
+#   用法: meshctl client_kick <MAC> [秒]      秒=0/省略 -> 只踢不封
+cmd_client_kick() {
+	local mac="$1" sec="${2:-0}" bss ms
+	mesh_mac_valid "$mac" || { echo "错误：MAC 格式无效（$mac）"; return 1; }
+	case "$sec" in ''|*[!0-9]*) sec=0;; esac
+	ms=$(( sec * 1000 ))
+	# 只踢不封：该客户端可能已不在本机（比如刚漫游走），这时不算错误
+	bss=$(mesh_client_find_bss "$mac") || bss=""
+	if [ -z "$bss" ]; then
+		# 找不到关联点：若只是解封/封禁，仍需要对**所有** BSS 下发（ban 是 per-BSS 的）
+		local any=0
+		for b in $(mesh_hapd_bss); do
+			ubus call "hostapd.$b" del_client "{\"addr\":\"$(mesh_mac_lc "$mac")\",\"reason\":1,\"deauth\":true,\"ban_time\":$ms}" >/dev/null 2>&1 && any=1
+		done
+		[ "$any" = 1 ] || { echo "错误：未找到该设备（可能已离线）"; return 1; }
+	else
+		ubus call "hostapd.$bss" del_client "{\"addr\":\"$(mesh_mac_lc "$mac")\",\"reason\":1,\"deauth\":true,\"ban_time\":$ms}" >/dev/null 2>&1 \
+			|| { echo "错误：操作失败（$bss）"; return 1; }
+	fi
+	if [ "$sec" -gt 0 ] 2>/dev/null; then
+		echo "已将该设备踢下线并停用 $(( sec / 60 )) 分钟"
+	else
+		echo "已将该设备踢下线"
+	fi
+	return 0
+}
+
+# 命令：解除停用
+cmd_client_unban() {
+	local mac="$1" bss any=0
+	mesh_mac_valid "$mac" || { echo "错误：MAC 格式无效（$mac）"; return 1; }
+	for bss in $(mesh_hapd_bss); do
+		# ban_time=0 再踢一次即清空该 MAC 的封禁（hostapd 语义）
+		ubus call "hostapd.$bss" del_client "{\"addr\":\"$(mesh_mac_lc "$mac")\",\"reason\":1,\"deauth\":false,\"ban_time\":0}" >/dev/null 2>&1 && any=1
+	done
+	[ "$any" = 1 ] || { echo "错误：本机没有可用的无线接口"; return 1; }
+	echo "已解除对该设备的停用（它可重新连接）"
+	return 0
+}
+
+# 命令：引导客户端换到更优 AP（802.11v BSS Transition Management）
+#   一期：简单版 —— 只发请求、不带候选列表，由客户端自行选择目标。
+#   二期：把 dawn get_hearing_map 里该 MAC 的最强 BSSID 填进 neighbors（接口签名不变）。
+cmd_client_steer() {
+	local mac="$1" bss
+	mesh_mac_valid "$mac" || { echo "错误：MAC 格式无效（$mac）"; return 1; }
+	bss=$(mesh_client_find_bss "$mac") || { echo "错误：未找到该设备（可能已离线）"; return 1; }
+	mesh_hapd_has "$bss" bss_transition_request || { echo "错误：本固件的 hostapd 不支持 802.11v 引导"; return 1; }
+	# disassociation_imminent=false：温和引导，不会硬踢（客户端可拒绝）。
+	# 不传 neighbors —— hostapd 会用自己已配置的邻居报告列表（真机实测两端
+	#   rrm_nr_list 均非空：dawn 已通过 rrm_nr_set 把对端 BSSID 灌好），
+	#   所以这里无需插件自己拼邻居清单，11v 引导即可生效。
+	# 【二期】若想让引导更"定向"，可先 ubus call dawn get_hearing_map 取该 MAC
+	#   在各 AP 上的实测信号，选最强者 BSSID 组 neighbors 数组一起下发（格式：
+	#   {"neighbors":[{"bssid":"..","neighbor_rep":1,"op_class":..,"channel":..}]}）。
+	#   一期不做：dawn 的 hearing map 依赖其自身采样周期，冷启动时可能为空。
+	ubus call "hostapd.$bss" bss_transition_request \
+		"{\"addr\":\"$(mesh_mac_lc "$mac")\",\"disassociation_imminent\":false,\"abridged\":false}" >/dev/null 2>&1 \
+		|| { echo "错误：引导请求发送失败"; return 1; }
+	echo "已发送引导请求（若设备支持会自动选择更优的节点；不支持则无变化）"
+	return 0
+}
+
+# 命令：让客户端回报周围 AP 的实测信号（802.11k Beacon Report）
+#   一期：只把原始测量结果回显给用户看，不自动做任何决策。
+cmd_client_probe() {
+	local mac="$1" bss
+	mesh_mac_valid "$mac" || { echo "错误：MAC 格式无效（$mac）"; return 1; }
+	bss=$(mesh_client_find_bss "$mac") || { echo "错误：未找到该设备（可能已离线）"; return 1; }
+	mesh_hapd_has "$bss" rrm_beacon_req || { echo "错误：本固件的 hostapd 不支持 802.11k 测量请求"; return 1; }
+	# mode=1(主动) duration=100TU(约 100ms)。op_class/channel 用当前 BSS 的。
+	local meta ch
+	meta=$(mesh_hapd_bss_meta "$bss"); ch=$(printf '%s' "$meta" | cut -d'|' -f3)
+	case "$ch" in ''|*[!0-9]*) ch=1;; esac
+	ubus call "hostapd.$bss" rrm_beacon_req \
+		"{\"addr\":\"$(mesh_mac_lc "$mac")\",\"op_class\":0,\"channel\":$ch,\"duration\":100,\"mode\":1}" >/dev/null 2>&1 \
+		|| { echo "错误：测量请求发送失败"; return 1; }
+	# ★ 结果只落在系统日志里，必须把"去哪儿看"说全，否则用户点了按钮一头雾水：
+	#   hostapd 会把 BEACON-REQ-TX-STATUS（请求已发出）/ BEACON-RESP-RX（收到回报）
+	#   写进 syslog，LuCI 的「状态 → 系统日志」与 SSH 的 logread 看到的是同一份。
+	# ★ 另一个必须提前讲清的事实：多数手机即便支持 11k，回报里也是空报告（实测
+	#   小米 15 Pro 每次都回一串 0）。所以"日志里有 BEACON-RESP-RX 但没信号值"
+	#   是设备行为，不是插件没发出请求。真正有数值的周围信号在 dawn 的
+	#   hearing map 里（dawn 每 15 秒自动做一次同样的测量并汇总），见二期计划。
+	echo "已请求测量。查看结果：LuCI「状态 → 系统日志」搜索 BEACON-RESP，或 SSH 执行 logread | grep BEACON-RESP（设备不支持 11k 会无回应；很多手机只回空报告，属正常）"
+	return 0
+}
+
+# 命令：查看某设备在各节点（含本机与远端）的实测信号
+#   数据源 = dawn 持续汇总的结果，比一次性 11k 测量靠谱得多：
+#     get_hearing_map 结构 {SSID:{MAC:{BSSID:{signal,freq,score,...}}}}
+#       → @.*["<MAC>"] 抽出该设备在所有 BSSID 上的信号对象（各 SSID 同名设备合并）
+#     get_network     结构 {SSID:{BSSID:{channel,freq,local,iface,hostname,...}}}
+#       → 对每个候选 BSSID，反查它属于哪个 SSID、是否本机、接口名
+#   ★ jsonfilter 不支持 @.keys()，所以 BSSID 清单用 grep 抓 17 位 MAC 串得到，
+#     再逐个 @["<BSSID>"].signal 取值 —— 比硬枚举已知 BSSID 稳（远端节点 BSSID 本机不知）。
+#   ★ dawn 存的 MAC 大小写不定 → 大小写都试一次。
+#   ★ 区分「节点」的可用信息有限：本网两台设备主机名可能相同（实测都叫 ponwrt），
+#     所以界面主要靠 local 字段分「本机 / 其他节点」，远端附 BSSID 前缀供定位。
+#   输出 JSON 数组：[{bssid,signal,freq,local,iface,node_host}, ...]（空数组=无数据）。
+cmd_client_signal_map() {
+	local mac="$1" mU mL hm net obj bssids b sig freq loc ifc hst out="" bssid
+	mesh_mac_valid "$mac" || { echo "错误：MAC 格式无效（$mac）"; return 1; }
+	mU=$(printf '%s' "$mac" | tr 'a-f' 'A-F')
+	mL=$(printf '%s' "$mac" | tr 'A-F' 'a-f')
+	hm=$(ubus call dawn get_hearing_map 2>/dev/null)
+	[ -n "$hm" ] || { echo "错误：读取各节点信号失败（dawn 不可用）"; return 1; }
+	net=$(ubus call dawn get_network 2>/dev/null)
+	obj=""
+	if [ -n "$JF" ] && [ -x "$JF" ]; then
+		# 取该 MAC 在 hearing map 中的信号对象；大小写都试
+		obj=$(printf '%s' "$hm" | "$JF" -e "@.*[\"$mU\"]" 2>/dev/null)
+		[ -n "$obj" ] || obj=$(printf '%s' "$hm" | "$JF" -e "@.*[\"$mL\"]" 2>/dev/null)
+	fi
+	[ -n "$obj" ] || { printf '[]'; return 0; }
+	# 抽出所有 BSSID 键（17 位 MAC 串）；jsonfilter 取不到键名，用 grep 兜底
+	bssids=$(printf '%s' "$obj" | grep -oE '"[0-9A-Fa-f:]{17}"' | tr -d '"' | sort -u)
+	[ -n "$bssids" ] || { printf '[]'; return 0; }
+	for bssid in $bssids; do
+		sig=""; freq=""; loc="false"; ifc=""; hst=""
+		[ -n "$JF" ] && [ -x "$JF" ] && {
+			sig=$(printf '%s' "$obj" | "$JF" -e "@[\"$bssid\"].signal" 2>/dev/null)
+			freq=$(printf '%s' "$obj" | "$JF" -e "@[\"$bssid\"].freq" 2>/dev/null)
+		}
+		if [ -n "$net" ] && [ -n "$JF" ] && [ -x "$JF" ]; then
+			[ "$("$JF" -s "$net" -e "@.*[\"$bssid\"].local" 2>/dev/null)" = "true" ] && loc="true"
+			ifc=$(printf '%s' "$net" | "$JF" -e "@.*[\"$bssid\"].iface" 2>/dev/null)
+			hst=$(printf '%s' "$net" | "$JF" -e "@.*[\"$bssid\"].hostname" 2>/dev/null)
+		fi
+		case "$sig"  in ''|*[!0-9-]*) sig="";;  esac
+		case "$freq" in ''|*[!0-9]*)   freq="";; esac
+		# ★ 跳过没有信号值的 BSSID：dawn 的 hearing map 会保留每个 SSID 下**所有**
+		#   BSSID 的条目，即便该设备当前根本没连上去（signal 缺失）。这类空行放进
+		#   弹窗只会变成一堆"无数据"噪声 —— 用户要看的是"这台设备在各节点上的实测
+		#   信号"，没测到就不该占一行。
+		[ -n "$sig" ] || continue
+		local seg="\"bssid\":\"$(mesh_esc "$bssid")\""
+		seg="$seg,\"signal\":$sig"
+		[ -n "$freq" ] && seg="$seg,\"freq\":$freq"
+		seg="$seg,\"local\":$loc"
+		[ -n "$ifc" ] && seg="$seg,\"iface\":\"$(mesh_esc "$ifc")\""
+		[ -n "$hst" ] && seg="$seg,\"node_host\":\"$(mesh_esc "$hst")\""
+		out="$out${out:+,}{$seg}"
+	done
+	printf '[%s]' "$out"
+	return 0
+}
+
 # ================= 诊断 =================
 cmd_diag() {
 	local r band ch ht sec mode p ifn st bgw bgwrt h
@@ -2488,8 +3006,14 @@ case "$1" in
 	set-role)         shift; cmd_set_role "$@";;
 	button)           shift; cmd_button "$@";;
 	wifi_ensure)      cmd_wifi_ensure;;
+	clients)          cmd_clients;;
+	client_kick)      shift; cmd_client_kick "$@";;
+	client_unban)     shift; cmd_client_unban "$@";;
+	client_steer)     shift; cmd_client_steer "$@";;
+	client_probe)     shift; cmd_client_probe "$@";;
+	client_signal_map) shift; cmd_client_signal_map "$@";;
 	*)
-		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|backup-refresh|log|pair-open|pair-close|pair-status|pair-join|set-role|button|wifi_ensure>"
+		echo "用法: meshctl <apply|status|diag|sync|daemon|revert|confirm_rollback|port_bridging|backup-refresh|log|pair-open|pair-close|pair-status|pair-join|set-role|button|wifi_ensure|clients|client_kick|client_unban|client_steer|client_probe|client_signal_map>"
 		exit 1
 		;;
 esac

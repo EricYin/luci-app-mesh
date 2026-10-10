@@ -60,6 +60,7 @@ BUILTIN_MANIFEST='
 /usr/share/luci/menu.d/luci-app-mesh.json
 /usr/share/rpcd/acl.d/luci-app-mesh.json
 /www/luci-static/resources/view/mesh/overview.js
+/www/luci-static/resources/view/mesh/clients.js
 /www/luci-static/resources/view/mesh/settings.js
 /www/luci-static/resources/view/mesh/tools.js
 /www/luci-static/resources/view/mesh/wifi.js

@@ -1,16 +1,21 @@
 {
 	"luci-app-mesh": {
-		"description": "Grant access to Mesh 组网 (meshctl / uci mesh)",
+		"description": "Grant access to Mesh 组网 (meshctl / uci mesh). hostapd.*: the connection-device page needs get_clients/get_status/list_bans (read) and del_client/bss_transition_request/rrm_beacon_req (write). Note: del_client is also granted by LuCI's own luci-mod-network/luci-mod-status-index, so it is duplicated here on purpose for systems that ship a trimmed LuCI.",
 		"read": {
 			"uci": [ "mesh" ],
 			"ubus": {
-				"mesh": [ "status" ]
+				"mesh": [ "status" ],
+				"hostapd.*": [ "get_clients", "get_status", "list_bans", "rrm_beacon_req" ],
+				"luci-rpc": [ "getDHCPLeases" ],
+				"iwinfo": [ "assoclist" ],
+				"dawn": [ "get_hearing_map", "get_network" ]
 			}
 		},
 		"write": {
 			"uci": [ "mesh" ],
 			"ubus": {
-				"mesh": [ "exec" ]
+				"mesh": [ "exec" ],
+				"hostapd.*": [ "del_client", "bss_transition_request", "rrm_beacon_req" ]
 			}
 		}
 	}

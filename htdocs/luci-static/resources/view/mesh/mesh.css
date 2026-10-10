@@ -145,3 +145,23 @@
 
 /* 「WiFi 快速设置」页：每个频段的小标题（2.4 GHz / 5 GHz）。不设颜色，跟随主题。 */
 .mesh-band-title { margin: 14px 0 2px; font-size: 13px; }
+
+/* 「查看各节点信号」弹窗（r56 方案 A）：每行一个节点/频段，按信号强弱排序 */
+.mesh-sig-list { margin: 4px 0 2px; }
+.mesh-sig-row {
+	display: flex;
+	justify-content: space-between;
+	align-items: baseline;
+	padding: 7px 10px;
+	border: 1px solid #e3e3e3;
+	border-radius: 4px;
+	background: #fbfbfb;
+	color: #333;
+	margin-bottom: 6px;
+}
+.mesh-sig-where { font-size: 13px; color: #555; }
+.mesh-sig-val { font-family: monospace; font-size: 13px; color: #333; font-weight: 600; }
+/* 当前最强信号：浅绿底 + 绿字，与浅色主题一致（显式设色，暗色主题下也读得出） */
+.mesh-sig-row.mesh-sig-best { background: #eef7ee; border-color: #cfe6cf; }
+.mesh-sig-row.mesh-sig-best .mesh-sig-val { color: #2e7d32; }
+.mesh-sig-row.mesh-sig-best .mesh-sig-where { color: #3c763d; }
