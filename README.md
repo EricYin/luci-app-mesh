@@ -4,7 +4,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 两台 OpenWrt 路由器即可零布线组网：**主节点**作为上网网关出网、作为配置源；**子节点**插电自动跟随，全部物理端口并入内网。有网线时拉一根线即自动切换有线回程（二层直转、满线速），拔线无线回程无缝接管。全部操作在 LuCI 网页完成，无需命令行。
 
-- 当前版本：`1.0.0-r50`（`PKG_RELEASE` 50）
+- 当前版本：`1.0.0-r57`（`PKG_RELEASE` 57）
 - 适用固件：OpenWrt 21.02 ~ 24.10（opkg / `.ipk`）、OpenWrt 25.12+（apk / `.apk`）
 - 许可：Apache-2.0
 
@@ -14,7 +14,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 
 原生 LuCI 的「网络 → 无线」页是给进阶用户用的多接口、多频段界面；要自己拼一套 802.11s + batman-adv 组网，得手工写 wireless / network / dhcp / firewall 四套配置，还要处理子节点地址分发、信道一致、回程切换、配置同步一堆事。
 
-本插件把这些收进 4 个页面：
+本插件把这些收进 5 个页面：
 
 - **与原生「无线」页共存，不是替代**——插件只是 `wireless` 配置的另一个写入者。你在「WiFi 快速设置」页改的主节点无线配置，会顺着组网同步链路自动下发到子节点；原生页改也一样生效。
 - **相比 WDS / relayd / 纯 802.11r**：走标准 **802.11s mesh point + SAE**（不是 WDS 的私有四地址桥接），用 **batman-adv** 做路径选择（不是 relayd 的 ARP 代理），漫游用 **dawn + 802.11k/v** 引导（不是只靠客户端自己决定）。有线回程直接二层直转、不引入 batman 开销。
@@ -41,7 +41,9 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 |---|---|
 | 一键加入（配对） | 新节点免手工填参数：主节点点「开放加入」临时起一个配对信号（固件固定 SSID/密码，默认隐藏广播），子节点点「一键加入」连上来领取 Mesh ID 与回程密码并自动应用。窗口默认 10 分钟自动关闭，可改或设为常开；窗口关着时配对信号根本不存在，固定密码不构成风险 |
 | 按键一键组网（WPS 键） | 不用进网页：按机身 WPS 键即可组网，**按法即意图**（短按加入 / 中按开窗 / 长按退出）。出厂机开箱直接按即可，详见下文专章 |
-| WiFi 快速设置 | 给普通用户的简单无线入口：填 SSID / 选加密 / 选信道 / 选带宽，替代原生无线页的多接口多频段界面。通道宽度用「160 MHz · WiFi 6」这类人话标签，不用 `HE160` 黑话。与原生页共用同一份 `wireless` 配置 |
+| WiFi 快速设置 | 给普通用户的简单无线入口：填 SSID / 选加密 / 选信道 / 选带宽，替代原生无线页的多接口多频段界面。通道宽度用「160 MHz · WiFi 6」这类人话标签，不用 `HE160` 黑话。与原生页共用同一份 `wireless` 配置。另有**国家/地区代码**与**发射功率**两项（每节点各自设置，不参与同步） |
+| 漫游引导 | 手机在节点之间怎么切换，不用去改 dawn 的底层参数：一个总开关 + 10 档「灵敏度」，档位同时驱动 dawn 的分数差阈值与连续评估次数（档 5 = dawn 出厂默认，标「标准（推荐）」）。改完**同步到所有子节点**，且**不重启无线**即生效。另有 8 项高级参数可单独覆盖，留空即跟随档位 |
+| 连接设备 | 查看当前挂在各节点 AP 上的无线客户端（主机名 / IP / 信号 / 协商速率 / 上传下载速率 / 已连接时长），并可直接**踢下线**、**按档封禁**、**解除封禁**、**引导到更优节点**、**查看该设备在各节点的信号**。全部走固件自带的 hostapd ubus 接口，无第三方依赖；按钮按运行时探测到的能力渲染，缺能力就自动隐藏 |
 | 状态页直接选角色 | 组网状态页在未选角色时直接给「设为主节点 / 设为子节点」按钮，不必先跳去设置页；主节点会自动派生 Mesh ID 与回程密码 |
 | 能力自检 | 诊断与维护页顶部集中显示缺失项：驱动 mesh point / 完整版 wpad / kmod-batman-adv / batctl / 漫游引导 dawn / umdns。组网必需项缺失 → 红框；组网可用但缺 dawn 或 umdns → 橙框提醒（不影响组网，只是客户端不会被引导切换） |
 
@@ -51,7 +53,7 @@ OpenWrt LuCI 的无线 Mesh 组网插件（JavaScript 界面 + busybox ash 后�
 |---|---|
 | 回滚保护 | 应用后开启看护窗口（静态地址 120 秒 / DHCP 子节点 180 秒），到期管理地址不可达则自动还原组网前配置并重启；页面顶部出现「保留新配置 / 立即还原」确认条 |
 | 备份与还原 / 退出组网 | 首次启用自动把 wireless / network / dhcp / firewall 备份到 `/etc/mesh-backup/`（关闭再开启不覆盖）；「退出组网」用备份整份覆盖并重启，可完整恢复被删除的 WAN 口。组网状态页与诊断页两个入口，同一套逻辑 |
-| 无线漫游自愈 | 随包安装两个幂等自检脚本（`97-wifi-roaming` / `99-dawn-roaming`），默认开机自启 + 每分钟 cron 巡检：前者补齐 AP 的 802.11k 邻居报告 / 802.11v BTM / 802.11r FT，后者校正 dawn 广播地址与 umdns 网络绑定。只在检测到配置漂移时才落盘并重载，配置正常时一轮开销约等于一次 md5sum；脚本带 mesh 守卫，未启用组网时完全静默 |
+| 无线漫游自愈 | 随包安装两个幂等自检脚本（`97-wifi-roaming` / `99-dawn-roaming`），默认开机自启 + 每分钟 cron 巡检：前者补齐 AP 的 802.11k 邻居报告 / 802.11v BTM / 802.11r FT，后者校正 dawn 广播地址与 umdns 网络绑定，并把「漫游引导」的档位翻译进 dawn。只在检测到配置漂移时才落盘并重载，配置正常时一轮开销约等于一次 md5sum；脚本带 mesh 守卫，未启用组网时完全静默 |
 | 在线安装 / 升级 / 卸载 | 随包落地 `mesh-install`，一条命令升级或卸载，自动保留配置、补扫包管理器删不掉的残留文件 |
 | 诊断与维护页 | 能力检测、射频能力表、备份/还原、端口并入内网、日志（可附带 syslog）、软件版本 |
 
@@ -93,8 +95,8 @@ cp -r luci-app-mesh <openwrt>/package/luci-app-mesh
 
 make menuconfig    # LuCI → 3. Applications → luci-app-mesh 选 <M>
 make package/luci-app-mesh/compile V=s
-# 产物：bin/packages/<arch>/base/luci-app-mesh-1.0.0-r50.apk（25.12+）
-#                    bin/packages/<arch>/base/luci-app-mesh_1.0.0-r50_all.ipk（24.10-）
+# 产物：bin/packages/<arch>/base/luci-app-mesh-1.0.0-r57.apk（25.12+）
+#                    bin/packages/<arch>/base/luci-app-mesh_1.0.0-r57_all.ipk（24.10-）
 ```
 
 `LUCI_DEPENDS` 的 12 项依赖由包管理器自动解析，开箱即用；`/etc/config/mesh` 已声明 conffile，升级不会覆盖你的活配置。
@@ -119,8 +121,8 @@ opkg update && opkg install curl jsonfilter iwinfo iw uclient-fetch rpcd \
 
 ```sh
 # a. 包管理器装编译好的 ipk/apk
-apk add --allow-untrusted luci-app-mesh-1.0.0-r50.apk
-opkg install luci-app-mesh_1.0.0-r50_all.ipk
+apk add --allow-untrusted luci-app-mesh-1.0.0-r57.apk
+opkg install luci-app-mesh_1.0.0-r57_all.ipk
 
 # b. 或把整个项目目录传到设备上，运行直装脚本（按 MANIFEST 复制文件、重启 rpcd、启用服务）
 sh install.sh
@@ -140,7 +142,7 @@ sh /tmp/mesh-install.sh install
 
 # 升级（默认保留配置）
 mesh-install upgrade                       # 取最新
-mesh-install upgrade --ver=1.0.0-r50       # 指定版本
+mesh-install upgrade --ver=1.0.0-r57       # 指定版本
 mesh-install upgrade --no-keep-config      # 不保留：配置回到出厂默认值
 
 # 卸载（默认保留配置，卸载后自动拷回）
@@ -149,7 +151,7 @@ mesh-install uninstall --no-keep-config    # 连配置/还原点一起清
 mesh-install uninstall --revert            # 卸载前先退出组网（推荐在网机器用）
 
 # 离线 / 内网：本地包、源码压缩包或项目目录
-mesh-install install --from=/tmp/luci-app-mesh-1.0.0-r50.apk
+mesh-install install --from=/tmp/luci-app-mesh-1.0.0-r57.apk
 mesh-install upgrade --from=/tmp/luci-app-mesh-src.tar.gz
 mesh-install upgrade --from=/tmp/luci-app-mesh/        # 解压后的项目目录
 
@@ -187,12 +189,13 @@ mesh-install info
 
 ## 页面导览
 
-菜单在 **网络 → Mesh 组网**（另有顶层快捷入口 **网络 → WiFi 快速设置**）。
+菜单在 **网络 → Mesh 组网**（另有顶层快捷入口 **网络 → WiFi 快速设置**）。5 个页面同属该菜单组，页面顶部有主题自带的**页签栏**可互相切换；顶层那个「WiFi 快速设置」是同一个页面的快捷入口（`alias`），旧地址照旧可访问。
 
 | 页面 | 位置 | 看什么 / 能改什么 |
 |---|---|---|
 | **组网状态** | Mesh 组网 → 组网状态 | 运行状态卡片、一键加入（配对）卡片（含「退出组网」）、网络拓扑图、节点列表（连接时长/信号/链路质量，离线节点显示最后上报时间） |
-| **WiFi 快速设置** | Mesh 组网 → WiFi 快速设置（= 顶层「WiFi 快速设置」） | SSID / 加密 / 密码 / 信道 / 带宽。未组网全部可改；主节点回程频段信道锁定为「跟随回程」；子节点只读 |
+| **连接设备** | Mesh 组网 → 连接设备 | 本机各 AP 上关联的无线客户端：主机名 / IP / 频段 / 信号 / 协商速率 / 上下行速率 / 已连接时长。可**踢下线**、**按档封禁**（0 / 1 分 / 5 分 / 30 分 / 1 小时 / 直到重启）、**解除封禁**、**引导到更优节点**、**查看该设备在各节点的信号**。按钮按运行时探测到的 hostapd 能力渲染 |
+| **WiFi 快速设置** | Mesh 组网 → WiFi 快速设置（= 顶层「WiFi 快速设置」） | SSID / 加密 / 密码 / 信道 / 带宽，外加**国家/地区代码**与**发射功率**（这两项每节点各自设置、**不参与同步**，子节点也能改）。未组网全部可改；主节点回程频段信道锁定为「跟随回程」；其余同步项子节点只读。下半部分是**漫游引导**：总开关 + 10 档灵敏度 + 8 项高级参数（见上文「易用性」） |
 | **组网设置** | Mesh 组网 → 组网设置 | 一步组网（角色/Mesh ID/密码/加密/频段/信道/国家码/主节点地址）、一键加入（配对）设置、按键组网（WPS 键）档位、链路控制（RSSI 门限/最大邻居数/离线保留时长） |
 | **诊断与维护** | Mesh 组网 → 诊断与维护 | 能力检测（组网前置条件红/橙/绿框）、射频能力表、维护（刷新备份 / 退出组网-还原组网前配置 / 端口并入内网）、软件版本、日志（可附带 syslog） |
 
@@ -231,6 +234,8 @@ mesh-install info
 - **备份 / 还原 / 回滚语义**：`/etc/mesh-backup/` 只在首次启用时创建，停用再启用**不覆盖**；「退出组网」= 备份整份覆盖回 wireless/network/dhcp/firewall + `enabled=0` + 删备份 + 生效；自动回滚到期不可达时走同一条还原路径。
 - **防静默失败**：能力缺失（wpad / kmod-batman-adv / batctl）在诊断页红框明示 + apply 强制拦截；`capabilities` 中 `batctl` 独立于内核模块判定，避免「模块在、工具缺」时界面假绿。
 - **漫游配置自愈（为什么用轮询而不是事件）**：本系列固件**不发 procd 的 `config.change` 事件**（命令行 `uci commit` 与 LuCI 的 `uci apply` 两条路径实测都不发），而 LuCI 无线页保存会**重写整段 wireless**，把 `rrm_neighbor_report` / `rrm_beacon_report` 这类它不认识的项直接冲掉。因此 `97-wifi-roaming` / `99-dawn-roaming` 采用每分钟 cron 巡检：配置未变时一轮只做一次 md5 比较即退出，检测到差异才 `uci commit` 并后台重载。两者都是**差异修复器**而非配置器——只补缺失项、不重写已正确的项，所以不会每次巡检都断一次无线。
+- **漫游档位的唯一真源与「免重启生效」**：漫游灵敏度存在 `mesh.main.roam_*`（UCI），`/etc/config/dawn` 只是产物 —— 避免"两处真源互相覆盖"。档位 → dawn 参数的翻译只在后端一处（`mesh_roam_effective()`，前端不维护档位表）；生效走 `ubus call dawn reload_config`（实测 dawn 进程不重启、邻居视图不丢），老版本 dawn 没有该方法时自动退回 `service dawn restart`。⚠ `99-dawn-roaming` 的快速跳过哈希**必须包含 `/etc/config/mesh`** —— 否则"用户改了档位、dawn 还没变"时哈希不变，整轮巡检被跳过，档位永远落不了地（r57 修）。
+- **为什么「连接设备」不需要任何第三方组件**：踢人/引导/测量全部走固件自带的 `ubus hostapd.<bss>` 对象（`del_client` / `bss_transition_request` / `rrm_beacon_req` / `get_clients` / `list_bans`），不需要 `hostapd_cli`。BSS 名靠 `ubus list 'hostapd.*'` 枚举（AP 段的 `ifname` 是 hostapd 按 phy 生成的，从 UCI 推不出来），方法存在性用 `ubus -v list` 运行时探测 → 抗版本漂移；缺哪个能力就隐藏对应按钮。
 - **mesh 守卫**：两个脚本都以 `/etc/config/mesh` 的 `enabled` 为总开关。安装时默认 `enable`（开机自启）+ `cron_enable`（每分钟巡检），但在未启用组网的设备上（`enabled != 1`）一律静默退出——**装包本身不会改动无线配置**；卸载时 `prerm` 自动清掉 cron 条目与自启链接。
 
 ---
@@ -289,15 +294,16 @@ luci-app-mesh/
 │   └── scripts/check-manifest.sh             #   校验 MANIFEST / Makefile / 内置清单一致
 ├── htdocs/luci-static/resources/view/mesh/   # LuCI JS 界面
 │   ├── overview.js                           #   组网状态
+│   ├── clients.js                            #   连接设备（客户端管理 / 踢人 / 引导）
+│   ├── wifi.js                               #   WiFi 快速设置 + 漫游引导
 │   ├── settings.js                           #   组网设置
 │   ├── tools.js                              #   诊断与维护
-│   ├── wifi.js                               #   WiFi 快速设置
 │   └── mesh.css
 └── root/
     ├── etc/config/mesh                       # 默认 UCI 配置（conffile 保护，升级不丢活配置）
     ├── etc/init.d/mesh                       # procd 守护服务（S99，respawn）
     ├── etc/init.d/97-wifi-roaming            # 漫游自检：补齐 AP 的 802.11k/11v/11r（开机自启 + cron）
-    ├── etc/init.d/99-dawn-roaming            # 漫游自检：校正 dawn 广播地址 / umdns 绑定
+    ├── etc/init.d/99-dawn-roaming            # 漫游自检：校正 dawn 广播地址 / umdns 绑定，并翻译漫游档位
     ├── etc/hotplug.d/iface/30-mesh-bat-mtu   # 接口 up 时事件驱动补 bat0 hardif MTU
     ├── etc/uci-defaults/40-luci-app-mesh-roaming  # 预装固件首次开机补 cron/自启（跑完自删）
     ├── etc/rc.wps/10-mesh                    # WPS 按键一键组网
@@ -316,13 +322,13 @@ luci-app-mesh/
 >
 > **为什么有 `version` 文件**：包数据库的版本会撒谎 —— 真机上 apk 记的是随固件编进来的旧版本，实际文件早被手动覆盖，"要不要升级"因此判不准。该文件随每次安装/升级被覆盖，永远等于真实落地版本。
 
-`meshctl` 子命令：`apply`（应用组网）、`status`（状态 JSON）、`diag`（诊断输出）、`sync`（手动同步一次）、`daemon`（守护循环）、`revert`（退出组网-还原组网前配置）、`confirm_rollback`（保留新管理地址）、`port_bridging`（端口并入内网）、`set-role`（只落角色配置不应用）、`button`（WPS 按键分档动作）、`pair-open` / `pair-close` / `pair-status` / `pair-join`（配对窗口与加入）、`backup-refresh`（以当前配置重建还原点）、`log`（读日志，可附 syslog）、`wifi_ensure`（保存无线后补一次 AP 自愈）。
+`meshctl` 子命令：`apply`（应用组网）、`status`（状态 JSON）、`diag`（诊断输出）、`sync`（手动同步一次）、`daemon`（守护循环）、`revert`（退出组网-还原组网前配置）、`confirm_rollback`（保留新管理地址）、`port_bridging`（端口并入内网）、`set-role`（只落角色配置不应用）、`button`（WPS 按键分档动作）、`pair-open` / `pair-close` / `pair-status` / `pair-join`（配对窗口与加入）、`backup-refresh`（以当前配置重建还原点）、`log`（读日志，可附 syslog）、`wifi_ensure`（保存无线后补一次 AP 自愈）、`clients`（客户端列表 JSON）、`client_kick` / `client_unban` / `client_steer` / `client_probe`（踢下线 / 解封 / 引导 / 测周围信号）、`roam_show` / `roam_apply`（读漫游档位与生效值 / 落地到 dawn）。
 
 ---
 
 ## 运维备忘
 
-- ★ **升级不能只换 `meshctl`**：包里有 21 个文件（见 `MANIFEST`），真机核对时发现过某些节点的 `meshctl`、`mesh-sync` 落后（只单独 wget 过其中几个）。核对办法：本地 `md5sum` 全部文件，设备上逐个 `md5sum` 比对。用 `mesh-install upgrade` 可避免这个问题。
+- ★ **升级不能只换 `meshctl`**：包里有 22 个文件（见 `MANIFEST`），真机核对时发现过某些节点的 `meshctl`、`mesh-sync` 落后（只单独 wget 过其中几个）。核对办法：本地 `md5sum` 全部文件，设备上逐个 `md5sum` 比对。用 `mesh-install upgrade` 可避免这个问题。
   - `/etc/config/mesh` **各节点本就不同**（含自己的 role / 凭证），不要覆盖。
   - `/etc/uci-defaults/40-luci-app-mesh-roaming` 在设备上 MISSING 是**正常的**，OpenWrt 首次启动跑完就会删掉这个文件。
 - ★ **关于 LuCI「迁移配置」弹窗（r39 已治本）**：r39 起本工具建的无线段全是具名段（`xxmesh_*`）、接口成员按固件语法写 `device`，**不会再因为本工具的配置弹迁移**。固件自带 / 用户自己建的匿名段仍会弹，那与插件无关；即便用户点了迁移把段名改掉，本工具也能靠 `mesh_managed=1` 标记把自己建的段找回来（旧版本则会因此失联：状态文件里的名字失效 → 每轮新建一段）。
@@ -359,6 +365,6 @@ Apache-2.0，见 [LICENSE](LICENSE)。
 
 完整版本历史见 **[CHANGELOG.md](CHANGELOG.md)**。最近三版：
 
-- **r50** — 新增「WiFi 快速设置」页（人话带宽标签）；能力检测移到诊断与维护；标签栏加 WiFi 快速设置；节点列表连接时长换算成「天/小时/分」。
-- **r49** — 配对信号默认隐藏广播（不广播 SSID），新增 `main.pair_hidden` 开关。
-- **r48** — 配对链路失败可追溯：两端补日志点 + 限流 + 超时后一次性状态码探测。
+- **r57** — 新增「漫游引导」：总开关 + 10 档漫游灵敏度（档 5 = dawn 出厂默认），改完**同步到所有子节点**且**不重启无线**即生效；修掉一个会让档位永远落不了地的 dawn 巡检哈希漏项；「WiFi 快速设置」移入 `Mesh 组网` 菜单组，与其余 4 页共用主题自带页签栏。
+- **r56** — 新增「连接设备」页：查看本机各 AP 上的无线客户端，可踢下线 / 按档封禁 / 解除封禁 / 引导到更优节点 / 查看该设备在各节点的信号。全部走固件自带的 hostapd ubus 接口，**无第三方依赖**，按钮按运行时能力渲染。
+- **r55** — 「WiFi 快速设置」新增「国家/地区码」与「发射功率」两项（各节点自管，不参与同步）。
