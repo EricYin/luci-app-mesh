@@ -213,7 +213,7 @@ bat_json() {
 	printf '{"enabled":%s,"gw":"%s"}' "$en" "$gw"
 }
 
-# 漫游灵敏度档位（r57）：**原样下发** mesh.main.roam_*（空串 = 跟随档位）。
+# 漫游灵敏度档位（r57）：**原样下发** mesh.main.roam_*（空串 = 用默认值）。
 # 下发"用户意图"而不是"翻译结果"，两端用同一个 mesh_roam_effective() 推导生效值，
 # 所以主/子不会算出不同结果；子节点上也能显示「档位 5」而不是一堆裸数字。
 # ⚠ 字段名必须与 mesh.main 的选项名完全一致 —— 子节点 mesh_uci_mirror_roam 直接

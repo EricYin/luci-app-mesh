@@ -22,7 +22,14 @@ start_service() {
 }
 
 stop_service() {
-	# 兜底：清理可能残留的历史进程（旧版非 procd 方式拉起的）
+	# ★ 本行在本固件上是**死代码**：busybox 未编 pkill（`command -v pkill` 失败、
+	#   `busybox pkill` 报 applet not found、直接调用 rc=127），报错又被 2>/dev/null 吞掉。
+	#   保留原因：部分固件（装了 procps 的）确有 pkill，这一行能兜底清理"旧版非 procd
+	#   方式拉起"的残留进程；本函数返回值与行为都不依赖它。
+	#   已实测**不会**引发双启动/重启竞争：本函数返回后 procd_kill 立刻删掉实例，
+	#   而 respawn.timeout=5s 才可能重启，两者相隔毫秒级 —— pkill 永远来不及插手。
+	#   （别改成 `killall meshctl`：busybox 按进程名匹配，而 comm = 脚本 basename，
+	#     会把同步子 shell 一起杀掉。）
 	pkill -f 'meshctl daemon' 2>/dev/null
 	return 0
 }

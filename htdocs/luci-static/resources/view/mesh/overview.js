@@ -655,15 +655,23 @@ function pairSection(d) {
 	   子节点这一段必须强调"先别应用"：凭证还没领到时跑 apply 必然报
 	   「子节点没有 Mesh ID」，那是预期内的失败，不该让用户以为是坏了。 */
 	if (!roleSet || !on) {
+		/* ★ 三种"还没开始"的态，措辞三条硬规矩：
+		   · 不写"已是主节点"这种断言 —— 出厂默认的 role=master 不是用户选的，
+		     断言会让人以为"谁动过我的配置"；
+		   · 用**真实按钮名**指路，不写"点下面的按钮"（下面有两个按钮，没有叫"启用"的）；
+		   · 不能笼统写"只写配置" —— 「成为主节点（一键组网）」是**会应用**的
+		     （重载无线，中断 10~30 秒），只有「成为子节点」才是只写配置。
+		   另外：出厂设备上这一态**并没有出错**，所以用中性色（非红非橙）；
+		   真正的异常（没选角色 / 已设主节点但没 apply）才用红框。 */
 		if (!roleSet) {
 			box.appendChild(E('div', { 'class': 'mesh-note red' },
-				_('本节点还没选角色，组网不会生效。选一个就能继续（只写配置，不改网络、不重启无线）：')));
+				_('本节点还没选角色，组网不会生效。选一个角色就能继续：')));
 		} else if (isClient) {
-			box.appendChild(E('div', { 'class': 'mesh-note orange' },
-				_('本节点已是子节点，但 Mesh 组网当前未启用。点下面的按钮启用它（只写配置）：')));
+			box.appendChild(E('div', { 'class': 'mesh-note' },
+				_('本节点当前角色是「子节点」，但组网还没启用。点下面的「成为子节点（跟随主节点）」继续（只写配置，不改网络），之后按提示点「一键加入」领凭证。')));
 		} else {
-			box.appendChild(E('div', { 'class': 'mesh-note orange' },
-				_('本节点已是主节点，但 Mesh 组网当前未启用。点下面的按钮启用它（只写配置）：')));
+			box.appendChild(E('div', { 'class': 'mesh-note' },
+				_('本节点当前角色是「主节点」（出厂默认值），但组网还没启用。点下面的「成为主节点（一键组网）」即启用并应用配置（会短暂重载无线）；若这台要当子节点，改点另一个按钮。')));
 		}
 
 		var pickRow = E('div', { 'class': 'mesh-btnrow' });
@@ -841,7 +849,7 @@ function buildBody(d) {
 	if (d.role_set === 0) {
 		roleBox = E('div', { 'class': 'mesh-note red' });
 			roleBox.textContent = _('未设置本节点角色：/etc/config/mesh 里没有 mesh.main.role，组网不会生效。')
-				+ ' ' + _('直接在下面「一键加入」区块里点「设为主节点」或「设为子节点」即可（也可到「组网设置」页改，或执行：uci set mesh.main.role=master; uci commit mesh）');
+				+ ' ' + _('直接在下面「一键加入」区块里点「成为主节点（一键组网）」或「成为子节点（跟随主节点）」即可（也可到「组网设置」页改，或执行：uci set mesh.main.role=master; uci commit mesh）');
 	}
 
 	/* 运行状态卡片 */

@@ -1358,7 +1358,7 @@ mesh_umdns_cap() { mesh_pkg_cap umdns; }
 #
 #   roam_enabled        0/1     总开关（0 = dawn kicking 0：只写日志不动作）
 #   roam_level          1..10   灵敏度档位（默认 5 = dawn 出厂值）
-#   —— 以下为「高级」覆盖项，**留空 = 跟随档位 / 用内置默认** ——
+#   —— 以下为「高级」覆盖项，**留空 = 用默认值**（仅 threshold/minkick 的默认来自档位）——
 #   roam_kicking        0..3    踢人方法（默认 1）
 #   roam_threshold      int     分数差阈值（默认跟随档位）
 #   roam_minkick        int     连续评估次数（默认跟随档位）
@@ -1534,7 +1534,7 @@ mesh_dawn_reload() {
 
 # 子节点：把主节点下发的 roam 块镜像到本机 mesh.main.roam_*。
 # 语义与 mesh_uci_mirror_aps 一致 —— 主节点该字段为空则子节点 **unset**，
-# 防止子节点残留旧的单项覆盖（主节点已改回"跟随档位"、子节点却还在用旧值）。
+# 防止子节点残留旧的单项覆盖（主节点已改回"用默认值"、子节点却还在用旧值）。
 # $1 = 同步 JSON。返回 0 = mesh 配置有改动（调用方负责 uci commit mesh）。
 mesh_uci_mirror_roam() {
 	local json="$1" o v cur changed=0

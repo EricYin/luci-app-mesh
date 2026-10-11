@@ -151,16 +151,19 @@ var ROAM_LEVELS = [
 
 /* 踢人方法。默认锁 1（相对比较）—— 只有它"只在确实存在更优 AP 时才动作"，
  * 语义才等于"漫游灵敏度"。方法 2 在**没有更好 AP 时也会发 BTM 软踢**（官方
- * CONFIGURE.md 明说），设备白扫一遍；3 = 1+2 是 OpenWrt 打包默认值。 */
+ * CONFIGURE.md 明说），设备白扫一遍；3 = 1+2 是固件打包默认值。
+ * s = 短名，只用于需要把生效值嵌进括号的场合（见下方"自动（…）"空选项）。 */
 var ROAM_KICKING_OPTS = [
-	{ v: '1', t: '1 · 相对比较（推荐）' },
-	{ v: '0', t: '0 · 关闭（只观测不动作）' },
-	{ v: '2', t: '2 · 绝对信号（无更好 AP 时也会软踢）' },
-	{ v: '3', t: '3 · 两者（OpenWrt 出厂默认）' }
+	{ v: '1', t: '1 · 相对比较（推荐）', s: '相对比较' },
+	{ v: '0', t: '0 · 关闭（只观测不动作）', s: '关闭' },
+	{ v: '2', t: '2 · 绝对信号（无更好 AP 时也会软踢）', s: '绝对信号' },
+	{ v: '3', t: '3 · 两者（固件出厂默认）', s: '两者' }
 ];
 
 /* 高级覆盖项：k = UCI 选项名后缀（mesh.main.roam_<k>），t = 界面标签。
- * 留空 = 跟随档位（输入框以"生效值"作 placeholder）。 */
+ * 留空 = 用默认值（数字框把生效值当 placeholder，下拉框把生效值拼进"自动（…）"）。
+ * ⚠ 只有 threshold / minkick 的默认值来自灵敏度档位，其余 6 项是**固定默认** ——
+ *   所以统一说"默认值"，不说"跟随档位"（后者对那 6 项是错的，会让人以为档位能改它们）。 */
 var ROAM_ADV = [
 	{ k: 'kicking',      t: '踢人方法',           kind: 'select' },
 	{ k: 'threshold',    t: '分数差阈值',         kind: 'num' },
@@ -581,13 +584,18 @@ return view.extend({
 			rows.push(E('div', { 'class': 'mesh-muted' },
 				'· ' + _('dawn 的评分是台阶式的，相邻档位未必有明显手感差异 —— 真正不同的是跨台阶的那几档。')));
 
-			/* --- 高级（可折叠）：留空 = 跟随档位，placeholder 显示当前生效值 --- */
+			/* --- 高级（可折叠）：留空 = 用默认值；placeholder / "自动（…）" 显示生效值 --- */
 			var grid = E('div', { 'class': 'mesh-roam-grid' });
 			ROAM_ADV.forEach(function (f) {
 				var inp;
 				if (f.kind === 'select') {
 					inp = E('select', { 'class': 'cbi-input-select' });
-					inp.appendChild(E('option', { 'value': '' }, _('跟随档位')));
+					/* 空选项必须**如实**说明它等于什么：踢人方法的默认值不来自档位（恒 1），
+					   写成"跟随档位"会让人以为档位能改它 —— 把生效值拼进标签。 */
+					var kEff = roamEff(f.k), kShort = '';
+					ROAM_KICKING_OPTS.forEach(function (o) { if (o.v === kEff) kShort = o.s; });
+					inp.appendChild(E('option', { 'value': '' },
+						kShort ? _('自动（%s）').format(_(kShort)) : _('自动（默认）')));
 					ROAM_KICKING_OPTS.forEach(function (o) { inp.appendChild(E('option', { 'value': o.v }, _(o.t))); });
 					inp.value = roamState.adv[f.k] || '';
 				} else {
@@ -604,7 +612,7 @@ return view.extend({
 				]));
 			});
 
-			var btnReset = E('button', { 'class': 'cbi-button cbi-button-neutral', 'type': 'button' }, _('全部跟随档位'));
+			var btnReset = E('button', { 'class': 'cbi-button cbi-button-neutral', 'type': 'button' }, _('全部恢复默认'));
 			btnReset.disabled = !roamEditable();
 			btnReset.addEventListener('click', function (ev) {
 				/* type=button 已显式写；这里再拦一次，防止某些主题下按钮落在 <form> 里 */
@@ -621,7 +629,8 @@ return view.extend({
 				E('summary', {}, _('高级设置（一般不用改）')),
 				grid,
 				E('div', { 'class': 'mesh-btnrow' }, [ btnReset ]),
-				E('div', { 'class': 'mesh-muted' }, '· ' + _('留空 = 跟随档位；输入框里的灰色数字就是当前的生效值。')),
+				E('div', { 'class': 'mesh-muted' }, '· ' + _('留空 = 用默认值；灰色文字/数字就是当前的生效值。')),
+				E('div', { 'class': 'mesh-muted' }, '· ' + _('只有「分数差阈值」与「连续评估次数」的默认值随上方灵敏度档位变化，其余 6 项是各自的固定默认值。')),
 				E('div', { 'class': 'mesh-muted' }, '· ' + _('「加权中点」只在踢人方法选 2 / 3 时生效；「好/差信号门限」影响 dawn 的评分台阶。'))
 			]));
 
@@ -660,7 +669,7 @@ return view.extend({
 			mm('roam_level', roamState.level);
 			ROAM_ADV.forEach(function (f) {
 				var v = String(roamState.adv[f.k] == null ? '' : roamState.adv[f.k]).replace(/\s+/g, '');
-				/* 非整数一律当"跟随档位"（清空），绝不把坏值写进配置 */
+				/* 非整数一律当"用默认值"（清空），绝不把坏值写进配置 */
 				if (v !== '' && !/^-?\d+$/.test(v)) v = '';
 				mm('roam_' + f.k, v);
 			});
